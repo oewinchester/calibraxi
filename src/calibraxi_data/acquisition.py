@@ -142,6 +142,7 @@ class AcquisitionCoordinator:
         payload = result.payload
         if payload is None:
             payload = {"error": result.error, "state": result.state.value}
+        knowledge_at = datetime.now(timezone.utc)
         return self._evidence_store.put(
             source=result.source,
             capability=result.capability,
@@ -149,7 +150,9 @@ class AcquisitionCoordinator:
             result_state=result.state,
             received_at=finished_at,
             processing_at=finished_at,
-            knowledge_at=finished_at,
+            knowledge_at=knowledge_at,
+            observed_at=_optional_datetime(result.metadata.get("source_observed_at")),
+            available_at=_optional_datetime(result.metadata.get("source_available_at")),
             http_status=result.http_status,
             metadata={
                 "integration": result.integration,
@@ -175,7 +178,6 @@ class AcquisitionCoordinator:
             adapter_version=result.adapter_version,
             metadata=result.metadata,
         )
-
     @staticmethod
     def _final_result(capability: str, attempts: list[AcquisitionAttempt]) -> AcquisitionResult:
         results = [attempt.result for attempt in attempts]
@@ -198,3 +200,12 @@ class AcquisitionCoordinator:
             attempts=tuple(attempts),
             error="; ".join(result.error for result in results if result.error) or None,
         )
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None

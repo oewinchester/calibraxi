@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import replace
 from typing import Any
 
-from .contracts import RawEvidence
+from .contracts import IngestionRunStatus, RawEvidence
 from .evidence import RawEvidenceStore
 from .espn import EspnObservationParser
 from .persistence import CanonicalStore, PersistenceResult
@@ -26,20 +27,41 @@ def replay_evidence(
     parsing so a missing or altered object cannot become canonical state.
     """
 
-    body = evidence_store.read_payload(evidence)
-    actual_hash = hashlib.sha256(body).hexdigest()
-    if actual_hash != evidence.content_hash:
-        raise ValueError(
-            f"raw evidence content hash mismatch: expected {evidence.content_hash}, got {actual_hash}"
-        )
+    run = store.start_run(evidence.source, replay_of=evidence.evidence_id)
     try:
-        payload: Any = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"raw evidence payload is not valid JSON: {exc}") from exc
+        body = evidence_store.read_payload(evidence)
+        actual_hash = hashlib.sha256(body).hexdigest()
+        if actual_hash != evidence.content_hash:
+            raise ValueError(
+                f"raw evidence content hash mismatch: expected {evidence.content_hash}, got {actual_hash}"
+            )
+        store.update_run(run.run_id, IngestionRunStatus.EVIDENCE_STORED, evidence_refs=(evidence.evidence_id,))
+        try:
+            payload: Any = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"raw evidence payload is not valid JSON: {exc}") from exc
 
-    event_id = _event_id(evidence)
-    observations = parser.parse(evidence.capability, payload, event_id=event_id)
-    return store.persist(observations, evidence_id=evidence.evidence_id)
+        event_id = _event_id(evidence)
+        observations = parser.parse(evidence.capability, payload, event_id=event_id)
+        observations = tuple(replace(observation, observed_at=observation.observed_at or evidence.observed_at, available_at=observation.available_at or evidence.available_at, knowledge_at=observation.knowledge_at or evidence.knowledge_at, processing_at=observation.processing_at or evidence.processing_at) for observation in observations)
+        result = store.persist(observations, evidence_id=evidence.evidence_id)
+        store.update_run(
+            run.run_id,
+            IngestionRunStatus.REPLAY_RECOVERED,
+            counts={
+                "canonical_rows_written": result.canonical_rows_written,
+                "canonical_rows_updated": result.canonical_rows_updated,
+                "source_identities_written": result.source_identities_written,
+                "observation_lineage_written": result.observation_lineage_written,
+            },
+        )
+        return result
+    except Exception as exc:
+        try:
+            store.update_run(run.run_id, IngestionRunStatus.FAILED, error=str(exc))
+        except Exception:
+            pass
+        raise
 
 
 def _event_id(evidence: RawEvidence) -> str | None:

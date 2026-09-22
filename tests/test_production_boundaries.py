@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from calibraxi_data import EntityType
 from calibraxi_data.espn import SourceObservation
-from calibraxi_data.contracts import SourceIdentity
+from calibraxi_data.contracts import IngestionRunStatus, SourceIdentity
 from calibraxi_data.evidence import S3RawEvidenceStore
 from calibraxi_data.persistence import FileSystemCanonicalStore, PostgresCanonicalStore
 from calibraxi_data.replay import replay_evidence
@@ -199,6 +199,7 @@ def test_postgres_store_persists_a_batch_in_one_transaction():
     )
 
     assert result.canonical_rows_written == 1
+    assert result.canonical_rows_updated == 0
     assert result.source_identities_written == 1
     assert result.observation_lineage_written == 2
     assert connection.commits == 1
@@ -236,6 +237,7 @@ def test_replay_reads_verified_payload_and_preserves_evidence_lineage(tmp_path):
     )
 
     assert result.canonical_rows_written == 1
+    assert result.canonical_rows_updated == 0
     assert result.observation_lineage_written == 1
     retry = replay_evidence(
         evidence_store=evidence_store,
@@ -268,3 +270,50 @@ def test_replay_rejects_corrupt_payload_before_persistence(tmp_path):
     else:
         raise AssertionError("corrupt evidence was replayed")
     assert canonical.observation_count() == 0
+
+
+def test_ingestion_run_lifecycle_survives_store_reload(tmp_path):
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    started = store.start_run("espn", run_id="run-1")
+    assert started.status is IngestionRunStatus.STARTED
+    store.update_run("run-1", IngestionRunStatus.EVIDENCE_STORED, evidence_refs=("e1",))
+    store.update_run("run-1", IngestionRunStatus.CANONICAL_PERSISTED, counts={"teams": 1})
+
+    reloaded = FileSystemCanonicalStore(tmp_path / "canonical")
+    run = reloaded.get_run("run-1")
+    assert run is not None
+    assert run.status is IngestionRunStatus.CANONICAL_PERSISTED
+    assert run.evidence_refs == ("e1",)
+    assert run.counts == {"teams": 1}
+    assert run.evidence_stored_at is not None
+    assert run.canonical_persisted_at is not None
+
+
+def test_replay_correction_advances_current_state_and_keeps_lineage(tmp_path):
+    from calibraxi_data.evidence import FileSystemRawEvidenceStore
+
+    evidence_store = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    canonical = FileSystemCanonicalStore(tmp_path / "canonical")
+    parser = __import__("calibraxi_data").EspnObservationParser()
+    first = evidence_store.put(
+        source="espn",
+        capability="teams",
+        payload={"sports": [{"leagues": [{"teams": [{"team": {"id": "349", "displayName": "Arsenal"}}]}]}]},
+    )
+    replay_evidence(evidence_store=evidence_store, evidence=first, parser=parser, store=canonical)
+    correction = evidence_store.put(
+        source="espn",
+        capability="teams",
+        payload={"sports": [{"leagues": [{"teams": [{"team": {"id": "349", "displayName": "Arsenal FC"}}]}]}]},
+        correction_of=first.evidence_id,
+    )
+    result = replay_evidence(evidence_store=evidence_store, evidence=correction, parser=parser, store=canonical)
+
+    assert result.canonical_rows_written == 0
+    assert result.canonical_rows_updated == 1
+    assert canonical.observation_count() == 2
+    current = __import__("json").loads((tmp_path / "canonical" / "canonical.json").read_text(encoding="utf-8"))
+    assert current[0]["name"] == "Arsenal FC"
+    lineage = (tmp_path / "canonical" / "observations.jsonl").read_text(encoding="utf-8")
+    assert correction.evidence_id in lineage
+    assert first.evidence_id in lineage

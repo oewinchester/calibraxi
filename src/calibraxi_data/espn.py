@@ -18,6 +18,10 @@ class SourceObservation:
     source_identity: SourceIdentity
     name: str | None = None
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    observed_at: datetime | None = None
+    available_at: datetime | None = None
+    knowledge_at: datetime | None = None
+    processing_at: datetime | None = None
 
     @property
     def source_id(self) -> str:
@@ -53,7 +57,14 @@ class EspnSourceAdapter:
                 return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata={"url": url})
         except Exception as exc:
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata={"url": url})
-        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, adapter_version=self.adapter_version, metadata={"url": url})
+        metadata: dict[str, Any] = {"url": url}
+        source_observed_at = _payload_timestamp(payload, "lastUpdatedAt", "lastUpdated", "updatedAt")
+        if source_observed_at is not None:
+            metadata["source_observed_at"] = source_observed_at
+        source_available_at = _payload_timestamp(payload, "availableAt", "available_at")
+        if source_available_at is not None:
+            metadata["source_available_at"] = source_available_at
+        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, adapter_version=self.adapter_version, metadata=metadata)
 
     def _endpoint(self, capability: str, league: str, params: Mapping[str, Any]) -> tuple[str | None, Mapping[str, Any]]:
         base = f"{self._base}/{league}"
@@ -179,3 +190,20 @@ class EspnObservationParser:
 
 def _parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _payload_timestamp(payload: Mapping[str, Any], *keys: str) -> str | None:
+    """Return a source timestamp only when ESPN explicitly supplies one."""
+
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    for key in keys:
+        value = payload.get(key) if isinstance(payload, Mapping) else None
+        if value is None:
+            value = meta.get(key)
+        if isinstance(value, str):
+            try:
+                _parse_dt(value)
+            except ValueError:
+                continue
+            return value
+    return None

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import Counter
 from typing import Any
 
 from .acquisition import AcquisitionCoordinator
-from .contracts import EntityType
+from .contracts import EntityType, IngestionRunStatus, RawEvidence
 from .espn import EspnObservationParser, SourceObservation
 from .persistence import CanonicalStore
 from .quality import DataQualityValidator, QualityIssue
@@ -23,6 +23,8 @@ class VerticalIngestionReport:
     quality_issues: tuple[QualityIssue, ...] = ()
     unresolved_source_ids: tuple[str, ...] = ()
     coverage: dict[str, "CoverageResult"] = field(default_factory=dict)
+    run_id: str | None = None
+    run_status: IngestionRunStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +45,7 @@ class EspnVerticalIngestor:
         self._validator = validator
         self._store = store
 
-    def ingest(self, *, league: str = "eng.1", date: str | None = None, include_summaries: bool = False) -> VerticalIngestionReport:
+    def ingest(self, *, league: str = "eng.1", date: str | None = None, include_summaries: bool = False, run_id: str | None = None) -> VerticalIngestionReport:
         all_capabilities = ["teams", "fixtures", "players"]
         if include_summaries:
             all_capabilities.extend(("lineups", "player_stats", "match_stats"))
@@ -55,6 +57,8 @@ class EspnVerticalIngestor:
         capability_observations: dict[str, tuple[SourceObservation, ...]] = {}
         coverage: dict[str, CoverageResult] = {}
         pending_persists: list[tuple[tuple[SourceObservation, ...], str]] = []
+        run = self._store.start_run("espn", run_id=run_id)
+        evidence_refs: list[str] = []
 
         for capability in ("teams", "fixtures"):
             params: dict[str, Any] = {"league": league}
@@ -62,12 +66,13 @@ class EspnVerticalIngestor:
                 params["date"] = date
             acquisition = self._coordinator.acquire(capability, params=params)
             evidence_objects += len(acquisition.attempts)
+            evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
             validation = self._validator.validate(acquisition, collection_field="events" if capability == "fixtures" else "sports", require_non_empty=True)
             if not validation.accepted:
                 failures.append(f"{capability}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
                 continue
-            observations = self._parser.parse(capability, validation.payload)
+            observations = self._with_evidence_chronology(self._parser.parse(capability, validation.payload), acquisition.evidence)
             capability_observations[capability] = observations
             expected = self._expected_population(capability, validation.payload)
             observed = len({o.source_id for o in observations if o.entity_type is (EntityType.TEAM if capability == "teams" else EntityType.FIXTURE)})
@@ -80,18 +85,24 @@ class EspnVerticalIngestor:
         for team_id in team_ids:
             acquisition = self._coordinator.acquire("players", params={"league": league, "team_id": team_id})
             evidence_objects += len(acquisition.attempts)
+            evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
             validation = self._validator.validate(acquisition, collection_field="athletes", require_non_empty=False)
             if not validation.accepted:
                 failures.append(f"players:{team_id}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
                 continue
-            observations = self._parser.parse("players", validation.payload)
+            observations = self._with_evidence_chronology(self._parser.parse("players", validation.payload), acquisition.evidence)
             pending_persists.append((observations, acquisition.evidence.evidence_id if acquisition.evidence else "missing-evidence"))
 
         fixture_ids = tuple(o.source_id for o in capability_observations.get("fixtures", ()) if o.entity_type is EntityType.FIXTURE)
         if include_summaries and fixture_ids:
-            self._ingest_summaries(league, fixture_ids, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists)
+            self._ingest_summaries(league, fixture_ids, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists, evidence_refs=evidence_refs)
             evidence_objects = self._summary_evidence_count
+
+        try:
+            self._store.update_run(run.run_id, IngestionRunStatus.EVIDENCE_STORED, evidence_refs=tuple(evidence_refs))
+        except Exception as exc:
+            failures.append(f"ingestion_run_evidence_status_failed:{exc}")
 
         if pending_persists:
             try:
@@ -103,9 +114,15 @@ class EspnVerticalIngestor:
                 failures.append(f"canonical_persistence_failed:{exc}")
 
         canonical_counts = {entity_type: self._store.count(entity_type) for entity_type in (EntityType.COMPETITION, EntityType.SEASON, EntityType.TEAM, EntityType.PLAYER, EntityType.FIXTURE, EntityType.LINEUP, EntityType.PLAYER_STAT, EntityType.TEAM_STAT)}
-        return VerticalIngestionReport("espn", tuple(all_capabilities), canonical_counts, evidence_objects, tuple(failures), tuple(quality_issues), tuple(unresolved), coverage)
+        final_status = IngestionRunStatus.FAILED if failures else IngestionRunStatus.CANONICAL_PERSISTED
+        try:
+            self._store.update_run(run.run_id, final_status, error="; ".join(failures) or None, counts={key.value: value for key, value in canonical_counts.items()})
+        except Exception as exc:
+            failures.append(f"ingestion_run_final_status_failed:{exc}")
+            final_status = IngestionRunStatus.FAILED
+        return VerticalIngestionReport("espn", tuple(all_capabilities), canonical_counts, evidence_objects, tuple(failures), tuple(quality_issues), tuple(unresolved), coverage, run.run_id, final_status)
 
-    def _ingest_summaries(self, league: str, fixture_ids: tuple[str, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]]) -> None:
+    def _ingest_summaries(self, league: str, fixture_ids: tuple[str, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]], evidence_refs: list[str]) -> None:
         covered_events: dict[str, int] = {"lineups": 0, "player_stats": 0, "match_stats": 0}
         self._summary_evidence_count = evidence_counter[0]
         for capability in covered_events:
@@ -116,13 +133,14 @@ class EspnVerticalIngestor:
                     coverage[capability] = CoverageResult(len(fixture_ids), 0, False, "capability policy is not registered")
                     break
                 self._summary_evidence_count += len(acquisition.attempts)
+                evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
                 field = "rosters" if capability in {"lineups", "player_stats"} else None
                 validation = self._validator.validate(acquisition, collection_field=field, required_fields=("boxscore",) if capability == "match_stats" else (), require_non_empty=False)
                 if not validation.accepted:
                     failures.append(f"{capability}:{event_id}:{validation.state.value}")
                     quality_issues.extend(validation.issues)
                     continue
-                observations = self._parser.parse(capability, validation.payload, event_id=event_id)
+                observations = self._with_evidence_chronology(self._parser.parse(capability, validation.payload, event_id=event_id), acquisition.evidence)
                 if observations:
                     covered_events[capability] += 1
                 pending_persists.append((observations, acquisition.evidence.evidence_id if acquisition.evidence else "missing-evidence"))
@@ -136,3 +154,9 @@ class EspnVerticalIngestor:
         if capability == "fixtures":
             return len(payload.get("events", []))
         return 0
+
+    @staticmethod
+    def _with_evidence_chronology(observations: tuple[SourceObservation, ...], evidence: RawEvidence | None) -> tuple[SourceObservation, ...]:
+        if evidence is None:
+            return observations
+        return tuple(replace(observation, observed_at=observation.observed_at or evidence.observed_at, available_at=observation.available_at or evidence.available_at, knowledge_at=observation.knowledge_at or evidence.knowledge_at, processing_at=observation.processing_at or evidence.processing_at) for observation in observations)

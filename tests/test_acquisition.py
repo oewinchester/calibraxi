@@ -118,3 +118,28 @@ def test_acquisition_raw_evidence_write_failure_remains_source_failed(tmp_path):
     assert result.state is CapabilityState.SOURCE_FAILED
     assert result.payload is None
     assert "raw evidence write failed" in (result.error or "")
+
+
+def test_acquisition_preserves_explicit_source_and_calibraxi_times(tmp_path):
+    from calibraxi_data.contracts import CapabilityState, SourceResult
+
+    class TimestampedAdapter:
+        def fetch(self, capability, **params):
+            return SourceResult(
+                CapabilityState.SUPPORTED,
+                "native",
+                capability,
+                payload={"events": []},
+                metadata={"source_observed_at": "2026-10-18T14:50:17Z"},
+            )
+
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("fixtures", "native"))
+    result = AcquisitionCoordinator(registry=registry, adapters={"native": TimestampedAdapter()}, evidence_store=FileSystemRawEvidenceStore(tmp_path)).acquire("fixtures")
+
+    assert result.evidence is not None
+    assert result.evidence.observed_at is not None
+    assert result.evidence.observed_at.isoformat() == "2026-10-18T14:50:17+00:00"
+    assert result.evidence.available_at is None
+    assert result.evidence.knowledge_at is not None
+    assert result.evidence.processing_at is not None

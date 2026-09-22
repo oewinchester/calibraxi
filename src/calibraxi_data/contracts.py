@@ -25,6 +25,31 @@ class HealthState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class IngestionRunStatus(StrEnum):
+    STARTED = "started"
+    EVIDENCE_STORED = "evidence_stored"
+    CANONICAL_PERSISTED = "canonical_persistence_completed"
+    FAILED = "failed"
+    REPLAY_RECOVERED = "replay_recovered"
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRun:
+    run_id: str
+    source: str
+    status: IngestionRunStatus
+    started_at: datetime
+    updated_at: datetime
+    evidence_stored_at: datetime | None = None
+    canonical_persisted_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    error: str | None = None
+    counts: Mapping[str, int] = field(default_factory=dict)
+    evidence_refs: tuple[str, ...] = ()
+    replay_of: str | None = None
+
+
 class EntityType(StrEnum):
     COMPETITION = "competition"
     SEASON = "season"

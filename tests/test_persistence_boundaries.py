@@ -17,6 +17,7 @@ def test_duplicate_fixture_is_idempotent_and_correction_keeps_lineage(tmp_path):
     assert one.canonical_rows_written == 1
     assert two.canonical_rows_written == 0
     assert three.canonical_rows_written == 0
+    assert three.canonical_rows_updated == 1
     assert store.count(EntityType.FIXTURE) == 1
     assert store.observation_count() == 3
 

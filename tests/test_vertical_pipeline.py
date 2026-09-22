@@ -7,6 +7,7 @@ from calibraxi_data import (
     FileSystemCanonicalStore,
     FileSystemRawEvidenceStore,
     SourceCapability,
+    IngestionRunStatus,
 )
 from calibraxi_data.acquisition import AcquisitionCoordinator
 from calibraxi_data.espn_vertical import EspnVerticalIngestor
@@ -51,6 +52,8 @@ def test_vertical_ingestor_flows_acquisition_quality_parse_and_persistence(tmp_p
     assert report.coverage["teams"].complete is True
     assert report.coverage["fixtures"].complete is True
     assert report.coverage["fixtures"].upstream_complete is None
+    assert report.run_status is IngestionRunStatus.CANONICAL_PERSISTED
+    assert store.get_run(report.run_id).evidence_refs
 
 
 def test_vertical_ingestor_reports_event_summary_coverage_without_persisting_unavailable_stats(tmp_path):
@@ -78,6 +81,7 @@ def test_vertical_ingestor_does_not_persist_source_failure(tmp_path):
 
     assert report.failures
     assert store.count(EntityType.TEAM) == 0
+    assert report.run_status is IngestionRunStatus.FAILED
 
 
 def test_vertical_ingestor_reports_canonical_persistence_failure(tmp_path):

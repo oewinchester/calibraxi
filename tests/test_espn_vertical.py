@@ -43,6 +43,14 @@ def test_espn_summary_capabilities_use_event_identity_and_direct_json_endpoint()
     assert "summary?event=401879276" in transport.urls[0]
 
 
+def test_espn_adapter_propagates_explicit_source_update_time_only():
+    transport = StaticTransport(b'{"meta":{"lastUpdatedAt":"2026-10-18T14:50:17Z"},"rosters":[]}')
+    result = EspnSourceAdapter(transport=transport).fetch("lineups", league="eng.1", event_id="401879276")
+
+    assert result.metadata["source_observed_at"] == "2026-10-18T14:50:17Z"
+    assert "source_available_at" not in result.metadata
+
+
 def test_espn_adapter_preserves_http_status_on_malformed_json():
     adapter = EspnSourceAdapter(transport=StaticTransport(b"broken"))
 
