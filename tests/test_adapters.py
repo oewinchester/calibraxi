@@ -100,3 +100,14 @@ def test_http_json_adapter_converts_unexpected_transport_failure_to_source_faile
     assert result.state is CapabilityState.SOURCE_FAILED
     assert result.payload is None
     assert result.error == "transport exploded"
+
+
+def test_http_json_adapter_malformed_json_is_source_failed():
+    transport = FakeTransport(HttpResponse(200, b"not-json", {"content-type": "application/json"}))
+    adapter = HttpJsonSourceAdapter(source_name="native", endpoints={"fixtures": "https://example.test/fixtures"}, transport=transport)
+
+    result = adapter.fetch("fixtures")
+
+    assert result.state is CapabilityState.SOURCE_FAILED
+    assert result.http_status == 200
+    assert "JSON" in (result.error or "") or "json" in (result.error or "")

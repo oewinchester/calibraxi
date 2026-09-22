@@ -18,7 +18,7 @@ class SourceAdapter(Protocol):
 @dataclass(frozen=True, slots=True)
 class AcquisitionAttempt:
     result: SourceResult
-    evidence: RawEvidence
+    evidence: RawEvidence | None
     started_at: datetime
     finished_at: datetime
 
@@ -69,7 +69,18 @@ class AcquisitionCoordinator:
             started_at = datetime.now(timezone.utc)
             result = self._fetch(source, capability, request_params)
             finished_at = datetime.now(timezone.utc)
-            evidence = self._capture_evidence(result, started_at, finished_at)
+            try:
+                evidence = self._capture_evidence(result, started_at, finished_at)
+            except Exception as exc:
+                result = SourceResult(
+                    state=CapabilityState.SOURCE_FAILED,
+                    source=result.source,
+                    capability=result.capability,
+                    error=f"raw evidence write failed: {exc}",
+                    integration=result.integration,
+                    adapter_version=result.adapter_version,
+                )
+                evidence = None
             result = self._with_evidence(result, evidence)
             attempt = AcquisitionAttempt(result, evidence, started_at, finished_at)
             attempts.append(attempt)
@@ -145,11 +156,12 @@ class AcquisitionCoordinator:
                 "attempt_started_at": started_at.isoformat(),
                 "attempt_finished_at": finished_at.isoformat(),
                 "error": result.error,
+                **dict(result.metadata),
             },
         )
 
     @staticmethod
-    def _with_evidence(result: SourceResult, evidence: RawEvidence) -> SourceResult:
+    def _with_evidence(result: SourceResult, evidence: RawEvidence | None) -> SourceResult:
         return SourceResult(
             state=result.state,
             source=result.source,
@@ -160,6 +172,7 @@ class AcquisitionCoordinator:
             evidence=evidence,
             integration=result.integration,
             adapter_version=result.adapter_version,
+            metadata=result.metadata,
         )
 
     @staticmethod
@@ -180,7 +193,7 @@ class AcquisitionCoordinator:
             state=state,
             source=None,
             payload=None,
-            evidence=attempts[-1].evidence if attempts else None,
+            evidence=next((attempt.evidence for attempt in reversed(attempts) if attempt.evidence is not None), None),
             attempts=tuple(attempts),
             error="; ".join(result.error for result in results if result.error) or None,
         )

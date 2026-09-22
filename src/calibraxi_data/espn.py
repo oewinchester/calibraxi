@@ -1,0 +1,137 @@
+"""Direct ESPN JSON adapter and source-normalized observation parser."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Mapping
+from urllib.parse import urlencode
+
+from .contracts import CapabilityState, EntityType, SourceResult, SourceIdentity
+from .http_json import HttpTransport, UrllibTransport
+
+
+@dataclass(frozen=True, slots=True)
+class SourceObservation:
+    entity_type: EntityType
+    source_identity: SourceIdentity
+    name: str | None = None
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def source_id(self) -> str:
+        return self.source_identity.source_id
+
+
+class EspnSourceAdapter:
+    """ESPN's direct JSON endpoints, kept behind the source adapter seam."""
+
+    source_name = "espn"
+    adapter_version = "espn-http-json-v1"
+    _base = "https://site.web.api.espn.com/apis/site/v2/sports/soccer"
+
+    def __init__(self, *, transport: HttpTransport | None = None, timeout: float = 20.0) -> None:
+        self._transport = transport or UrllibTransport()
+        self._timeout = timeout
+
+    def fetch(self, capability: str, **params: Any) -> SourceResult:
+        league = str(params.get("league", "eng.1"))
+        endpoint, query = self._endpoint(capability, league, params)
+        if endpoint is None:
+            return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, adapter_version=self.adapter_version)
+        url = f"{endpoint}?{urlencode(query)}" if query else endpoint
+        try:
+            response = self._transport.request(
+                url, headers={"User-Agent": "Mozilla/5.0", "Origin": "https://www.espn.com", "Accept": "application/json"}, timeout=self._timeout
+            )
+            if response.status < 200 or response.status >= 300:
+                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata={"url": url})
+            try:
+                payload = json.loads(response.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata={"url": url})
+        except Exception as exc:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata={"url": url})
+        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, adapter_version=self.adapter_version, metadata={"url": url})
+
+    def _endpoint(self, capability: str, league: str, params: Mapping[str, Any]) -> tuple[str | None, Mapping[str, Any]]:
+        base = f"{self._base}/{league}"
+        if capability in {"competition", "season", "fixtures"}:
+            query = {}
+            if params.get("date"):
+                query["dates"] = str(params["date"])
+            return f"{base}/scoreboard", query
+        if capability == "teams":
+            return f"{base}/teams", {}
+        if capability == "players":
+            team_id = params.get("team_id")
+            return (f"{base}/teams/{team_id}/roster", {}) if team_id else (None, {})
+        if capability in {"lineups", "match_stats"}:
+            event_id = params.get("event_id")
+            return (f"{base}/summary", {"event": str(event_id)}) if event_id else (None, {})
+        return None, {}
+
+
+class EspnObservationParser:
+    """Converts ESPN payloads to source-normalized observations only."""
+
+    def parse(self, capability: str, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
+        if capability == "teams":
+            return self._teams(payload)
+        if capability == "players":
+            return self._players(payload)
+        if capability in {"competition", "season", "fixtures"}:
+            return self._scoreboard(payload, capability)
+        return ()
+
+    def _scoreboard(self, payload: Mapping[str, Any], capability: str) -> tuple[SourceObservation, ...]:
+        out: list[SourceObservation] = []
+        leagues = payload.get("leagues", [])
+        for league in leagues if isinstance(leagues, list) else []:
+            lid = str(league.get("id", ""))
+            if lid:
+                out.append(SourceObservation(EntityType.COMPETITION, SourceIdentity("espn", EntityType.COMPETITION, lid), league.get("name"), {"slug": league.get("slug")}))
+            season = league.get("season") or payload.get("season")
+            if isinstance(season, Mapping) and season.get("year") is not None:
+                sid = f"{lid}:{season['year']}" if lid else str(season["year"])
+                out.append(SourceObservation(EntityType.SEASON, SourceIdentity("espn", EntityType.SEASON, sid), season.get("displayName"), {"year": season["year"], "competition_source_id": lid}))
+        events = payload.get("events", [])
+        if capability == "fixtures" or events:
+            for event in events if isinstance(events, list) else []:
+                fixture = self._fixture(event)
+                if fixture:
+                    out.append(fixture)
+                    out.extend(self._fixture_teams(event))
+        return tuple(out)
+
+    def _fixture(self, event: Mapping[str, Any]) -> SourceObservation | None:
+        source_id = event.get("id")
+        kickoff = event.get("date")
+        if not source_id or not kickoff:
+            return None
+        competitors = (event.get("competitions") or [{}])[0].get("competitors", [])
+        home = next((c.get("team", {}) for c in competitors if c.get("homeAway") == "home"), {})
+        away = next((c.get("team", {}) for c in competitors if c.get("homeAway") == "away"), {})
+        return SourceObservation(EntityType.FIXTURE, SourceIdentity("espn", EntityType.FIXTURE, str(source_id)), event.get("name"), {"kickoff_at": _parse_dt(kickoff), "home_team_source_id": str(home.get("id")) if home.get("id") else None, "away_team_source_id": str(away.get("id")) if away.get("id") else None})
+
+    def _fixture_teams(self, event: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
+        competitors = (event.get("competitions") or [{}])[0].get("competitors", [])
+        return tuple(SourceObservation(EntityType.TEAM, SourceIdentity("espn", EntityType.TEAM, str(team["id"])), team.get("displayName")) for c in competitors if (team := c.get("team")) and team.get("id"))
+
+    def _teams(self, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
+        out: list[SourceObservation] = []
+        for sport in payload.get("sports", []) if isinstance(payload.get("sports", []), list) else []:
+            for league in sport.get("leagues", []) if isinstance(sport.get("leagues", []), list) else []:
+                for item in league.get("teams", []) if isinstance(league.get("teams", []), list) else []:
+                    team = item.get("team", item)
+                    if team.get("id"):
+                        out.append(SourceObservation(EntityType.TEAM, SourceIdentity("espn", EntityType.TEAM, str(team["id"])), team.get("displayName") or team.get("name"), {"slug": team.get("slug"), "logo": team.get("logo")}))
+        return tuple(out)
+
+    def _players(self, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
+        return tuple(SourceObservation(EntityType.PLAYER, SourceIdentity("espn", EntityType.PLAYER, str(a["id"])), a.get("displayName") or a.get("fullName"), {"team_source_id": (a.get("defaultTeam") or {}).get("id"), "date_of_birth": a.get("dateOfBirth")}) for a in payload.get("athletes", []) if isinstance(a, Mapping) and a.get("id"))
+
+
+def _parse_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)

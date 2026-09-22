@@ -17,6 +17,9 @@ from .entity_resolution import EntityResolutionIndex
 from .http_json import HttpJsonSourceAdapter, UrllibTransport
 from .soccerdata import SoccerDataAdapter
 from .quality import DataQualityValidator, QualityIssue, ValidationResult
+from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
+from .persistence import FileSystemCanonicalStore, PersistenceResult
+from .espn_vertical import EspnVerticalIngestor, VerticalIngestionReport
 
 __all__ = [
     "CapabilityRegistry",
@@ -39,4 +42,11 @@ __all__ = [
     "QualityIssue",
     "ValidationResult",
     "UrllibTransport",
+    "EspnObservationParser",
+    "EspnSourceAdapter",
+    "SourceObservation",
+    "FileSystemCanonicalStore",
+    "PersistenceResult",
+    "EspnVerticalIngestor",
+    "VerticalIngestionReport",
 ]

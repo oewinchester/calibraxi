@@ -95,3 +95,4 @@ class SourceResult:
     evidence: RawEvidence | None = None
     integration: str | None = None
     adapter_version: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)

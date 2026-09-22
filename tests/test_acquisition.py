@@ -99,3 +99,22 @@ def test_acquisition_does_not_turn_all_failures_into_empty_success(tmp_path):
     assert result.state is CapabilityState.SOURCE_FAILED
     assert result.payload is None
     assert len(result.attempts) == 2
+
+
+def test_acquisition_raw_evidence_write_failure_remains_source_failed(tmp_path):
+    class BrokenEvidenceStore:
+        def put(self, **kwargs):
+            raise OSError("disk full")
+
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("fixtures", "native"))
+    adapter = HttpJsonSourceAdapter(
+        source_name="native",
+        endpoints={"fixtures": "https://example.test/fixtures"},
+        transport=StaticTransport(HttpResponse(200, b'{"events":[1]}', {})),
+    )
+    result = AcquisitionCoordinator(registry=registry, adapters={"native": adapter}, evidence_store=BrokenEvidenceStore()).acquire("fixtures")
+
+    assert result.state is CapabilityState.SOURCE_FAILED
+    assert result.payload is None
+    assert "raw evidence write failed" in (result.error or "")

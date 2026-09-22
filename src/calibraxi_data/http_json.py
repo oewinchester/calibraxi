@@ -61,11 +61,14 @@ class HttpJsonSourceAdapter:
         try:
             response = self._transport.request(url, headers=self._headers, timeout=self._timeout)
             if response.status < 200 or response.status >= 300:
-                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}")
-            payload = json.loads(response.body.decode("utf-8"))
+                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", metadata={"url": url})
+            try:
+                payload = json.loads(response.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", metadata={"url": url})
         except Exception as exc:  # adapter boundary converts transport/decode failures to data state
-            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc))
-        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status)
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), metadata={"url": url})
+        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, metadata={"url": url})
 
     @staticmethod
     def _with_params(endpoint: str, params: Mapping[str, str | int]) -> str:
