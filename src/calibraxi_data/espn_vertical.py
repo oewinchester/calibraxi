@@ -11,6 +11,7 @@ from .contracts import EntityType, IngestionRunStatus, RawEvidence
 from .espn import EspnObservationParser, SourceObservation
 from .persistence import CanonicalStore
 from .quality import DataQualityValidator, QualityIssue
+from .operations import OperationalRecorder
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +40,12 @@ class CoverageResult:
 class EspnVerticalIngestor:
     """Orchestrates request, evidence, quality, source normalization, and persistence."""
 
-    def __init__(self, *, coordinator: AcquisitionCoordinator, parser: EspnObservationParser, validator: DataQualityValidator, store: CanonicalStore) -> None:
+    def __init__(self, *, coordinator: AcquisitionCoordinator, parser: EspnObservationParser, validator: DataQualityValidator, store: CanonicalStore, operations: OperationalRecorder | None = None) -> None:
         self._coordinator = coordinator
         self._parser = parser
         self._validator = validator
         self._store = store
+        self._operations = operations
 
     def ingest(self, *, league: str = "eng.1", date: str | None = None, include_summaries: bool = False, run_id: str | None = None) -> VerticalIngestionReport:
         all_capabilities = ["teams", "fixtures", "players"]
@@ -68,6 +70,7 @@ class EspnVerticalIngestor:
             evidence_objects += len(acquisition.attempts)
             evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
             validation = self._validator.validate(acquisition, collection_field="events" if capability == "fixtures" else "sports", require_non_empty=True)
+            self._record_operations(run.run_id, acquisition, validation, failures)
             if not validation.accepted:
                 failures.append(f"{capability}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
@@ -87,6 +90,7 @@ class EspnVerticalIngestor:
             evidence_objects += len(acquisition.attempts)
             evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
             validation = self._validator.validate(acquisition, collection_field="athletes", require_non_empty=False)
+            self._record_operations(run.run_id, acquisition, validation, failures)
             if not validation.accepted:
                 failures.append(f"players:{team_id}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
@@ -96,7 +100,7 @@ class EspnVerticalIngestor:
 
         fixture_ids = tuple(o.source_id for o in capability_observations.get("fixtures", ()) if o.entity_type is EntityType.FIXTURE)
         if include_summaries and fixture_ids:
-            self._ingest_summaries(league, fixture_ids, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists, evidence_refs=evidence_refs)
+            self._ingest_summaries(run.run_id, league, fixture_ids, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists, evidence_refs=evidence_refs)
             evidence_objects = self._summary_evidence_count
 
         try:
@@ -106,7 +110,7 @@ class EspnVerticalIngestor:
 
         if pending_persists:
             try:
-                result = self._store.persist_batch(pending_persists)
+                result = self._store.persist_batch(pending_persists, run_id=run.run_id)
                 for observations, _ in pending_persists:
                     for observation in observations:
                         counts[observation.entity_type] += 1
@@ -122,7 +126,7 @@ class EspnVerticalIngestor:
             final_status = IngestionRunStatus.FAILED
         return VerticalIngestionReport("espn", tuple(all_capabilities), canonical_counts, evidence_objects, tuple(failures), tuple(quality_issues), tuple(unresolved), coverage, run.run_id, final_status)
 
-    def _ingest_summaries(self, league: str, fixture_ids: tuple[str, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]], evidence_refs: list[str]) -> None:
+    def _ingest_summaries(self, run_id: str, league: str, fixture_ids: tuple[str, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]], evidence_refs: list[str]) -> None:
         covered_events: dict[str, int] = {"lineups": 0, "player_stats": 0, "match_stats": 0}
         self._summary_evidence_count = evidence_counter[0]
         for capability in covered_events:
@@ -136,6 +140,7 @@ class EspnVerticalIngestor:
                 evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
                 field = "rosters" if capability in {"lineups", "player_stats"} else None
                 validation = self._validator.validate(acquisition, collection_field=field, required_fields=("boxscore",) if capability == "match_stats" else (), require_non_empty=False)
+                self._record_operations(run_id, acquisition, validation, failures)
                 if not validation.accepted:
                     failures.append(f"{capability}:{event_id}:{validation.state.value}")
                     quality_issues.extend(validation.issues)
@@ -146,6 +151,14 @@ class EspnVerticalIngestor:
                 pending_persists.append((observations, acquisition.evidence.evidence_id if acquisition.evidence else "missing-evidence"))
         for capability, observed in covered_events.items():
             coverage[capability] = CoverageResult(len(fixture_ids), observed, observed == len(fixture_ids), "summary response coverage; entity completeness is reported by canonical counts", None)
+
+    def _record_operations(self, run_id: str, acquisition, validation, failures: list[str]) -> None:
+        if self._operations is None:
+            return
+        try:
+            self._operations.record_acquisition(run_id=run_id, acquisition=acquisition, validation=validation)
+        except Exception as exc:
+            failures.append(f"operational_recording_failed:{exc}")
 
     @staticmethod
     def _expected_population(capability: str, payload: Any) -> int:

@@ -8,9 +8,12 @@ from .contracts import (
     HealthState,
     IngestionRun,
     IngestionRunStatus,
+    QuarantineDecision,
     RawEvidence,
     SourceCapability,
     SourceCapabilityHealth,
+    SourceCapabilityHealthSnapshot,
+    SourceHealthSignal,
     SourceIdentity,
     SourceResult,
 )
@@ -23,6 +26,9 @@ from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
 from .persistence import CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
 from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngestionReport
 from .replay import replay_evidence
+from .recovery import RecoveryAction, RecoveryOutcome, RecoveryWorker
+from .operations import OperationalRecorder
+from .scheduler import EspnIngestionScheduler, SchedulerRunResult
 
 __all__ = [
     "CapabilityRegistry",
@@ -39,11 +45,14 @@ __all__ = [
     "HealthState",
     "IngestionRun",
     "IngestionRunStatus",
+    "QuarantineDecision",
     "HttpJsonSourceAdapter",
     "RawEvidence",
     "SoccerDataAdapter",
     "SourceCapability",
     "SourceCapabilityHealth",
+    "SourceCapabilityHealthSnapshot",
+    "SourceHealthSignal",
     "SourceIdentity",
     "SourceResult",
     "DataQualityValidator",
@@ -61,4 +70,10 @@ __all__ = [
     "VerticalIngestionReport",
     "CoverageResult",
     "replay_evidence",
+    "RecoveryAction",
+    "RecoveryOutcome",
+    "RecoveryWorker",
+    "OperationalRecorder",
+    "EspnIngestionScheduler",
+    "SchedulerRunResult",
 ]

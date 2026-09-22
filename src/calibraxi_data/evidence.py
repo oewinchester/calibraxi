@@ -107,6 +107,16 @@ class FileSystemRawEvidenceStore:
         path = self.root / Path(evidence.object_path).parent / f"{evidence.evidence_id}.json"
         return _raw_evidence_from_json(path.read_bytes())
 
+    def find_by_id(self, evidence_id: str) -> RawEvidence | None:
+        for path in self.root.rglob(f"{evidence_id}.json"):
+            try:
+                evidence = _raw_evidence_from_json(path.read_bytes())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+                continue
+            if evidence.evidence_id == evidence_id:
+                return evidence
+        return None
+
     @staticmethod
     def _safe_component(value: str, label: str) -> str:
         """Keep source-controlled object paths below the configured evidence root."""
@@ -125,12 +135,14 @@ class ObjectStorageClient(Protocol):
     def put_object(self, **kwargs: Any) -> Any: ...
     def get_object(self, **kwargs: Any) -> Mapping[str, Any]: ...
     def delete_object(self, **kwargs: Any) -> Any: ...
+    def list_objects_v2(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
 
 class RawEvidenceStore(Protocol):
     def put(self, **kwargs: Any) -> RawEvidence: ...
     def read_payload(self, evidence: RawEvidence) -> bytes: ...
     def read_metadata(self, evidence: RawEvidence) -> RawEvidence: ...
+    def find_by_id(self, evidence_id: str) -> RawEvidence | None: ...
 
 
 class S3RawEvidenceStore:
@@ -251,6 +263,32 @@ class S3RawEvidenceStore:
         body = response["Body"]
         raw = body.read() if hasattr(body, "read") else bytes(body)
         return _raw_evidence_from_json(raw)
+
+    def find_by_id(self, evidence_id: str) -> RawEvidence | None:
+        continuation: str | None = None
+        suffix = f"/{evidence_id}.json"
+        while True:
+            request: dict[str, Any] = {"Bucket": self.bucket, "Prefix": self.prefix}
+            if continuation:
+                request["ContinuationToken"] = continuation
+            response = self.client.list_objects_v2(**request)
+            for item in response.get("Contents", ()):
+                key = str(item.get("Key", ""))
+                if ".metadata/" not in key or not key.endswith(suffix):
+                    continue
+                body = self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
+                raw = body.read() if hasattr(body, "read") else bytes(body)
+                try:
+                    evidence = _raw_evidence_from_json(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                if evidence.evidence_id == evidence_id:
+                    return evidence
+            if not response.get("IsTruncated"):
+                return None
+            continuation = response.get("NextContinuationToken")
+            if not continuation:
+                return None
 
 
 class MinioRawEvidenceStore(S3RawEvidenceStore):

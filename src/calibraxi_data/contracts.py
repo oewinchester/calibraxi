@@ -31,6 +31,7 @@ class IngestionRunStatus(StrEnum):
     CANONICAL_PERSISTED = "canonical_persistence_completed"
     FAILED = "failed"
     REPLAY_RECOVERED = "replay_recovered"
+    RECOVERY_PENDING = "recovery_pending"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,8 @@ class IngestionRun:
     counts: Mapping[str, int] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     replay_of: str | None = None
+    claim_token: str | None = None
+    claim_until: datetime | None = None
 
 
 class EntityType(StrEnum):
@@ -83,6 +86,55 @@ class SourceCapabilityHealth:
     capability: str
     source: str
     health: HealthState
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineDecision:
+    quarantine_id: str
+    run_id: str
+    source: str
+    capability: str
+    evidence_id: str | None
+    state: CapabilityState
+    code: str
+    message: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SourceHealthSignal:
+    capability: str
+    source: str
+    health: HealthState
+    attempted_at: datetime
+    success: bool = False
+    failure: bool = False
+    schema_drift: bool = False
+    empty_population: bool = False
+    quarantine: bool = False
+    retryable_failure: bool = False
+    latency_ms: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCapabilityHealthSnapshot:
+    capability: str
+    source: str
+    health: HealthState
+    attempt_count: int
+    success_count: int
+    failure_count: int
+    schema_drift_count: int
+    empty_population_count: int
+    quarantine_count: int
+    retryable_failure_count: int
+    last_attempt_at: datetime | None
+    last_success_at: datetime | None
+    last_failure_at: datetime | None
+    last_latency_ms: int | None
+    last_error: str | None
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
