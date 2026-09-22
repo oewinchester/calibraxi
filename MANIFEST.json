@@ -1,0 +1,42 @@
+{
+  "AGENTS.md": {
+    "bytes": 3480,
+    "sha256": "4d70e2d49d367df1041750892abdf48dc135b15d410a4d0678f60689decc3e6d"
+  },
+  "CONTEXT.md": {
+    "bytes": 1588,
+    "sha256": "452af7dac9c1e3a28561644dd5feec93fc5570b5a783d7162e116ac19143c161"
+  },
+  "FRESH-SETUP.md": {
+    "bytes": 603,
+    "sha256": "b6a73f2b063b4814f85c5bbb6b4df20bee42046bd08abe209ae599bdcc06c7c2"
+  },
+  "NEXT-ROADMAP.md": {
+    "bytes": 821,
+    "sha256": "bebb04ae6a36b7619a0ee9905b630b4c5d87c16c4ff9f6df4855762433a1f96d"
+  },
+  "README.md": {
+    "bytes": 977,
+    "sha256": "b69fb4f7f400ef5a834091b9c956e4dc5ffec484582792deea093a91f2debfe8"
+  },
+  "docs/CalibraXI-v13.md": {
+    "bytes": 320952,
+    "sha256": "f284974a6bd8cbcc570a22fcf75847e1d4a664726d13d4928f3f3cc13494270d"
+  },
+  "docs/CalibraXI.md": {
+    "bytes": 320952,
+    "sha256": "f284974a6bd8cbcc570a22fcf75847e1d4a664726d13d4928f3f3cc13494270d"
+  },
+  "docs/engineering/source-acquisition.md": {
+    "bytes": 2019,
+    "sha256": "7b641c61eca34378cc0643a3910b856c3b776815f2242b2f9d507d9ddba53b80"
+  },
+  "docs/legacy/README.md": {
+    "bytes": 963,
+    "sha256": "1c6eb35f6e080c2bb71362ec89d70e1d8ce513e2978d0c13462a576f840da7bf"
+  },
+  "prompts/START-CODEX.md": {
+    "bytes": 1451,
+    "sha256": "7bb0b5fb21ca605b673b0a13330fd6574816be119d0accaa54a9f2db8b1bc1a8"
+  }
+}
