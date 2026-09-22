@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
 from calibraxi_data import FileSystemCanonicalStore, FileSystemRawEvidenceStore, EspnObservationParser
+from calibraxi_data.espn_vertical import VerticalIngestionReport
+from calibraxi_data.thesportsdb import TheSportsDbObservationParser
 from calibraxi_data.contracts import IngestionRunStatus
 from calibraxi_data.recovery import RecoveryWorker
 from calibraxi_data.scheduler import EspnIngestionScheduler
@@ -53,3 +55,33 @@ def test_scheduler_uses_a_durable_slot_lease(tmp_path):
 
     assert first is True
     assert second is False
+
+
+def test_scheduler_can_run_a_non_espn_ingestor_through_the_same_lease_path(tmp_path):
+    class GenericIngestor:
+        def __init__(self):
+            self.kwargs = None
+
+        def ingest(self, **kwargs):
+            self.kwargs = kwargs
+            return VerticalIngestionReport("thesportsdb", ("fixtures",), {}, 0, run_id=kwargs["run_id"])
+
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    ingestor = GenericIngestor()
+    recovery = RecoveryWorker(store=store, evidence_store=evidence, parser=TheSportsDbObservationParser())
+    scheduler = EspnIngestionScheduler(
+        store=store,
+        ingestor=ingestor,
+        recovery_worker=recovery,
+        source_name="thesportsdb",
+        league="4328",
+        ingestion_params={"league_id": "4328", "season": "2026-2027", "round": 1},
+    )
+
+    result = scheduler.run_once()
+
+    assert result.error is None
+    assert ingestor.kwargs["league_id"] == "4328"
+    assert ingestor.kwargs["run_id"] == result.run_id
+    assert store.get_run(result.run_id).source == "thesportsdb"

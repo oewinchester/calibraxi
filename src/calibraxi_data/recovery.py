@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from .contracts import CapabilityState, IngestionRunStatus, RawEvidence
 from .evidence import RawEvidenceStore
-from .espn import EspnObservationParser
 from .persistence import CanonicalStore
 from .replay import replay_evidence
 
@@ -44,7 +43,7 @@ class RecoveryWorker:
         IngestionRunStatus.RECOVERY_PENDING,
     )
 
-    def __init__(self, *, store: CanonicalStore, evidence_store: RawEvidenceStore, parser: EspnObservationParser, lease_for: timedelta = timedelta(minutes=5)) -> None:
+    def __init__(self, *, store: CanonicalStore, evidence_store: RawEvidenceStore, parser: object, lease_for: timedelta = timedelta(minutes=5)) -> None:
         self._store = store
         self._evidence_store = evidence_store
         self._parser = parser

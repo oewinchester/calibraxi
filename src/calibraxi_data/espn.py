@@ -18,6 +18,7 @@ class SourceObservation:
     source_identity: SourceIdentity
     name: str | None = None
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    canonical_id: str | None = None
     observed_at: datetime | None = None
     available_at: datetime | None = None
     knowledge_at: datetime | None = None

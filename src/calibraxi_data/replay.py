@@ -49,7 +49,7 @@ def replay_evidence(
             raise ValueError(f"raw evidence payload is not valid JSON: {exc}") from exc
 
         event_id = _event_id(evidence)
-        observations = parser.parse(evidence.capability, payload, event_id=event_id)
+        observations = parser.parse(evidence.capability, payload) if event_id is None else parser.parse(evidence.capability, payload, event_id=event_id)
         observations = tuple(replace(observation, observed_at=observation.observed_at or evidence.observed_at, available_at=observation.available_at or evidence.available_at, knowledge_at=observation.knowledge_at or evidence.knowledge_at, processing_at=observation.processing_at or evidence.processing_at) for observation in observations)
         result = store.persist(observations, evidence_id=evidence.evidence_id, run_id=run.run_id)
         if finalize_status:

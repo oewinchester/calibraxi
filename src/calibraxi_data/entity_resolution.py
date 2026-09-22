@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
+import re
+from typing import Iterable
 
 from .contracts import EntityType, SourceIdentity
+from .espn import SourceObservation
 
 
 class EntityResolutionIndex:
@@ -30,6 +34,17 @@ class EntityResolutionIndex:
     def suggest_by_name(self, entity_type: EntityType, name: str) -> tuple[str, ...]:
         return tuple(sorted(self._names.get((entity_type, self._normalize(name)), set())))
 
+    def annotate(self, observation: SourceObservation) -> SourceObservation:
+        """Attach only an explicit mapping; name suggestions never resolve state."""
+
+        canonical_id = self.resolve(observation.source_identity)
+        return replace(observation, canonical_id=canonical_id)
+
     @staticmethod
     def _normalize(name: str) -> str:
-        return " ".join(name.casefold().split())
+        tokens = re.findall(r"[a-z0-9]+", name.casefold())
+        return " ".join(token for token in tokens if token not in {"afc", "fc", "cf", "sc", "and"})
+
+
+def resolve_observations(index: EntityResolutionIndex, observations: Iterable[SourceObservation]) -> tuple[SourceObservation, ...]:
+    return tuple(index.annotate(observation) for observation in observations)

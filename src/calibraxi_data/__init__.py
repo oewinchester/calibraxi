@@ -18,12 +18,13 @@ from .contracts import (
     SourceResult,
 )
 from .evidence import FileSystemRawEvidenceStore, MinioRawEvidenceStore, RawEvidenceStore, S3RawEvidenceStore
-from .entity_resolution import EntityResolutionIndex
+from .entity_resolution import EntityResolutionIndex, resolve_observations
 from .http_json import HttpJsonSourceAdapter, UrllibTransport
 from .soccerdata import SoccerDataAdapter
 from .quality import DataQualityValidator, QualityIssue, ValidationResult
 from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
-from .persistence import CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
+from .persistence import CanonicalAuthorityPolicy, CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
+from .thesportsdb import TheSportsDbAdapter, TheSportsDbObservationParser, TheSportsDbSourceAdapter, TheSportsDbVerticalIngestor
 from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngestionReport
 from .replay import replay_evidence
 from .recovery import RecoveryAction, RecoveryOutcome, RecoveryWorker
@@ -37,6 +38,7 @@ __all__ = [
     "AcquisitionResult",
     "CapabilityState",
     "EntityResolutionIndex",
+    "resolve_observations",
     "EntityType",
     "FileSystemRawEvidenceStore",
     "S3RawEvidenceStore",
@@ -62,9 +64,14 @@ __all__ = [
     "EspnObservationParser",
     "EspnSourceAdapter",
     "SourceObservation",
+    "TheSportsDbObservationParser",
+    "TheSportsDbSourceAdapter",
+    "TheSportsDbAdapter",
+    "TheSportsDbVerticalIngestor",
     "FileSystemCanonicalStore",
     "PersistenceResult",
     "CanonicalStore",
+    "CanonicalAuthorityPolicy",
     "PostgresCanonicalStore",
     "EspnVerticalIngestor",
     "VerticalIngestionReport",

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import uuid4
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .contracts import (
     CapabilityState,
@@ -32,10 +32,39 @@ class PersistenceResult:
     canonical_rows_updated: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalAuthorityPolicy:
+    """Deterministic cross-source authority without latest-write-wins."""
+
+    source_order: Mapping[EntityType, tuple[str, ...]] | None = None
+    field_order: Mapping[tuple[EntityType, str], tuple[str, ...]] | None = None
+
+    def allows_update(self, *, entity_type: EntityType, current_source: str | None, incoming_source: str, field: str | None = None) -> bool:
+        if current_source is None or current_source == incoming_source:
+            return True
+        order = (self.field_order or {}).get((entity_type, field)) if field is not None else None
+        order = order or (self.source_order or {}).get(entity_type)
+        if not order:
+            return False
+        try:
+            current_rank = order.index(current_source)
+        except ValueError:
+            current_rank = len(order)
+        try:
+            incoming_rank = order.index(incoming_source)
+        except ValueError:
+            incoming_rank = len(order)
+        return incoming_rank < current_rank
+
+    def allows_field_update(self, *, entity_type: EntityType, field: str, current_source: str | None, incoming_source: str) -> bool:
+        return self.allows_update(entity_type=entity_type, current_source=current_source, incoming_source=incoming_source, field=field)
+
+
 class CanonicalStore(Protocol):
     def persist(self, observations: Iterable[SourceObservation], *, evidence_id: str, run_id: str | None = None) -> PersistenceResult: ...
     def persist_batch(self, batches: Iterable[tuple[Iterable[SourceObservation], str]], *, run_id: str | None = None) -> PersistenceResult: ...
     def count(self, entity_type: EntityType) -> int: ...
+    def canonical_id_for(self, identity: SourceIdentity) -> str | None: ...
     def start_run(self, source: str, *, run_id: str | None = None, replay_of: str | None = None) -> IngestionRun: ...
     def update_run(self, run_id: str, status: IngestionRunStatus, **kwargs: Any) -> IngestionRun: ...
     def get_run(self, run_id: str) -> IngestionRun | None: ...
@@ -63,11 +92,12 @@ def _json_value(value: Any) -> str:
 class FileSystemCanonicalStore:
     """Dev implementation; production can replace this boundary with PostgreSQL/S3 adapters."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, authority_policy: CanonicalAuthorityPolicy | None = None) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self._canonical: dict[tuple[EntityType, SourceIdentity], dict] = {}
+        self._canonical: dict[tuple[EntityType, str], dict] = {}
         self._identities: dict[SourceIdentity, str] = {}
+        self._authority_policy = authority_policy or CanonicalAuthorityPolicy()
         self._observations: list[dict] = []
         self._runs: dict[str, IngestionRun] = {}
         self._persistence_lineage: set[tuple[str, str]] = set()
@@ -81,12 +111,16 @@ class FileSystemCanonicalStore:
         lineage = 0
         for observation in observations:
             identity = observation.source_identity
-            canonical_id = self._identities.get(identity)
+            known_canonical_id = self._identities.get(identity)
+            canonical_id = observation.canonical_id or known_canonical_id
+            if known_canonical_id is not None and canonical_id != known_canonical_id:
+                raise ValueError(f"source identity already mapped to {known_canonical_id}")
             if canonical_id is None:
                 canonical_id = _canonical_id(identity)
+            if known_canonical_id is None:
                 self._identities[identity] = canonical_id
                 identities += 1
-            key = (observation.entity_type, identity)
+            key = (observation.entity_type, canonical_id)
             current = self._canonical.get(key)
             next_row = {
                 "canonical_id": canonical_id,
@@ -104,7 +138,7 @@ class FileSystemCanonicalStore:
             if current is None:
                 self._canonical[key] = next_row
                 rows += 1
-            elif current.get("name") != observation.name or current.get("attributes") != dict(observation.attributes):
+            elif self._authority_policy.allows_update(entity_type=observation.entity_type, current_source=current.get("source"), incoming_source=identity.source) and (current.get("name") != observation.name or current.get("attributes") != dict(observation.attributes)):
                 self._canonical[key] = next_row
                 updates += 1
             self._observations.append({"evidence_id": evidence_id, "canonical_id": canonical_id, "entity_type": observation.entity_type.value, "source": identity.source, "source_id": identity.source_id, "name": observation.name, "attributes": dict(observation.attributes), "observed_at": observation.observed_at, "available_at": observation.available_at, "knowledge_at": observation.knowledge_at, "processing_at": observation.processing_at})
@@ -135,6 +169,9 @@ class FileSystemCanonicalStore:
 
     def source_identity_count(self) -> int:
         return len(self._identities)
+
+    def canonical_id_for(self, identity: SourceIdentity) -> str | None:
+        return self._identities.get(identity)
 
     def observation_count(self) -> int:
         return len(self._observations)
@@ -264,8 +301,7 @@ class FileSystemCanonicalStore:
         canonical_path = self.root / "canonical.json"
         if canonical_path.exists():
             for item in json.loads(canonical_path.read_text(encoding="utf-8")):
-                identity = SourceIdentity(item["source"], EntityType(item["entity_type"]), item["source_id"])
-                self._canonical[(identity.entity_type, identity)] = item
+                self._canonical[(EntityType(item["entity_type"]), item["canonical_id"])] = item
         runs_path = self.root / "ingestion-runs.json"
         if runs_path.exists():
             for item in json.loads(runs_path.read_text(encoding="utf-8")):
@@ -324,6 +360,11 @@ class PostgresCanonicalStore:
             ADD COLUMN IF NOT EXISTS current_available_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS current_knowledge_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS current_processing_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE canonical_entities
+            ADD COLUMN IF NOT EXISTS current_source TEXT,
+            ADD COLUMN IF NOT EXISTS current_source_id TEXT
         """,
         """
         CREATE TABLE IF NOT EXISTS source_identities (
@@ -434,8 +475,9 @@ class PostgresCanonicalStore:
         """,
     )
 
-    def __init__(self, *, connection_factory: Callable[[], Any], auto_migrate: bool = True) -> None:
+    def __init__(self, *, connection_factory: Callable[[], Any], auto_migrate: bool = True, authority_policy: CanonicalAuthorityPolicy | None = None) -> None:
         self._connection_factory = connection_factory
+        self._authority_policy = authority_policy or CanonicalAuthorityPolicy()
         if auto_migrate:
             self.ensure_schema()
 
@@ -475,13 +517,19 @@ class PostgresCanonicalStore:
             cursor = connection.cursor()
             for observation, evidence_id in ((observation, evidence_id) for observations, evidence_id in materialized for observation in observations):
                 identity = observation.source_identity
-                canonical_id = _canonical_id(identity)
+                canonical_id = observation.canonical_id or _canonical_id(identity)
                 attributes = _json_value(observation.attributes)
+                current_source = None
+                cursor.execute("SELECT current_source FROM canonical_entities WHERE canonical_id = %s", (canonical_id,))
+                current_row = cursor.fetchone()
+                if current_row is not None and isinstance(current_row[0], str):
+                    current_source = current_row[0]
+                should_update = self._authority_policy.allows_update(entity_type=observation.entity_type, current_source=current_source, incoming_source=identity.source)
                 cursor.execute(
                     """
                     INSERT INTO canonical_entities
-                        (canonical_id, entity_type, name, attributes, current_evidence_id, current_observed_at, current_available_at, current_knowledge_at, current_processing_at)
-                    VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+                        (canonical_id, entity_type, name, attributes, current_evidence_id, current_observed_at, current_available_at, current_knowledge_at, current_processing_at, current_source, current_source_id)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (canonical_id) DO UPDATE SET
                         name = EXCLUDED.name,
                         attributes = EXCLUDED.attributes,
@@ -490,12 +538,15 @@ class PostgresCanonicalStore:
                         current_available_at = %s,
                         current_knowledge_at = %s,
                         current_processing_at = %s,
+                        current_source = %s,
+                        current_source_id = %s,
                         updated_at = now()
-                    WHERE canonical_entities.name IS DISTINCT FROM EXCLUDED.name
-                       OR canonical_entities.attributes IS DISTINCT FROM EXCLUDED.attributes
+                    WHERE %s
+                      AND (canonical_entities.name IS DISTINCT FROM EXCLUDED.name
+                       OR canonical_entities.attributes IS DISTINCT FROM EXCLUDED.attributes)
                     RETURNING (xmax = 0) AS inserted
                     """,
-                    (canonical_id, observation.entity_type.value, observation.name, attributes, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at),
+                    (canonical_id, observation.entity_type.value, observation.name, attributes, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at, identity.source, identity.source_id, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at, identity.source, identity.source_id, should_update),
                 )
                 if cursor.rowcount == 1:
                     returned = cursor.fetchone()
@@ -511,7 +562,13 @@ class PostgresCanonicalStore:
                     """,
                     (identity.source, identity.entity_type.value, identity.source_id, canonical_id),
                 )
-                identities += int(cursor.rowcount == 1)
+                identity_inserted = cursor.rowcount == 1
+                if observation.canonical_id is not None:
+                    cursor.execute("SELECT canonical_id FROM source_identities WHERE source = %s AND entity_type = %s AND source_id = %s", (identity.source, identity.entity_type.value, identity.source_id))
+                    existing_identity = cursor.fetchone()
+                    if existing_identity is not None and isinstance(existing_identity[0], str) and existing_identity[0] != canonical_id:
+                        raise ValueError(f"source identity already mapped to {existing_identity[0]}")
+                identities += int(identity_inserted)
                 fingerprint = hashlib.sha256(_json_value({"name": observation.name, "attributes": observation.attributes}).encode("utf-8")).hexdigest()
                 cursor.execute(
                     """
@@ -543,6 +600,19 @@ class PostgresCanonicalStore:
 
     def source_identity_count(self) -> int:
         return self._count("source_identities")
+
+    def canonical_id_for(self, identity: SourceIdentity) -> str | None:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT canonical_id FROM source_identities WHERE source = %s AND entity_type = %s AND source_id = %s", (identity.source, identity.entity_type.value, identity.source_id))
+            row = cursor.fetchone()
+            return row[0] if row is not None else None
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
 
     def observation_count(self) -> int:
         return self._count("source_observations")
