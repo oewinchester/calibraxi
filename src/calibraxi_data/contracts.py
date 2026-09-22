@@ -35,6 +35,9 @@ class EntityType(StrEnum):
     VENUE = "venue"
     REFEREE = "referee"
     MARKET = "market"
+    LINEUP = "lineup"
+    TEAM_STAT = "team_stat"
+    PLAYER_STAT = "player_stat"
 
 
 @dataclass(frozen=True, slots=True)

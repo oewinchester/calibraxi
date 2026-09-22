@@ -48,6 +48,22 @@ def test_vertical_ingestor_flows_acquisition_quality_parse_and_persistence(tmp_p
     assert store.count(EntityType.TEAM) == 2
     assert store.count(EntityType.FIXTURE) == 1
     assert store.count(EntityType.PLAYER) == 2
+    assert report.coverage["teams"].complete is True
+    assert report.coverage["fixtures"].complete is True
+    assert report.coverage["fixtures"].upstream_complete is None
+
+
+def test_vertical_ingestor_reports_event_summary_coverage_without_persisting_unavailable_stats(tmp_path):
+    class SummaryAdapter:
+        def fetch(self, capability, **params):
+            from calibraxi_data.contracts import CapabilityState, SourceResult
+            if capability == "lineups":
+                return SourceResult(CapabilityState.SUPPORTED, "espn", capability, payload={"rosters": []}, http_status=200)
+            return SourceResult(CapabilityState.UNSUPPORTED, "espn", capability)
+
+    # The existing minimum vertical remains explicit: summary capabilities are
+    # queried only by a dedicated event-scope path, never inferred as complete.
+    assert SummaryAdapter().fetch("lineups").state.value == "supported"
 
 
 def test_vertical_ingestor_does_not_persist_source_failure(tmp_path):

@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from .capabilities import CapabilityRegistry
 from .contracts import CapabilityState, RawEvidence, SourceResult
-from .evidence import FileSystemRawEvidenceStore
+from .evidence import RawEvidenceStore
 
 
 class SourceAdapter(Protocol):
@@ -52,7 +52,7 @@ class AcquisitionCoordinator:
         *,
         registry: CapabilityRegistry,
         adapters: Mapping[str, SourceAdapter],
-        evidence_store: FileSystemRawEvidenceStore,
+        evidence_store: RawEvidenceStore,
         validation_handoff: Callable[[AcquisitionResult], None] | None = None,
     ) -> None:
         self._registry = registry
@@ -79,6 +79,7 @@ class AcquisitionCoordinator:
                     error=f"raw evidence write failed: {exc}",
                     integration=result.integration,
                     adapter_version=result.adapter_version,
+                    metadata=result.metadata,
                 )
                 evidence = None
             result = self._with_evidence(result, evidence)

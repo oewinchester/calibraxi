@@ -67,7 +67,7 @@ class EspnSourceAdapter:
         if capability == "players":
             team_id = params.get("team_id")
             return (f"{base}/teams/{team_id}/roster", {}) if team_id else (None, {})
-        if capability in {"lineups", "match_stats"}:
+        if capability in {"lineups", "player_stats", "match_stats"}:
             event_id = params.get("event_id")
             return (f"{base}/summary", {"event": str(event_id)}) if event_id else (None, {})
         return None, {}
@@ -76,14 +76,58 @@ class EspnSourceAdapter:
 class EspnObservationParser:
     """Converts ESPN payloads to source-normalized observations only."""
 
-    def parse(self, capability: str, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
+    def parse(self, capability: str, payload: Mapping[str, Any], *, event_id: str | None = None) -> tuple[SourceObservation, ...]:
         if capability == "teams":
             return self._teams(payload)
         if capability == "players":
             return self._players(payload)
+        if capability in {"lineups", "player_stats", "match_stats"}:
+            return self._summary(payload, capability, event_id)
         if capability in {"competition", "season", "fixtures"}:
             return self._scoreboard(payload, capability)
         return ()
+
+    def _summary(self, payload: Mapping[str, Any], capability: str, event_id: str | None) -> tuple[SourceObservation, ...]:
+        if not event_id:
+            return ()
+        out: list[SourceObservation] = []
+        rosters = payload.get("rosters", [])
+        for roster in rosters if isinstance(rosters, list) else []:
+            team = roster.get("team") or {}
+            team_id = str(team.get("id")) if team.get("id") else None
+            if not team_id:
+                continue
+            entries = roster.get("roster") or []
+            for entry in entries if isinstance(entries, list) else []:
+                athlete = entry.get("athlete") or {}
+                player_id = str(athlete.get("id")) if athlete.get("id") else None
+                if not player_id:
+                    continue
+                source_id = f"{event_id}:{team_id}:{player_id}"
+                attrs = {
+                    "fixture_source_id": str(event_id),
+                    "team_source_id": team_id,
+                    "player_source_id": player_id,
+                    "starter": bool(entry.get("starter", False)),
+                    "active": entry.get("active"),
+                    "subbed_in": entry.get("subbedIn"),
+                    "subbed_out": entry.get("subbedOut"),
+                    "position": (entry.get("position") or {}).get("abbreviation"),
+                    "jersey": entry.get("jersey"),
+                }
+                if capability == "lineups":
+                    out.append(SourceObservation(EntityType.LINEUP, SourceIdentity("espn", EntityType.LINEUP, source_id), athlete.get("displayName") or athlete.get("fullName"), attrs))
+                elif capability == "player_stats":
+                    attrs["statistics"] = entry.get("stats") or []
+                    out.append(SourceObservation(EntityType.PLAYER_STAT, SourceIdentity("espn", EntityType.PLAYER_STAT, source_id), athlete.get("displayName") or athlete.get("fullName"), attrs))
+        if capability == "match_stats":
+            for team_stats in (payload.get("boxscore") or {}).get("teams", []) if isinstance((payload.get("boxscore") or {}).get("teams", []), list) else []:
+                team = team_stats.get("team") or {}
+                team_id = str(team.get("id")) if team.get("id") else None
+                if team_id:
+                    source_id = f"{event_id}:{team_id}"
+                    out.append(SourceObservation(EntityType.TEAM_STAT, SourceIdentity("espn", EntityType.TEAM_STAT, source_id), team.get("displayName") or team.get("name"), {"fixture_source_id": str(event_id), "team_source_id": team_id, "home_away": team_stats.get("homeAway"), "statistics": team_stats.get("statistics") or []}))
+        return tuple(out)
 
     def _scoreboard(self, payload: Mapping[str, Any], capability: str) -> tuple[SourceObservation, ...]:
         out: list[SourceObservation] = []

@@ -12,14 +12,14 @@ from .contracts import (
     SourceIdentity,
     SourceResult,
 )
-from .evidence import FileSystemRawEvidenceStore
+from .evidence import FileSystemRawEvidenceStore, MinioRawEvidenceStore, RawEvidenceStore, S3RawEvidenceStore
 from .entity_resolution import EntityResolutionIndex
 from .http_json import HttpJsonSourceAdapter, UrllibTransport
 from .soccerdata import SoccerDataAdapter
 from .quality import DataQualityValidator, QualityIssue, ValidationResult
 from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
-from .persistence import FileSystemCanonicalStore, PersistenceResult
-from .espn_vertical import EspnVerticalIngestor, VerticalIngestionReport
+from .persistence import CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
+from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngestionReport
 
 __all__ = [
     "CapabilityRegistry",
@@ -30,6 +30,9 @@ __all__ = [
     "EntityResolutionIndex",
     "EntityType",
     "FileSystemRawEvidenceStore",
+    "S3RawEvidenceStore",
+    "MinioRawEvidenceStore",
+    "RawEvidenceStore",
     "HealthState",
     "HttpJsonSourceAdapter",
     "RawEvidence",
@@ -47,6 +50,9 @@ __all__ = [
     "SourceObservation",
     "FileSystemCanonicalStore",
     "PersistenceResult",
+    "CanonicalStore",
+    "PostgresCanonicalStore",
     "EspnVerticalIngestor",
     "VerticalIngestionReport",
+    "CoverageResult",
 ]

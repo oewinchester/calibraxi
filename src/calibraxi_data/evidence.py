@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from .contracts import CapabilityState, RawEvidence
@@ -105,3 +106,126 @@ class FileSystemRawEvidenceStore:
         ):
             raise ValueError(f"{label} must be a single safe path component")
         return value
+
+
+class ObjectStorageClient(Protocol):
+    def put_object(self, **kwargs: Any) -> Any: ...
+    def get_object(self, **kwargs: Any) -> Mapping[str, Any]: ...
+
+
+class RawEvidenceStore(Protocol):
+    def put(self, **kwargs: Any) -> RawEvidence: ...
+    def read_payload(self, evidence: RawEvidence) -> bytes: ...
+
+
+class S3RawEvidenceStore:
+    """S3-compatible immutable evidence store for AWS S3 or local MinIO."""
+
+    def __init__(self, *, client: ObjectStorageClient, bucket: str, prefix: str = "raw") -> None:
+        if not bucket.strip():
+            raise ValueError("bucket cannot be empty")
+        self.client = client
+        self.bucket = bucket
+        self.prefix = prefix.strip("/")
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        bucket: str | None = None,
+        prefix: str = "raw",
+        endpoint_url: str | None = None,
+        region_name: str | None = None,
+        ensure_bucket: bool = False,
+    ) -> "S3RawEvidenceStore":
+        try:
+            import boto3
+        except ImportError as exc:
+            raise RuntimeError("boto3 is required for S3/MinIO evidence storage; install calibraxi-data[storage]") from exc
+        resolved_bucket = bucket or os.getenv("CALIBRAXI_S3_BUCKET", "calibraxi-dev")
+        resolved_endpoint = endpoint_url or os.getenv("CALIBRAXI_S3_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
+        client = boto3.client("s3", endpoint_url=resolved_endpoint, region_name=region_name or os.getenv("AWS_REGION"))
+        store = cls(client=client, bucket=resolved_bucket, prefix=prefix)
+        if ensure_bucket:
+            store.ensure_bucket()
+        return store
+
+    def ensure_bucket(self) -> None:
+        try:
+            self.client.head_bucket(Bucket=self.bucket)  # type: ignore[attr-defined]
+        except Exception:
+            self.client.create_bucket(Bucket=self.bucket)  # type: ignore[attr-defined]
+
+    def put(
+        self,
+        *,
+        source: str,
+        capability: str,
+        payload: Any,
+        result_state: CapabilityState = CapabilityState.SUPPORTED,
+        observed_at: datetime | None = None,
+        available_at: datetime | None = None,
+        knowledge_at: datetime | None = None,
+        received_at: datetime | None = None,
+        processing_at: datetime | None = None,
+        http_status: int | None = None,
+        parser_version: str | None = None,
+        schema_version: str | None = None,
+        correction_of: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> RawEvidence:
+        safe_source = FileSystemRawEvidenceStore._safe_component(source, "source")
+        safe_capability = FileSystemRawEvidenceStore._safe_component(capability, "capability")
+        body = _json_bytes(payload)
+        content_hash = hashlib.sha256(body).hexdigest()
+        evidence_id = str(uuid4())
+        received = received_at or _utc_now()
+        processing = processing_at or _utc_now()
+        knowledge = knowledge_at or received
+        object_path = "/".join(part for part in (self.prefix, safe_source, safe_capability, content_hash) if part)
+        evidence = RawEvidence(
+            evidence_id=evidence_id,
+            source=source,
+            capability=capability,
+            content_hash=content_hash,
+            object_path=object_path,
+            observed_at=observed_at,
+            available_at=available_at,
+            received_at=received,
+            knowledge_at=knowledge,
+            processing_at=processing,
+            http_status=http_status,
+            result_state=result_state,
+            parser_version=parser_version,
+            schema_version=schema_version,
+            correction_of=correction_of,
+            metadata=dict(metadata or {}),
+        )
+        self.client.put_object(Bucket=self.bucket, Key=object_path, Body=body, ContentType="application/json")
+        metadata_path = f"{object_path}/metadata/{evidence_id}.json"
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=metadata_path,
+            Body=json.dumps(asdict(evidence), default=lambda value: value.isoformat() if isinstance(value, datetime) else value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return evidence
+
+    def read_payload(self, evidence: RawEvidence) -> bytes:
+        response = self.client.get_object(Bucket=self.bucket, Key=evidence.object_path)
+        body = response["Body"]
+        return body.read() if hasattr(body, "read") else bytes(body)
+
+
+class MinioRawEvidenceStore(S3RawEvidenceStore):
+    """Named local-development entry point for an S3-compatible MinIO endpoint."""
+
+    @classmethod
+    def from_environment(cls, *, bucket: str = "calibraxi-dev", prefix: str = "raw") -> "MinioRawEvidenceStore":
+        store = S3RawEvidenceStore.from_environment(
+            bucket=bucket,
+            prefix=prefix,
+            endpoint_url=os.getenv("CALIBRAXI_MINIO_ENDPOINT_URL", "http://localhost:9000"),
+            ensure_bucket=True,
+        )
+        return cls(client=store.client, bucket=store.bucket, prefix=store.prefix)

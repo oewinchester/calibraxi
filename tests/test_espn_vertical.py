@@ -32,6 +32,17 @@ def test_espn_adapter_preserves_upstream_identity_and_capability():
     assert "dates=20261018" in transport.urls[0]
 
 
+def test_espn_summary_capabilities_use_event_identity_and_direct_json_endpoint():
+    transport = StaticTransport(b'{"rosters": [], "boxscore": {"teams": []}}')
+    adapter = EspnSourceAdapter(transport=transport)
+
+    result = adapter.fetch("lineups", league="eng.1", event_id="401879276")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.capability == "lineups"
+    assert "summary?event=401879276" in transport.urls[0]
+
+
 def test_espn_adapter_preserves_http_status_on_malformed_json():
     adapter = EspnSourceAdapter(transport=StaticTransport(b"broken"))
 
@@ -66,6 +77,38 @@ def test_espn_observation_parser_keeps_source_ids_and_fixture_relations():
     assert fixture.attributes["home_team_source_id"] == "349"
     assert fixture.attributes["away_team_source_id"] == "389"
     assert fixture.attributes["kickoff_at"] == datetime(2026, 10, 18, 13, 0, tzinfo=timezone.utc)
+
+
+def test_espn_summary_parser_preserves_lineup_and_team_player_stats_identity():
+    payload = {
+        "rosters": [{
+            "homeAway": "home",
+            "team": {"id": "349", "displayName": "AFC Bournemouth"},
+            "roster": [{
+                "starter": True,
+                "athlete": {"id": "p1", "displayName": "Player One"},
+                "position": {"abbreviation": "M"},
+                "stats": [{"name": "totalShots", "value": 2.0}],
+            }],
+        }],
+        "boxscore": {"teams": [{
+            "homeAway": "home",
+            "team": {"id": "349"},
+            "statistics": [{"name": "possessionPct", "displayValue": "55%"}],
+        }]},
+    }
+    parser = EspnObservationParser()
+
+    lineups = parser.parse("lineups", payload, event_id="401879276")
+    player_stats = parser.parse("player_stats", payload, event_id="401879276")
+    team_stats = parser.parse("match_stats", payload, event_id="401879276")
+
+    assert lineups[0].source_id == "401879276:349:p1"
+    assert lineups[0].attributes["starter"] is True
+    assert player_stats[0].source_id == "401879276:349:p1"
+    assert player_stats[0].attributes["statistics"][0]["name"] == "totalShots"
+    assert team_stats[0].source_id == "401879276:349"
+    assert team_stats[0].attributes["statistics"][0]["name"] == "possessionPct"
 
 
 def test_filesystem_canonical_store_is_idempotent_and_keeps_observation_lineage(tmp_path):
