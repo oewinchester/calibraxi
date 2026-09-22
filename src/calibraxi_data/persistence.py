@@ -22,6 +22,7 @@ class PersistenceResult:
 
 class CanonicalStore(Protocol):
     def persist(self, observations: Iterable[SourceObservation], *, evidence_id: str) -> PersistenceResult: ...
+    def persist_batch(self, batches: Iterable[tuple[Iterable[SourceObservation], str]]) -> PersistenceResult: ...
     def count(self, entity_type: EntityType) -> int: ...
 
 
@@ -63,6 +64,21 @@ class FileSystemCanonicalStore:
             lineage += 1
         self._flush()
         return PersistenceResult(rows, identities, lineage)
+
+    def persist_batch(self, batches: Iterable[tuple[Iterable[SourceObservation], str]]) -> PersistenceResult:
+        snapshot = (dict(self._canonical), dict(self._identities), list(self._observations))
+        totals = [0, 0, 0]
+        try:
+            for observations, evidence_id in batches:
+                result = self.persist(observations, evidence_id=evidence_id)
+                totals[0] += result.canonical_rows_written
+                totals[1] += result.source_identities_written
+                totals[2] += result.observation_lineage_written
+        except Exception:
+            self._canonical, self._identities, self._observations = snapshot
+            self._flush()
+            raise
+        return PersistenceResult(*totals)
 
     def count(self, entity_type: EntityType) -> int:
         return sum(1 for kind, _ in self._canonical if kind is entity_type)
@@ -168,13 +184,16 @@ class PostgresCanonicalStore:
             connection.close()
 
     def persist(self, observations: Iterable[SourceObservation], *, evidence_id: str) -> PersistenceResult:
-        materialized = tuple(observations)
+        return self.persist_batch(((observations, evidence_id),))
+
+    def persist_batch(self, batches: Iterable[tuple[Iterable[SourceObservation], str]]) -> PersistenceResult:
+        materialized = tuple((tuple(observations), evidence_id) for observations, evidence_id in batches)
         connection = self._connection_factory()
         cursor = None
         canonical_rows = identities = lineage = 0
         try:
             cursor = connection.cursor()
-            for observation in materialized:
+            for observation, evidence_id in ((observation, evidence_id) for observations, evidence_id in materialized for observation in observations):
                 identity = observation.source_identity
                 canonical_id = _canonical_id(identity)
                 attributes = _json_value(observation.attributes)

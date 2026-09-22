@@ -26,6 +26,15 @@ def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _raw_evidence_from_json(body: bytes) -> RawEvidence:
+    value = json.loads(body.decode("utf-8"))
+    for field in ("observed_at", "available_at", "received_at", "knowledge_at", "processing_at"):
+        if value.get(field):
+            value[field] = datetime.fromisoformat(value[field])
+    value["result_state"] = CapabilityState(value["result_state"])
+    return RawEvidence(**value)
+
+
 class FileSystemRawEvidenceStore:
     """Stores payload and metadata separately; callers can later swap the adapter."""
 
@@ -94,6 +103,10 @@ class FileSystemRawEvidenceStore:
     def read_payload(self, evidence: RawEvidence) -> bytes:
         return (self.root / evidence.object_path).read_bytes()
 
+    def read_metadata(self, evidence: RawEvidence) -> RawEvidence:
+        path = self.root / Path(evidence.object_path).parent / f"{evidence.evidence_id}.json"
+        return _raw_evidence_from_json(path.read_bytes())
+
     @staticmethod
     def _safe_component(value: str, label: str) -> str:
         """Keep source-controlled object paths below the configured evidence root."""
@@ -111,11 +124,13 @@ class FileSystemRawEvidenceStore:
 class ObjectStorageClient(Protocol):
     def put_object(self, **kwargs: Any) -> Any: ...
     def get_object(self, **kwargs: Any) -> Mapping[str, Any]: ...
+    def delete_object(self, **kwargs: Any) -> Any: ...
 
 
 class RawEvidenceStore(Protocol):
     def put(self, **kwargs: Any) -> RawEvidence: ...
     def read_payload(self, evidence: RawEvidence) -> bytes: ...
+    def read_metadata(self, evidence: RawEvidence) -> RawEvidence: ...
 
 
 class S3RawEvidenceStore:
@@ -202,19 +217,40 @@ class S3RawEvidenceStore:
             metadata=dict(metadata or {}),
         )
         self.client.put_object(Bucket=self.bucket, Key=object_path, Body=body, ContentType="application/json")
-        metadata_path = f"{object_path}/metadata/{evidence_id}.json"
-        self.client.put_object(
-            Bucket=self.bucket,
-            Key=metadata_path,
-            Body=json.dumps(asdict(evidence), default=lambda value: value.isoformat() if isinstance(value, datetime) else value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        # Keep metadata beside the payload. Object stores such as MinIO do not
+        # permit an object key and a child key below that object to coexist.
+        metadata_path = f"{object_path}.metadata/{evidence_id}.json"
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=metadata_path,
+                Body=json.dumps(asdict(evidence), default=lambda value: value.isoformat() if isinstance(value, datetime) else value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            # A payload without its manifest is not usable evidence. Remove the
+            # just-written object when the endpoint supports deletion, then
+            # propagate the failure to acquisition for fallback/quarantine.
+            delete_object = getattr(self.client, "delete_object", None)
+            if delete_object is not None:
+                try:
+                    delete_object(Bucket=self.bucket, Key=object_path)
+                except Exception:
+                    pass
+            raise
         return evidence
 
     def read_payload(self, evidence: RawEvidence) -> bytes:
         response = self.client.get_object(Bucket=self.bucket, Key=evidence.object_path)
         body = response["Body"]
         return body.read() if hasattr(body, "read") else bytes(body)
+
+    def read_metadata(self, evidence: RawEvidence) -> RawEvidence:
+        key = f"{evidence.object_path}.metadata/{evidence.evidence_id}.json"
+        response = self.client.get_object(Bucket=self.bucket, Key=key)
+        body = response["Body"]
+        raw = body.read() if hasattr(body, "read") else bytes(body)
+        return _raw_evidence_from_json(raw)
 
 
 class MinioRawEvidenceStore(S3RawEvidenceStore):

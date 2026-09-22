@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: calibraxi
+      POSTGRES_USER: calibraxi
+      POSTGRES_PASSWORD: calibraxi-dev
+    ports:
+      - "54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U calibraxi -d calibraxi"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - calibraxi-postgres-data:/var/lib/postgresql/data
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: calibraxi
+      MINIO_ROOT_PASSWORD: calibraxi-dev
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - calibraxi-minio-data:/data
+
+volumes:
+  calibraxi-postgres-data:
+  calibraxi-minio-data:

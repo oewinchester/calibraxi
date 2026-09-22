@@ -20,6 +20,7 @@ from .quality import DataQualityValidator, QualityIssue, ValidationResult
 from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
 from .persistence import CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
 from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngestionReport
+from .replay import replay_evidence
 
 __all__ = [
     "CapabilityRegistry",
@@ -55,4 +56,5 @@ __all__ = [
     "EspnVerticalIngestor",
     "VerticalIngestionReport",
     "CoverageResult",
+    "replay_evidence",
 ]

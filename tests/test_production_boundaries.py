@@ -7,7 +7,8 @@ from calibraxi_data import EntityType
 from calibraxi_data.espn import SourceObservation
 from calibraxi_data.contracts import SourceIdentity
 from calibraxi_data.evidence import S3RawEvidenceStore
-from calibraxi_data.persistence import PostgresCanonicalStore
+from calibraxi_data.persistence import FileSystemCanonicalStore, PostgresCanonicalStore
+from calibraxi_data.replay import replay_evidence
 
 
 class FakeS3:
@@ -22,6 +23,9 @@ class FakeS3:
     def get_object(self, *, Bucket, Key):
         return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
 
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop((Bucket, Key), None)
+
 
 def test_s3_evidence_is_content_addressed_and_readable():
     client = FakeS3()
@@ -32,8 +36,40 @@ def test_s3_evidence_is_content_addressed_and_readable():
     assert evidence.content_hash in evidence.object_path
     assert evidence.object_path.startswith("raw/espn/fixtures/")
     assert store.read_payload(evidence) == b'{"events":[1]}'
+    assert store.read_metadata(evidence).evidence_id == evidence.evidence_id
     assert len(client.puts) == 2
     assert client.puts[0]["Bucket"] == "calibraxi-dev"
+
+
+def test_s3_evidence_metadata_can_reconstruct_replay_reference():
+    client = FakeS3()
+    store = S3RawEvidenceStore(client=client, bucket="calibraxi-dev", prefix="raw")
+
+    evidence = store.put(source="espn", capability="teams", payload={"sports": []})
+    loaded = store.read_metadata(evidence)
+
+    assert loaded.evidence_id == evidence.evidence_id
+    assert loaded.content_hash == evidence.content_hash
+    assert loaded.object_path == evidence.object_path
+
+
+def test_s3_manifest_failure_does_not_leave_an_unmanifested_payload():
+    class FailingManifestS3(FakeS3):
+        def put_object(self, **kwargs):
+            if ".metadata/" in kwargs["Key"]:
+                raise OSError("metadata store unavailable")
+            super().put_object(**kwargs)
+
+    client = FailingManifestS3()
+    store = S3RawEvidenceStore(client=client, bucket="calibraxi-dev", prefix="raw")
+
+    try:
+        store.put(source="espn", capability="teams", payload={"sports": []})
+    except OSError as exc:
+        assert "metadata store unavailable" in str(exc)
+    else:
+        raise AssertionError("manifest failure was swallowed")
+    assert client.objects == {}
 
 
 class FakeCursor:
@@ -51,8 +87,9 @@ class FakeCursor:
             self.rowcount = 0 if params[0] in self.connection.canonical else 1
             self.connection.canonical.add(params[0])
         elif normalized.startswith("insert into source_identities"):
+            key = (params[0], params[1], params[2])
+            self.rowcount = 0 if key in self.connection.identities else 1
             self.connection.identities.add((params[0], params[1], params[2]))
-            self.rowcount = 1
         elif normalized.startswith("insert into source_observations"):
             key = tuple(params[:5])
             self.rowcount = 0 if key in self.connection.observations else 1
@@ -150,6 +187,23 @@ def test_postgres_store_never_reassigns_a_source_identity():
     assert "do update" not in identity_statement
 
 
+def test_postgres_store_persists_a_batch_in_one_transaction():
+    connection = FakeConnection()
+    store = PostgresCanonicalStore(connection_factory=lambda: connection, auto_migrate=False)
+
+    result = store.persist_batch(
+        [
+            ((_team_observation(),), "e1"),
+            ((_team_observation("Arsenal FC"),), "e2"),
+        ]
+    )
+
+    assert result.canonical_rows_written == 1
+    assert result.source_identities_written == 1
+    assert result.observation_lineage_written == 2
+    assert connection.commits == 1
+
+
 def test_postgres_schema_creation_is_explicit_and_transactional():
     connection = FakeConnection()
     store = PostgresCanonicalStore(connection_factory=lambda: connection, auto_migrate=False)
@@ -161,3 +215,56 @@ def test_postgres_schema_creation_is_explicit_and_transactional():
     assert "source_identities" in statements
     assert "source_observations" in statements
     assert connection.commits == 1
+
+
+def test_replay_reads_verified_payload_and_preserves_evidence_lineage(tmp_path):
+    from calibraxi_data.evidence import FileSystemRawEvidenceStore
+
+    evidence_store = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    evidence = evidence_store.put(
+        source="espn",
+        capability="teams",
+        payload={"sports": [{"leagues": [{"teams": [{"team": {"id": "349", "displayName": "Arsenal"}}]}]}]},
+    )
+    canonical = FileSystemCanonicalStore(tmp_path / "canonical")
+
+    result = replay_evidence(
+        evidence_store=evidence_store,
+        evidence=evidence,
+        parser=__import__("calibraxi_data").EspnObservationParser(),
+        store=canonical,
+    )
+
+    assert result.canonical_rows_written == 1
+    assert result.observation_lineage_written == 1
+    retry = replay_evidence(
+        evidence_store=evidence_store,
+        evidence=evidence,
+        parser=__import__("calibraxi_data").EspnObservationParser(),
+        store=canonical,
+    )
+    assert retry.canonical_rows_written == 0
+    assert retry.observation_lineage_written == 1
+    assert canonical.observation_count() == 2
+
+
+def test_replay_rejects_corrupt_payload_before_persistence(tmp_path):
+    from calibraxi_data.evidence import FileSystemRawEvidenceStore
+
+    evidence_store = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    evidence = evidence_store.put(source="espn", capability="teams", payload={"sports": []})
+    (tmp_path / "evidence" / evidence.object_path).write_bytes(b"corrupt")
+    canonical = FileSystemCanonicalStore(tmp_path / "canonical")
+
+    try:
+        replay_evidence(
+            evidence_store=evidence_store,
+            evidence=evidence,
+            parser=__import__("calibraxi_data").EspnObservationParser(),
+            store=canonical,
+        )
+    except ValueError as exc:
+        assert "content hash" in str(exc)
+    else:
+        raise AssertionError("corrupt evidence was replayed")
+    assert canonical.observation_count() == 0
