@@ -1,0 +1,256 @@
+{
+  "benchmark": "EPL 2025/26",
+  "scope": "Evidence captured during source qualification; unknown means no measured evidence was retained.",
+  "results": [],
+  "sources": [
+    {
+      "source": "ESPN",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http-json",
+      "classification": "measured",
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "richness_score": 1.0, "freshness_at": "2026-05-24"},
+        {"capability": "lineups", "state": "supported", "row_count": 22, "unique_source_id_count": 22, "note": "One completed-match sample"},
+        {"capability": "player_match_stats", "state": "supported", "row_count": 40, "note": "One completed-match sample"},
+        {"capability": "team_match_stats", "state": "supported", "row_count": 1, "note": "One completed-match sample"}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "events", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Sofascore",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "soccerdata",
+      "classification": "measured",
+      "measured": [{"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "overlap_count": 342, "overlap_ratio": 0.9, "latency_ms": 8500}, {"capability": "teams", "state": "supported", "row_count": 20}],
+      "unknown_capabilities": ["competitions", "seasons", "players", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Understat",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "soccerdata",
+      "classification": "measured",
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "overlap_count": 240, "overlap_ratio": 0.63, "latency_ms": 1300},
+        {"capability": "players", "state": "supported", "row_count": 537},
+        {"capability": "xg", "state": "supported", "row_count": 380, "note": "Team-match xG/PPDA and representative shot sample"},
+        {"capability": "shots", "state": "supported", "row_count": 1, "note": "Representative completed-match shot sample"}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "lineups", "events", "team_match_stats", "player_match_stats", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Football-Data.co.uk",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http-csv",
+      "classification": "measured",
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "latency_ms": 800, "note": "No upstream match ID; identity is schedule/name based"},
+        {"capability": "odds", "state": "supported", "row_count": 380, "note": "Result/odds fields in the CSV"}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "identity_assets"]
+    },
+    {
+      "source": "ClubElo",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http-csv",
+      "classification": "blocked",
+      "limitation": "current endpoint returned repeated HTTP 502 responses",
+      "measured": [{"capability": "team_ratings", "state": "source_failed", "error": "HTTP 502"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "FBref",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "browser-dependent",
+      "classification": "blocked",
+      "limitation": "browser/ChromeDriver localhost session failure; retries were stopped",
+      "measured": [],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "SoFIFA",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "browser-dependent",
+      "classification": "blocked",
+      "limitation": "browser-backed request hung; stopped without treating timeout as empty data",
+      "measured": [],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "WhoScored",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "browser-dependent",
+      "classification": "blocked",
+      "limitation": "request reset and browser session trouble; stopped",
+      "measured": [],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "FotMob",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http-json",
+      "classification": "blocked",
+      "limitation": "Guessed match-details endpoint returned HTTP 404",
+      "measured": [{"capability": "fixtures", "state": "source_failed", "http_statuses": [404], "error": "HTTP 404"}],
+      "unknown_capabilities": []
+    },
+    {
+      "source": "Soccerway",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "limitation": "Guessed season URL redirected; no stable direct benchmark response retained",
+      "measured": [{"capability": "fixtures", "state": "source_failed", "error": "redirected route"}],
+      "unknown_capabilities": []
+    },
+    {
+      "source": "Flashscore",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-html",
+      "classification": "incomplete",
+      "limitation": "Static HTML lacked reliable event IDs for qualification",
+      "measured": [{"capability": "fixtures", "state": "parser_schema_drift", "error": "stable event ID unavailable"}],
+      "unknown_capabilities": []
+    },
+    {
+      "source": "SoccerPunter",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "limitation": "Verification/redirect behavior prevented comparable current-season qualification",
+      "measured": [{"capability": "fixtures", "state": "source_failed", "error": "verification or redirect"}],
+      "unknown_capabilities": []
+    },
+    {
+      "source": "worldfootball.net",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "limitation": "Direct HTTP returned Cloudflare HTTP 403",
+      "measured": [{"capability": "fixtures", "state": "source_failed", "http_statuses": [403], "error": "HTTP 403"}],
+      "unknown_capabilities": []
+    },
+    {
+      "source": "FotMob",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "direct-after-browser-discovery",
+      "classification": "direct-after-browser-discovery",
+      "limitation": "One historical route showed an inconsistent embedded kickoff chronology; validate source chronology before production use",
+      "measured": [
+        {"capability": "competitions", "state": "supported", "row_count": 1, "note": "2025/2026 Premier League metadata"},
+        {"capability": "seasons", "state": "supported", "row_count": 1, "note": "Season metadata explicitly reported 2025/2026"},
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "freshness_at": "2026-05-24"},
+        {"capability": "teams", "state": "supported", "row_count": 20, "unique_source_id_count": 20},
+        {"capability": "lineups", "state": "supported", "row_count": 22, "unique_source_id_count": 22, "note": "11 home and 11 away lineup players in one completed-match sample"},
+        {"capability": "player_match_stats", "state": "supported", "row_count": 40, "note": "One completed-match sample"},
+        {"capability": "shots", "state": "supported", "row_count": 21, "note": "One completed-match sample"},
+        {"capability": "events", "state": "supported", "row_count": 1, "note": "Match-event payload exposed; event cardinality was not retained"},
+        {"capability": "team_match_stats", "state": "supported", "row_count": 1, "note": "Three period views exposed in one completed-match sample"},
+        {"capability": "xg", "state": "supported", "row_count": 1, "note": "xG and xGOT fields exposed in one completed-match sample"},
+        {"capability": "cards", "state": "supported", "row_count": 1, "note": "Card fields exposed in one completed-match sample"},
+        {"capability": "ratings", "state": "supported", "row_count": 1, "note": "Ratings exposed in one completed-match sample"}
+      ],
+      "unknown_capabilities": ["players", "xg_a", "corners", "standings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Soccerway",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-required",
+      "classification": "browser-required-but-usable",
+      "limitation": "Measured match page was current 2026/27, not comparable 2025/26 benchmark scope; no stable direct JSON endpoint retained",
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "One match page with stable mid reference; out-of-scope season sample"},
+        {"capability": "teams", "state": "supported", "row_count": 2, "note": "One match page"},
+        {"capability": "events", "state": "supported", "row_count": 1, "note": "Event timeline and substitutions exposed"},
+        {"capability": "lineups", "state": "supported", "row_count": 1, "note": "Lineup section exposed; player row count not retained"},
+        {"capability": "player_match_stats", "state": "supported", "row_count": 1, "note": "Player-stats section exposed; row count not retained"},
+        {"capability": "team_match_stats", "state": "supported", "row_count": 1, "note": "Possession, shots and big chances exposed"},
+        {"capability": "xg", "state": "supported", "row_count": 1, "note": "0.80 and 1.65 in one match page"},
+        {"capability": "odds", "state": "supported", "row_count": 1}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "players", "shots", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "identity_assets"]
+    },
+    {
+      "source": "Flashscore",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-dependent",
+      "classification": "browser-required-partial",
+      "limitation": "Sampled match was upcoming; deeper completed-match capabilities were not measured and no direct endpoint was identified",
+      "measured": [
+        {"capability": "competitions", "state": "supported", "row_count": 1},
+        {"capability": "seasons", "state": "supported", "row_count": 1},
+        {"capability": "standings", "state": "supported", "row_count": 20},
+        {"capability": "fixtures", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "Stable match URL and mid value; full-season count not retained"},
+        {"capability": "teams", "state": "supported", "row_count": 2, "note": "Team names in sampled match"}
+      ],
+      "unknown_capabilities": ["players", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "SoccerPunter",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-required",
+      "classification": "not-worth-operational-cost",
+      "limitation": "Requested 2025/26 route redirected to a 2015/16 EPL page; current benchmark coverage was not reachable",
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "Historical out-of-scope page"},
+        {"capability": "teams", "state": "supported", "row_count": 2, "note": "Historical out-of-scope page"},
+        {"capability": "odds", "state": "supported", "row_count": 1, "note": "Historical out-of-scope page"}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "players", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "identity_assets"]
+    },
+    {
+      "source": "worldfootball.net",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-required",
+      "classification": "browser-required-but-usable",
+      "limitation": "Direct HTTP returned Cloudflare 403; browser report pages exposed basic match data but limited advanced statistics",
+      "measured": [
+        {"capability": "competitions", "state": "supported", "row_count": 1, "note": "2025/26 competition page"},
+        {"capability": "seasons", "state": "supported", "row_count": 1},
+        {"capability": "standings", "state": "supported", "row_count": 20},
+        {"capability": "teams", "state": "supported", "row_count": 20, "unique_source_id_count": 20},
+        {"capability": "fixtures", "state": "supported", "row_count": 10, "unique_source_id_count": 10, "note": "One matchday page; full-season count not retained"},
+        {"capability": "events", "state": "supported", "row_count": 1, "note": "Completed report exposed goal events and scorers"},
+        {"capability": "lineups", "state": "supported", "row_count": 1, "note": "Completed report exposed formations, lineups and substitutions"}
+      ],
+      "unknown_capabilities": ["players", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "TheSportsDB",
+      "benchmark_stage": "first-stage",
+      "acquisition_mode": "direct-http-json",
+      "classification": "unmeasured",
+      "limitation": "Existing overlap adapter is available; no retained broad qualification counts in this benchmark artifact",
+      "measured": [],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "SoFIFA",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-required",
+      "classification": "browser-required-research-only",
+      "limitation": "Player/rating source only; current FC27 data was observed and match capabilities are not applicable",
+      "measured": [
+        {"capability": "players", "state": "supported", "row_count": 60, "unique_source_id_count": 60, "note": "Loaded Premier League roster page with player IDs, teams, ratings, potential, value and contract fields"}
+      ],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "WhoScored",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "browser-required",
+      "classification": "browser-required-but-usable",
+      "limitation": "Direct HTTP returned 403; one completed match was inspected and deeper team/player rows were not fully expanded",
+      "measured": [
+        {"capability": "competitions", "state": "supported", "row_count": 1, "note": "2025/26 Premier League season page"},
+        {"capability": "seasons", "state": "supported", "row_count": 1, "unique_source_id_count": 1},
+        {"capability": "fixtures", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "Completed sample match 1903442; season page exposed fixtures without retained full count"},
+        {"capability": "teams", "state": "supported", "row_count": 2, "unique_source_id_count": 2},
+        {"capability": "odds", "state": "supported", "row_count": 1},
+        {"capability": "cards", "state": "supported", "row_count": 1, "note": "Embedded match configuration exposed card counts"},
+        {"capability": "team_match_stats", "state": "supported", "row_count": 1, "note": "Statistics sections and indicators were visible; rows were not fully quantified"},
+        {"capability": "player_match_stats", "state": "supported", "row_count": 1, "note": "Player statistics section was visible; rows were not fully quantified"}
+      ],
+      "unknown_capabilities": ["players", "lineups", "events", "shots", "xg", "xg_a", "xg_got", "corners", "standings", "ratings", "historical_results", "identity_assets"]
+    }
+  ]
+}

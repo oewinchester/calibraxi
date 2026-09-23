@@ -20,7 +20,18 @@ from .contracts import (
 from .evidence import FileSystemRawEvidenceStore, MinioRawEvidenceStore, RawEvidenceStore, S3RawEvidenceStore
 from .entity_resolution import EntityResolutionIndex, resolve_observations
 from .http_json import HttpJsonSourceAdapter, UrllibTransport
-from .soccerdata import SoccerDataAdapter
+from .soccerdata import (
+    SOCCERDATA_PROVIDER_SPECS,
+    SoccerDataAdapter,
+    SoccerDataCapabilitySpec,
+    SoccerDataProviderBridge,
+    SoccerDataProviderSpec,
+    SoccerDataQualificationMatrix,
+    SoccerDataQualificationRecommendation,
+    SoccerDataQualificationResult,
+    SoccerDataQualificationRunner,
+    default_soccerdata_provider_specs,
+)
 from .quality import DataQualityValidator, QualityIssue, ValidationResult
 from .espn import EspnObservationParser, EspnSourceAdapter, SourceObservation
 from .persistence import CanonicalAuthorityPolicy, CanonicalStore, FileSystemCanonicalStore, PersistenceResult, PostgresCanonicalStore
@@ -51,6 +62,15 @@ __all__ = [
     "HttpJsonSourceAdapter",
     "RawEvidence",
     "SoccerDataAdapter",
+    "SoccerDataCapabilitySpec",
+    "SoccerDataProviderBridge",
+    "SoccerDataProviderSpec",
+    "SOCCERDATA_PROVIDER_SPECS",
+    "default_soccerdata_provider_specs",
+    "SoccerDataQualificationMatrix",
+    "SoccerDataQualificationRecommendation",
+    "SoccerDataQualificationResult",
+    "SoccerDataQualificationRunner",
     "SourceCapability",
     "SourceCapabilityHealth",
     "SourceCapabilityHealthSnapshot",
