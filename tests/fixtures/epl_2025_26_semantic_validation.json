@@ -1,0 +1,115 @@
+{
+  "benchmark": "EPL 2025/26 semantic validation",
+  "scope": "Measured live samples from completed, recent and upcoming EPL fixtures; this artifact records qualification evidence only and does not select source policy.",
+  "sources": {
+    "ESPN": {
+      "fixtures": {
+        "full_season_coverage": "380/380",
+        "completed_sample": 10,
+        "recent_sample": 4,
+        "upcoming_probe": "2026-09-23 returned HTTP 200 with zero events"
+      },
+      "chronology": {
+        "pit_quality": "strong",
+        "evidence": "summary metadata exposed lastUpdatedAt, firstPlayWallClock, lastPlayWallClock and post state"
+      },
+      "identity": "stable event IDs and team/player IDs in JSON"
+    },
+    "Sofascore": {
+      "fixtures": {
+        "coverage": "380/380",
+        "team_rows": 20,
+        "stable_id_field": "game_id",
+        "latency_ms": 11300
+      },
+      "match_level_measured": false,
+      "limitation": "installed SoccerData wrapper exposed schedule and league table; lineups, events, shots and match player stats were not measured through this boundary"
+    },
+    "Understat": {
+      "fixtures": {
+        "coverage": "380/380",
+        "stable_id_field": "game_id",
+        "season_state": "2025/26 fully completed"
+      },
+      "match_level": {
+        "sample_matches": 2,
+        "player_stats_rows": 57,
+        "shot_rows": 48,
+        "team_match_rows": 380,
+        "fields": [
+          "player_id",
+          "team_id",
+          "minutes",
+          "goals",
+          "shots",
+          "xg",
+          "xa",
+          "key_passes",
+          "yellow_cards",
+          "red_cards"
+        ]
+      },
+      "semantics": {
+        "xg_xa": "explicit",
+        "shots": "shot event rows include shot_id, location, minute, body_part, situation and result",
+        "chronology": "match date and season identifiers present; no source availability timestamp measured"
+      }
+    },
+    "Football-Data.co.uk": {
+      "fixtures": {
+        "coverage": "380/380",
+        "upstream_match_id": false,
+        "identity": "schedule date/time plus normalized home/away names"
+      },
+      "odds": {
+        "opening_columns_complete": true,
+        "closing_columns_complete": true,
+        "opening_examples": ["B365H", "B365D", "B365A", "AvgH", "AvgD", "AvgA"],
+        "closing_examples": ["B365CH", "B365CD", "B365CA", "AvgCH", "AvgCD", "AvgCA"],
+        "per_quote_timestamp": false,
+        "collection_note": "source notes state weekend odds are collected Friday afternoons and midweek odds Tuesday afternoons",
+        "semantic_status": "pre-closing and closing snapshots/aggregates, not a time series"
+      }
+    },
+    "FotMob": {
+      "fixtures": {
+        "coverage": "380/380",
+        "stable_schedule_id": true,
+        "structured_home_away_ids": true
+      },
+      "chronology": {
+        "fallback_safe": false,
+        "route_id_mismatch": true,
+        "schedule_fixture_id": "4813374",
+        "schedule_utc": "2025-08-15T19:00:00Z",
+        "detail_fixture_id": "5795455",
+        "detail_utc": "2026-09-20T13:00:00.000Z",
+        "visible_detail_date": "2025-08-15",
+        "explanation": "the schedule hash is not honored by the unfragmented match route; page data resolves to a current-season event while the visible page remains the historical fixture"
+      },
+      "limitation": "do not use match-detail route identity or chronology for fallback until a direct endpoint keyed by the schedule fixture ID is proven"
+    }
+  },
+  "capability_compatibility": {
+    "fixture_identity": {
+      "status": "conditionally_comparable",
+      "reason": "ESPN, Sofascore, Understat and FotMob expose stable IDs; Football-Data requires schedule/name matching"
+    },
+    "kickoff_chronology": {
+      "status": "conditionally_comparable",
+      "reason": "sources expose kickoff values but correction and source-availability timestamps are not uniform"
+    },
+    "lineups_events_stats": {
+      "status": "not_yet_comparable",
+      "reason": "ESPN is measured; Sofascore match-level fields were not measured and Understat is not a lineup/event authority"
+    },
+    "xg": {
+      "status": "not_directly_comparable",
+      "reason": "Understat xG is explicit but provider models and shot inclusion semantics differ from ESPN/FotMob"
+    },
+    "odds": {
+      "status": "not_pit_comparable",
+      "reason": "Football-Data opening/closing values lack per-quote timestamps; a point-in-time comparison needs timestamped observations"
+    }
+  }
+}

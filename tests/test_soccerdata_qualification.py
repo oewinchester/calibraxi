@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -487,6 +488,43 @@ def test_checked_in_epl_fixture_keeps_first_stage_deep_capabilities():
     )
     assert football_data_odds.state is CapabilityState.SUPPORTED
     assert football_data_odds.row_count == 380
+
+
+def test_checked_in_semantic_validation_preserves_measured_compatibility_limits():
+    payload = json.loads(
+        Path("tests/fixtures/epl_2025_26_semantic_validation.json").read_text(encoding="utf-8")
+    )
+
+    assert payload["benchmark"] == "EPL 2025/26 semantic validation"
+    sources = payload["sources"]
+    assert sources["ESPN"]["fixtures"]["completed_sample"] == 10
+    assert sources["ESPN"]["chronology"]["pit_quality"] == "strong"
+
+    assert sources["Sofascore"]["fixtures"]["coverage"] == "380/380"
+    assert sources["Sofascore"]["match_level_measured"] is False
+
+    understat = sources["Understat"]
+    assert understat["fixtures"]["coverage"] == "380/380"
+    assert understat["match_level"]["player_stats_rows"] == 57
+    assert understat["match_level"]["shot_rows"] == 48
+    assert understat["semantics"]["xg_xa"] == "explicit"
+
+    football_data = sources["Football-Data.co.uk"]
+    assert football_data["odds"]["opening_columns_complete"] is True
+    assert football_data["odds"]["closing_columns_complete"] is True
+    assert football_data["odds"]["per_quote_timestamp"] is False
+    assert "Friday" in football_data["odds"]["collection_note"]
+
+    fotmob = sources["FotMob"]
+    assert fotmob["chronology"]["fallback_safe"] is False
+    assert fotmob["chronology"]["route_id_mismatch"] is True
+    assert fotmob["chronology"]["schedule_fixture_id"] == "4813374"
+    assert fotmob["chronology"]["detail_fixture_id"] == "5795455"
+
+    comparable = payload["capability_compatibility"]
+    assert comparable["fixture_identity"]["status"] == "conditionally_comparable"
+    assert comparable["xg"]["status"] == "not_directly_comparable"
+    assert comparable["odds"]["status"] == "not_pit_comparable"
 
 
 def test_checked_in_epl_fixture_preserves_dynamic_first_stage_failures():
