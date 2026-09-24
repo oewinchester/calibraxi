@@ -316,6 +316,7 @@ class SoccerDataQualificationResult:
     acquisition_mode: str = "soccerdata"
     classification: str = "observed"
     limitation: str | None = None
+    operational_difficulty: str = "unknown"
     integration: str | None = None
     adapter_version: str | None = None
     http_statuses: tuple[int | None, ...] = ()
@@ -387,6 +388,7 @@ class SoccerDataQualificationMatrix:
                 "acquisition_mode": source.get("acquisition_mode", "unknown"),
                 "classification": source.get("classification", "unmeasured"),
                 "limitation": source.get("limitation"),
+                "operational_difficulty": source.get("operational_difficulty", "unknown"),
             }
             for measured in source.get("measured", ()):
                 rows.append({**common, **measured, "source": source_name})
@@ -424,7 +426,7 @@ class SoccerDataQualificationMatrix:
     def to_markdown(self) -> str:
         """Render comparable observed outcomes; no source policy is selected here."""
         headers = (
-            "Source", "Stage", "Acquisition mode", "Classification", "Integration", "Adapter version", "HTTP", "Capability", "State", "Coverage", "Rows", "IDs", "Overlap",
+            "Source", "Stage", "Acquisition mode", "Classification", "Operational difficulty", "Integration", "Adapter version", "HTTP", "Capability", "State", "Coverage", "Rows", "IDs", "Overlap",
             "Fields", "Richness", "Missing fields", "Duplicate IDs", "Freshness", "Latency",
             "Repeat success", "Schema stable", "PIT", "Rights", "Quality issues", "Error / note",
         )
@@ -456,6 +458,7 @@ class SoccerDataQualificationMatrix:
                 result.benchmark_stage,
                 result.acquisition_mode,
                 result.classification,
+                result.operational_difficulty,
                 _display_value(result.integration),
                 _display_value(result.adapter_version),
                 ",".join(str(status) if status is not None else "unknown" for status in result.http_statuses) or "unknown",

@@ -334,7 +334,7 @@ def test_qualification_matrix_exports_machine_readable_and_reviewable_reports():
     assert result["columns"] == ["game_id", "date", "home_team", "away_team"]
     assert result["coverage_expected"] == 380
     assert result["latency_samples_ms"] == []
-    assert "| example-source | first-stage | soccerdata | observed | unknown | unknown | unknown | fixtures | source_failed | 0/380 (0%) |" in report
+    assert "| example-source | first-stage | soccerdata | observed | unknown | unknown | unknown | unknown | fixtures | source_failed | 0/380 (0%) |" in report
     assert "game_id, date, home_team, away_team" in report
     assert "HTTP 503 \\| retry exhausted" in report
     assert "unknown" in report
@@ -401,7 +401,11 @@ def test_checked_in_epl_fixture_merges_all_sources_and_keeps_unknowns_explicit()
         "tests/fixtures/epl_2025_26_source_qualification.json"
     )
     sources = {result.source for result in matrix.results}
-    assert len(sources) == 14
+    assert len(sources) == 25
+    assert {
+        "StatBunker", "Global Sports Archive", "AiScore", "BeSoccer", "Transfermarkt",
+        "BetExplorer", "SoccerStats", "OpenFootball", "Footiqo", "11v11", "Mackolik",
+    }.issubset(sources)
     espn = next(result for result in matrix.results if result.source == "ESPN" and result.capability == "fixtures")
     assert espn.coverage_observed == 380
     assert espn.benchmark_stage == "first-stage"
@@ -449,6 +453,27 @@ def test_checked_in_epl_fixture_merges_all_sources_and_keeps_unknowns_explicit()
     assert "FotMob" in report
     assert "second-stage" in report
     assert "not measured" in report
+
+
+def test_focused_discovery_rows_keep_access_failures_separate_from_unknown_capabilities():
+    matrix = SoccerDataQualificationMatrix.from_fixture(
+        "tests/fixtures/epl_2025_26_source_qualification.json"
+    )
+    aiscore = next(result for result in matrix.results if result.source == "AiScore" and result.capability == "source_access")
+    assert aiscore.state is CapabilityState.SOURCE_FAILED
+    assert aiscore.http_statuses == (403,)
+    assert aiscore.classification == "blocked"
+    statbunker = next(result for result in matrix.results if result.source == "StatBunker" and result.capability == "source_access")
+    assert statbunker.state is CapabilityState.SUPPORTED
+    assert statbunker.classification == "accessible-unqualified"
+    unknown = next(result for result in matrix.results if result.source == "StatBunker" and result.capability == "fixtures")
+    assert unknown.state is CapabilityState.MISSING
+    assert unknown.classification == "unmeasured"
+    for source in ("StatBunker", "Global Sports Archive", "AiScore", "BeSoccer", "Transfermarkt", "BetExplorer", "SoccerStats", "OpenFootball", "Footiqo", "11v11", "Mackolik"):
+        rows = [result for result in matrix.results if result.source == source]
+        assert rows
+        assert all(result.operational_difficulty != "unknown" for result in rows)
+        assert any(result.latency_ms is not None for result in rows if result.capability == "source_access" or result.capability == "competitions")
 
 
 def test_checked_in_epl_fixture_preserves_multiple_stage_rows_for_one_source():
@@ -548,3 +573,52 @@ def test_checked_in_epl_fixture_preserves_dynamic_first_stage_failures():
         assert result.state is state
         assert result.classification in {"blocked", "incomplete"}
         assert result.limitation
+
+
+def test_corrected_source_evidence_is_additive_to_historical_qualification_stages():
+    payload = json.loads(
+        Path("tests/fixtures/epl_2025_26_source_qualification.json").read_text(encoding="utf-8")
+    )
+    entries = payload["sources"]
+    targets = {
+        "Global Sports Archive",
+        "StatBunker",
+        "Transfermarkt",
+        "BetExplorer",
+        "OpenFootball",
+        "11v11",
+        "Mackolik",
+    }
+    corrected = {
+        entry["source"]: entry
+        for entry in entries
+        if entry["benchmark_stage"] == "corrected-record-level"
+    }
+
+    assert set(corrected) == targets
+    for source in targets:
+        assert any(
+            entry["source"] == source and entry["benchmark_stage"] == "focused-discovery"
+            for entry in entries
+        )
+
+    previous_failures = {
+        entry["source"]: entry
+        for entry in entries
+        if entry["benchmark_stage"] == "focused-discovery"
+        and entry["source"] in {"BetExplorer", "OpenFootball"}
+    }
+    assert previous_failures["BetExplorer"]["measured"][0]["http_statuses"] == [404]
+    assert previous_failures["OpenFootball"]["measured"][0]["http_statuses"] == [404]
+
+    gsa_fixtures = next(item for item in corrected["Global Sports Archive"]["measured"] if item["capability"] == "fixtures")
+    assert gsa_fixtures["coverage_observed"] == 380
+    assert gsa_fixtures["unique_source_id_count"] == 380
+    statbunker = corrected["StatBunker"]
+    assert next(item for item in statbunker["measured"] if item["capability"] == "players")["row_count"] == 697
+    transfermarkt = corrected["Transfermarkt"]
+    assert next(item for item in transfermarkt["measured"] if item["capability"] == "fixtures")["row_count"] == 380
+    assert corrected["BetExplorer"]["classification"] == "operationally unsuitable"
+    assert corrected["OpenFootball"]["classification"] == "verification-reference"
+    assert next(item for item in corrected["11v11"]["measured"] if item["capability"] == "fixtures")["row_count"] == 380
+    assert "no normalized standings" in corrected["Mackolik"]["limitation"]

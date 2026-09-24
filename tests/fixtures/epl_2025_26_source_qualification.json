@@ -251,6 +251,321 @@
         {"capability": "player_match_stats", "state": "supported", "row_count": 1, "note": "Player statistics section was visible; rows were not fully quantified"}
       ],
       "unknown_capabilities": ["players", "lineups", "events", "shots", "xg", "xg_a", "xg_got", "corners", "standings", "ratings", "historical_results", "identity_assets"]
+    },
+    {
+      "source": "StatBunker",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-html",
+      "classification": "accessible-unqualified",
+      "operational_difficulty": "medium",
+      "limitation": "Public landing page returned HTTP 200, but no comparable EPL 2025/26 capability payload was captured",
+      "measured": [{"capability": "source_access", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 12002}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Global Sports Archive",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-html-jsonld",
+      "classification": "accessible-unqualified",
+      "operational_difficulty": "low",
+      "limitation": "Public soccer landing page returned HTTP 200; EPL 2025/26 completeness and stable IDs were not measured",
+      "measured": [{"capability": "source_access", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 750}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "AiScore",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "EPL route returned HTTP 403; no capability population inferred",
+      "measured": [{"capability": "source_access", "state": "source_failed", "http_statuses": [403], "latency_ms": 247, "error": "HTTP 403"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "BeSoccer",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "EPL route returned HTTP 406 with empty body",
+      "measured": [{"capability": "source_access", "state": "source_failed", "http_statuses": [406], "latency_ms": 202, "error": "HTTP 406"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Transfermarkt",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-html",
+      "classification": "accessible-unqualified",
+      "operational_difficulty": "low",
+      "limitation": "EPL 25/26 season page returned HTTP 200 and title scope, but no normalized capability counts or stable IDs were retained",
+      "measured": [{"capability": "competitions", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 957, "note": "Page title: Premier League 25/26"}],
+      "unknown_capabilities": ["seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "BetExplorer",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "Candidate EPL 2025/26 route returned HTTP 404",
+      "measured": [{"capability": "source_access", "state": "source_failed", "http_statuses": [404], "latency_ms": 409, "error": "HTTP 404"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "SoccerStats",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "Candidate current EPL route returned HTTP 403",
+      "measured": [{"capability": "source_access", "state": "source_failed", "http_statuses": [403], "latency_ms": 142, "error": "HTTP 403"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "OpenFootball",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-csv",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "Candidate GitHub EPL CSV route returned HTTP 404",
+      "measured": [{"capability": "source_access", "state": "source_failed", "http_statuses": [404], "latency_ms": 278, "error": "HTTP 404"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Footiqo",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-https",
+      "classification": "blocked",
+      "operational_difficulty": "blocked",
+      "limitation": "TLS handshake failed before an HTTP response was received",
+      "measured": [{"capability": "source_access", "state": "source_failed", "latency_ms": 154, "error": "TLS handshake failure"}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "11v11",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-html",
+      "classification": "accessible-unqualified",
+      "operational_difficulty": "low",
+      "limitation": "Premier League competition page returned HTTP 200, but no season-scoped 2025/26 capability counts were retained",
+      "measured": [{"capability": "competitions", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 316, "note": "Premier League competition page"}],
+      "unknown_capabilities": ["seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Mackolik",
+      "benchmark_stage": "focused-discovery",
+      "acquisition_mode": "direct-http-html",
+      "classification": "accessible-unqualified",
+      "operational_difficulty": "medium",
+      "limitation": "Archive landing page returned HTTP 200; EPL 2025/26 scope and stable capability payload were not measured",
+      "measured": [{"capability": "source_access", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 1468}],
+      "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "xg_a", "xg_got", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
+      "source": "Global Sports Archive",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html-jsonld",
+      "classification": "strong production candidate",
+      "operational_difficulty": "low",
+      "limitation": "The exact season/round URL, response hashes, and season-fetch latency were not retained. The season page itself shows one 10-match round; full coverage was counted across the 38 rounds.",
+      "captures": [
+        {"surface": "EPL 2025/26 rounds", "route": "competition_id=76035; round_id=125229; exact URL not retained", "http_status": 200, "row_count": 380, "unique_match_ids": 380, "rounds": 38, "repeat_fetch_consistency": "Repeated season/round extraction reproduced 380 unique match IDs; response hashes were not retained."},
+        {"surface": "representative match", "route": "https://globalsportsarchive.com/en/soccer/match/2025-08-15/liverpool-fc-vs-afc-bournemouth-fc/3739542", "http_status": 200, "response_bytes": 1725401, "source_match_id": "3739542"},
+        {"surface": "player stats", "route": "https://globalsportsarchive.com/en/soccer/match/2025-08-15/liverpool-fc-vs-afc-bournemouth-fc/3739542/player-stats", "http_status": 200, "response_bytes": 1680619},
+        {"surface": "shot chart", "route": "https://globalsportsarchive.com/en/soccer/match/2025-08-15/liverpool-fc-vs-afc-bournemouth-fc/3739542/shot-chart", "http_status": 200, "response_bytes": 1578090}
+      ],
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "note": "38 gameweeks; numeric competition, round, and match IDs."},
+        {"capability": "teams", "state": "supported", "row_count": 20, "unique_source_id_count": 20, "note": "Numeric team IDs."},
+        {"capability": "players", "state": "supported", "note": "Numeric player IDs observed; the season-wide player population was not counted."},
+        {"capability": "lineups", "state": "supported", "note": "Representative match exposes lineups and bench; row totals were not retained."},
+        {"capability": "events", "state": "supported", "note": "Representative match exposes match events and formations."},
+        {"capability": "team_match_stats", "state": "supported", "note": "Match statistics exposed; row totals were not retained."},
+        {"capability": "player_match_stats", "state": "supported", "note": "Dedicated player-stats route returned HTTP 200."},
+        {"capability": "shots", "state": "supported", "note": "Dedicated shot-chart route returned HTTP 200; marker count is not deduplicated and is not reported."},
+        {"capability": "xg", "state": "supported", "note": "xG fields exposed on the representative detail surfaces."},
+        {"capability": "identity_assets", "state": "supported", "note": "Venue, attendance, officials, and sidelined-player details exposed on the representative match surfaces."}
+      ],
+      "qualification_detail": {
+        "response_latency": "Not retained for these season and match-detail requests.",
+        "duplicates": "380 unique match IDs across the counted season; no duplicate fixture rows reported.",
+        "chronology": "Match dates/kickoffs are present; provider publication or source-available timestamps were not measured.",
+        "historical_depth": "Not measured in this qualification.",
+        "repeatability": "Season/round records repeated consistently by ID; exact hashes and per-route repeat counts were not retained.",
+        "unique_value_beyond_core": "Broad season coverage with source-local competition/team/player/match IDs, formations, officials, attendance, sidelined-player details, and integrated match/player statistics, shots, and xG. No exclusive xG claim is made against Understat/ESPN/Sofascore."
+      },
+      "unknown_capabilities": ["odds", "provider_publication_timestamps", "historical_revisions"]
+    },
+    {
+      "source": "StatBunker",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html",
+      "classification": "specialist production candidate",
+      "operational_difficulty": "medium",
+      "limitation": "Normalized detail-page repeats were consistent in the earlier capture, but season-table hashes/source publication times are unavailable; list latency varied and prior requests timed out.",
+      "captures": [
+        {"surface": "season appearances", "route": "https://www.statbunker.com/competitions/SeasonAppearances?comp_id=776", "http_statuses": [200, 200], "row_count": 697, "unique_player_ids": 679, "repeat_fetch_consistency": "Same first record and row count on two captures; 18 player IDs occur under multiple clubs."},
+        {"surface": "player standings", "route": "https://www.statbunker.com/competitions/PlayerStandings?comp_id=776", "http_status": 200, "row_count": 679, "player_ids_in_rows": 0, "latency_seconds_previous_samples": [2.7, 9.4]},
+        {"surface": "club-filtered appearances", "route": "https://www.statbunker.com/competitions/SeasonAppearances?comp_id=776&club_id=4", "http_status": 200, "row_count": 34, "club_id": "4"},
+        {"surface": "last matches offset 0", "route": "https://www.statbunker.com/competitions/LastMatches?comp_id=776&limit=10&offset=0", "http_status": 200, "row_count": 10, "unique_match_ids": 10, "latency_seconds": 5.82},
+        {"surface": "last matches offset 10", "route": "https://www.statbunker.com/competitions/LastMatches?comp_id=776&limit=10&offset=10", "http_status": 200, "row_count": 10, "unique_match_ids": 10, "latency_seconds": 5.94},
+        {"surface": "match detail", "route": "https://www.statbunker.com/competitions/MatchDetails/Premier-League-25/26/West-Ham-United-VS-Leeds-United?comp_id=776&match_id=128552&date=24-May-2026", "http_status": 200, "source_match_id": "128552"}
+      ],
+      "measured": [
+        {"capability": "competitions", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "EPL 2025/26 competition ID 776."},
+        {"capability": "players", "state": "supported", "row_count": 697, "unique_source_id_count": 679, "note": "Season appearances contain numeric player links; 18 IDs occur under two clubs after transfers."},
+        {"capability": "teams", "state": "supported", "row_count": 20, "unique_source_id_count": 20, "note": "Numeric club IDs; club_id=4 filtering returned 34 appearance rows."},
+        {"capability": "player_match_stats", "state": "supported", "row_count": 679, "note": "Player standings expose appearances, goals, assists, cards, starts, substitutions, penalties, and own goals; rows have no player ID links."},
+        {"capability": "fixtures", "state": "supported", "row_count": 20, "unique_source_id_count": 20, "note": "Two LastMatches pages of 10 distinct numeric match IDs using offset=0 and offset=10; not a season-complete schedule."},
+        {"capability": "lineups", "state": "supported", "row_count": 40, "note": "One match report lists 20 linked players per side and seven substitutions."},
+        {"capability": "events", "state": "supported", "row_count": 6, "note": "One match report has three goal descriptions and three booking descriptions."},
+        {"capability": "identity_assets", "state": "supported", "row_count": 1, "note": "Representative report exposes venue, attendance, and referee."}
+      ],
+      "qualification_detail": {
+        "pagination_and_filters": "offset=0/10 returned distinct match IDs; club_id=4 returned 34 rows. Earlier SeasonAppearances requests with page=2 or limit=100 were ignored.",
+        "duplicates": "SeasonAppearances has 697 club-player rows and 679 player IDs; the 18 repeated player IDs represent multiple club rows. The two observed LastMatches pages had disjoint IDs.",
+        "chronology": "Match date/kickoff fields are present. The update-after-match footer is a cadence statement; no provider publication timestamp or revision ID was exposed.",
+        "historical_depth": "Competition selectors list seasons back to 1993/94; historical field completeness was not measured.",
+        "repeatability_and_latency": "SeasonAppearances returned 697 rows and the same first record twice. New LastMatches pages took 5.82/5.94 seconds; earlier captures measured 27.2/30.3 seconds and included client timeouts. Preserve the latency variance.",
+        "unique_value_beyond_core": "Source-local numeric club/player/match IDs, season participation and contribution tables, transfer-split player memberships, and match-report goals/cards/substitutions/referee/venue/attendance. No xG, shot map, odds chronology, or player-match-stat table was observed."
+      },
+      "unknown_capabilities": ["shots", "xg", "odds", "provider_publication_timestamps", "historical_revisions"]
+    },
+    {
+      "source": "Transfermarkt",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html",
+      "classification": "specialist production candidate",
+      "operational_difficulty": "medium",
+      "limitation": "The captured record retained page families and counts but not the exact request URLs, response latencies, or repeat-fetch comparisons. Transfer-fee completeness and historical market-value entries were not parsed.",
+      "captures": [
+        {"surface": "Premier League GB1 season 2025 overview", "route": "Exact request URL not retained", "http_status": 200, "club_count": 20, "squad_memberships": 798},
+        {"surface": "club squad pages", "route": "20 club squad pages; exact request URLs not retained", "http_statuses": [200], "page_count": 20, "squad_memberships": 798, "unique_player_ids": 781, "players_listed_for_multiple_clubs": 17},
+        {"surface": "2025/26 schedule", "route": "Schedule page; exact request URL not retained", "http_status": 200, "row_count": 380, "unique_match_report_ids": 380},
+        {"surface": "season transfers", "route": "Transfers page; exact request URL not retained", "http_status": 200, "club_lists": 40, "row_references": 788, "unique_transfer_ids": 709},
+        {"surface": "market values", "route": "Premier League market-value page and sampled player page; exact request URLs not retained", "http_status": 200, "player_rows": 75, "example_player": "Erling Haaland", "page_label_last_update": "2026-07-22"},
+        {"surface": "match report", "route": "Representative match page; exact request URL not retained", "http_status": 200, "starters": 22, "bench_players": 18, "other_fields": ["events", "venue", "attendance", "referee"]}
+      ],
+      "measured": [
+        {"capability": "teams", "state": "supported", "row_count": 20, "unique_source_id_count": 20, "note": "Premier League GB1 season overview and numeric club IDs."},
+        {"capability": "players", "state": "supported", "row_count": 798, "unique_source_id_count": 781, "note": "798 squad memberships; 17 player IDs appear under more than one club."},
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "note": "Schedule records have numeric match-report IDs."},
+        {"capability": "transfers", "state": "supported", "row_count": 788, "unique_source_id_count": 709, "note": "40 club lists; fee fields were not parsed for completeness or semantics."},
+        {"capability": "market_values", "state": "supported", "row_count": 75, "note": "75 player rows; one sampled player page labels a last update of 2026-07-22. Historical value-change rows were not extracted."},
+        {"capability": "lineups", "state": "supported", "row_count": 40, "note": "One match report exposed 22 starters and 18 bench players."},
+        {"capability": "events", "state": "supported", "note": "Events exposed on the sampled match report; event count not retained."},
+        {"capability": "identity_assets", "state": "supported", "note": "Venue, attendance, and referee exposed on the sampled match report."}
+      ],
+      "qualification_detail": {
+        "stable_ids_and_duplicates": "Numeric club, player, match-report, and transfer IDs were observed. Squad rows are memberships, not unique players; 17 of 781 distinct players appeared under multiple clubs. Transfer lists had 788 row references and 709 transfer IDs.",
+        "repeatability_and_latency": "Not measured or not retained for these captures.",
+        "chronology": "Keep transfer effective dates, market-value effective dates, provider page publication/update time, and CalibraXI observed_at as separate fields. The 2026-07-22 Haaland page label is only a displayed last-update date; it is not a verified value-effective timestamp or CalibraXI knowledge time. Transfer-date semantics were not extracted.",
+        "historical_depth": "Market-value history rows were not extracted; historical depth remains unknown.",
+        "unique_value_beyond_core": "Stable club/player/transfer identities, squad memberships, transfer records, and market-value surfaces add transfer and valuation context absent from ESPN/Sofascore/Understat/Football-Data. Fee completeness and point-in-time value history remain unqualified."
+      },
+      "unknown_capabilities": ["transfer_fee_completeness", "historical_market_value_series", "source_publication_timestamps", "repeat_fetch_consistency", "historical_revisions"]
+    },
+    {
+      "source": "BetExplorer",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html",
+      "classification": "operationally unsuitable",
+      "operational_difficulty": "blocked",
+      "limitation": "The EPL results HTML contains an explicit 18+ confirmation overlay. No interaction or bypass was attempted; odds and match-detail surfaces were not pursued.",
+      "captures": [
+        {"surface": "EPL 2025/26 results", "route": "Exact request URL not retained", "http_statuses": [200, 200], "response_bytes": 381246, "sha256": "d7f6e1f8b6dfb9eeaacf995dc703a62261a633a6f519a1ebae4b77283caee1b7", "row_count": 380, "numeric_data_test_ids": 380, "slug_ids": 380, "repeat_fetch_consistency": "Two response bodies were byte-identical."}
+      ],
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "note": "380 EPL results rows; 380 numeric data-test IDs and 380 slug IDs in identical repeated HTML captures."}
+      ],
+      "qualification_detail": {
+        "markets_and_odds": "1X2 cells in the captured result rows are blank. Bookmakers, market names, opening/closing prices, and movement were not observed.",
+        "chronology": "No odds observation or per-quote timestamp was captured; no chronology can be inferred.",
+        "duplicates": "No duplicate result rows were reported in the 380-row capture; both bodies had identical hashes.",
+        "historical_depth": "Not measured.",
+        "latency": "Not retained.",
+        "unique_value_beyond_core": "No odds or other incremental capability was verified."
+      },
+      "unknown_capabilities": ["bookmakers", "odds", "opening_odds", "closing_odds", "historical_movement", "per_observation_timestamps", "match_details"]
+    },
+    {
+      "source": "OpenFootball",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-json",
+      "classification": "verification-reference",
+      "operational_difficulty": "low",
+      "limitation": "No provider fixture IDs, provider-side publication timestamps, odds, or PIT quote chronology. The earlier 404 was for a different guessed CSV route.",
+      "captures": [
+        {"surface": "basic season JSON", "route": "https://raw.githubusercontent.com/openfootball/football.json/master/2025-26/en.1.json", "http_statuses": [200, 200], "response_bytes": 108493, "sha256": "d6070bdf731546ccf97767f062e8af4bd26dd309dee69f6092025bf9c78f43c1", "row_count": 380, "latency_seconds": [0.33, 0.34], "repeat_fetch_consistency": "Byte-identical payloads."},
+        {"surface": "full season JSON", "route": "https://raw.githubusercontent.com/openfootball/football.json/master/2025-26/en.1-full.json", "http_statuses": [200, 200], "response_bytes": 1029891, "sha256": "cbc433be6594afec7c495a80e034578245ddda8cb0e9826743297471f188ceae", "row_count": 380, "latency_seconds": [0.45, 0.46], "repeat_fetch_consistency": "Byte-identical payloads."},
+        {"surface": "basic-file revision history", "route": "https://api.github.com/repos/openfootball/football.json/commits?path=2025-26/en.1.json&per_page=100", "http_status": 200, "revision_count": 22, "first_revision": "2025-07-30", "last_revision": "2026-05-26"},
+        {"surface": "full-file revision history", "route": "https://api.github.com/repos/openfootball/football.json/commits?path=2025-26/en.1-full.json&per_page=100", "http_status": 200, "revision_count": 1, "revision_date": "2026-08-24"}
+      ],
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "note": "38 rounds of 10 matches; 20 teams with 38 appearances each; dates 2025-08-15 through 2026-05-24. No provider fixture IDs."},
+        {"capability": "lineups", "state": "supported", "row_count": 760, "note": "Starting-XI arrays exist for all 760 team appearances. Only 758 of 760 team records have bench/substitution arrays."},
+        {"capability": "events", "state": "supported", "row_count": 2526, "note": "Goals: 1,045 records in 353 matches. Bookings: 1,481 records in 366 matches. Full file also includes 1,140 referee records."},
+        {"capability": "identity_assets", "state": "supported", "row_count": 380, "note": "Full file includes 380 venues, attendance values, and 1,140 referee records."}
+      ],
+      "qualification_detail": {
+        "duplicates": "No duplicate (date, team1, team2) keys in either file.",
+        "chronology": "Git commit time and ETag identify repository revisions, not provider collection times or per-fixture publication times.",
+        "historical_depth": "Basic file: 22 revisions from 2025-07-30 through 2026-05-26. Full file: one captured revision dated 2026-08-24.",
+        "missing_fields": "No source IDs, odds, xG/xA/xGOT, shots, ratings, injuries, transfers, or market values. Team names differ between the two files. Basic file has 27 bare [0,0] score values; full file has null/missing goals in 27 scoreless matches and bookings in 14 matches.",
+        "unique_value_beyond_core": "Fast, deterministic, independently revised public-domain fixtures/results and name-based venue, attendance, lineup, goal, booking, and referee records for cross-source verification."
+      },
+      "unknown_capabilities": ["provider_fixture_ids", "odds", "xg", "shots", "source_available_timestamps", "point_in_time_history"]
+    },
+    {
+      "source": "11v11",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html",
+      "classification": "research-only",
+      "operational_difficulty": "low",
+      "limitation": "Season coverage and one report sample are measured, but exact match-detail URL, response latency, full row counts, and historical depth were not retained.",
+      "captures": [
+        {"surface": "EPL 2025/26 matches", "route": "https://www.11v11.com/competitions/premier-league/2026/matches/", "http_status": 200, "row_count": 380, "unique_numeric_match_ids": 380},
+        {"surface": "representative match report", "route": "Linked from the 2026 season route; exact detail URL not retained", "http_statuses": [200, 200], "repeat_fetch_consistency": "Normalized page text matched; raw response hashes differed."}
+      ],
+      "measured": [
+        {"capability": "fixtures", "state": "supported", "coverage_expected": 380, "coverage_observed": 380, "coverage_ratio": 1.0, "row_count": 380, "unique_source_id_count": 380, "note": "Correct 2025/26 season route uses /2026/; the /2025/ season route was 2024/25."},
+        {"capability": "lineups", "state": "supported", "note": "One report exposed lineups; row count was not retained."},
+        {"capability": "events", "state": "supported", "note": "One report exposed goals, substitutions, and cards; event counts were not retained."},
+        {"capability": "identity_assets", "state": "supported", "note": "One report exposed referee, venue, and attendance."}
+      ],
+      "qualification_detail": {
+        "duplicates": "380 unique numeric match IDs on the season route; no duplicate count beyond the unique-ID total was retained.",
+        "latency": "Not retained for the season or detail routes.",
+        "chronology": "Match record dates are present; provider publication/update timestamps were not measured.",
+        "historical_depth": "Not measured.",
+        "unique_value_beyond_core": "One public match report adds referee, venue, attendance, substitutions, and cards; most match-detail fields overlap ESPN/Sofascore and the sample is too small to establish broader incremental coverage."
+      },
+      "unknown_capabilities": ["player_ids", "team_ids", "odds", "xg", "player_match_statistics", "provider_publication_timestamps", "historical_depth"]
+    },
+    {
+      "source": "Mackolik",
+      "benchmark_stage": "corrected-record-level",
+      "acquisition_mode": "direct-http-html",
+      "classification": "research-only",
+      "operational_difficulty": "medium",
+      "limitation": "The EPL season resolver identified season ID 70266 and its standings page returned HTTP 200, but no normalized standings/match records or stable record IDs were retained. Qualification stopped here.",
+      "captures": [
+        {"surface": "season resolver", "route": "https://arsiv.mackolik.com/CompetitionHandler.aspx?op=seasons&group=17&year=2025/2026", "http_status": 200, "competition": "English Premier League", "season_id": "70266"},
+        {"surface": "season standings page", "route": "https://arsiv.mackolik.com/Standings/Default.aspx?sId=70266", "http_status": 200, "response_bytes": 198566, "latency_seconds": 0.810451, "normalized_rows_retained": 0}
+      ],
+      "measured": [
+        {"capability": "seasons", "state": "supported", "row_count": 1, "unique_source_id_count": 1, "note": "EPL 2025/26 season ID 70266 from the archive resolver."},
+        {"capability": "source_access", "state": "supported", "row_count": 1, "http_statuses": [200], "latency_ms": 810, "note": "Season standings HTML response; no row-level parsing was retained."}
+      ],
+      "qualification_detail": {
+        "record_level_status": "Unresolved: no standings rows, match IDs, player/team IDs, pagination behavior, or match-detail records were measured.",
+        "repeatability": "Not measured.",
+        "chronology": "Not measured.",
+        "historical_depth": "Not measured.",
+        "unique_value_beyond_core": "None verified beyond resolving the EPL season ID."
+      },
+      "unknown_capabilities": ["teams", "players", "fixtures", "standings", "lineups", "events", "match_statistics", "odds", "provider_timestamps", "historical_depth"]
     }
   ]
 }
