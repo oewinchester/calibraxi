@@ -41,7 +41,10 @@ class SourceManifestRegistry:
     def snapshot(self) -> tuple[SourceManifest, ...]:
         return tuple(self._manifests.values())
 
-    def validate_policy(self, capability: SourceCapability) -> None:
+    def validate_policy(self, capability: SourceCapability, *, allow_review_required: bool = False) -> None:
+        allowed_rights = {"approved", "permitted"}
+        if allow_review_required:
+            allowed_rights.add("review_required")
         sources = (capability.primary_source, *capability.fallback_sources)
         for source in sources:
             manifest = self.get(source)
@@ -55,8 +58,10 @@ class SourceManifestRegistry:
                     raise ValueError(
                         f"semantic contract mismatch for {capability.key}: {source}={actual!r}, expected={capability.semantic_contract!r}"
                     )
-            if manifest.rights_state not in {"approved", "permitted", "review_required"}:
+            if manifest.rights_state not in allowed_rights:
                 raise ValueError(f"source rights state is not eligible: {source}")
+        if capability.usage_rights_state not in allowed_rights:
+            raise ValueError(f"capability rights state is not eligible: {capability.usage_rights_state}")
 
 
 class CapabilityRegistry:
@@ -69,30 +74,37 @@ class CapabilityRegistry:
         self._policy_store = policy_store
         self._manifest_registry = manifest_registry
 
-    def register(self, capability: SourceCapability) -> None:
+    def register(self, capability: SourceCapability, *, allow_review_required: bool = False) -> None:
         if not capability.key.strip():
             raise ValueError("capability key cannot be empty")
         if not capability.primary_source.strip():
             raise ValueError("primary source cannot be empty")
+        if capability.usage_rights_state == "review_required" and not allow_review_required:
+            raise ValueError("capability rights state is not eligible: review_required requires explicit local opt-in")
         if capability.key in self._capabilities:
             raise ValueError(f"capability already registered: {capability.key}")
         self._validate_sources(capability)
         if self._manifest_registry is not None:
-            self._manifest_registry.validate_policy(capability)
+            self._manifest_registry.validate_policy(capability, allow_review_required=allow_review_required)
         sources = (capability.primary_source, *capability.fallback_sources)
         self._capabilities[capability.key] = capability
         self._history[capability.key] = [capability]
         for source in sources:
             self._health[(capability.key, source)] = HealthState.HEALTHY
 
-    def activate(self, capability: SourceCapability) -> SourceCapability:
+    def activate(self, capability: SourceCapability, *, allow_review_required: bool = False) -> SourceCapability:
         if not capability.evidence_refs:
             raise ValueError(f"capability policy requires qualification evidence: {capability.key}")
         if capability.policy_version == "unversioned":
             raise ValueError(f"capability policy requires a version: {capability.key}")
+        allowed_rights = {"approved", "permitted"}
+        if allow_review_required:
+            allowed_rights.add("review_required")
+        if capability.usage_rights_state not in allowed_rights:
+            raise ValueError(f"capability rights state is not eligible: {capability.usage_rights_state}")
         self._validate_sources(capability)
         if self._manifest_registry is not None:
-            self._manifest_registry.validate_policy(capability)
+            self._manifest_registry.validate_policy(capability, allow_review_required=allow_review_required)
         if capability.key in self._capabilities:
             current = self._capabilities[capability.key]
             if current.policy_version == capability.policy_version:
@@ -105,7 +117,7 @@ class CapabilityRegistry:
             for source in (capability.primary_source, *capability.fallback_sources):
                 self._health.setdefault((capability.key, source), HealthState.HEALTHY)
             return capability
-        self.register(capability)
+        self.register(capability, allow_review_required=allow_review_required)
         return capability
 
     def policy_history(self, key: str) -> tuple[SourceCapability, ...]:

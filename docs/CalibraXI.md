@@ -12720,6 +12720,14 @@ Detailed engineering specification: **MOVED / CONSOLIDATED** into `docs/CalibraX
 - Public Recommendation Track Record includes only genuinely published Recommendation artifacts; Daily Pick is a genuine Recommendation subtype; public Studio Track Record includes only Published Studio Compositions. Withdrawals do not erase publication or evaluation history, and old Forecasts/Signals/rankings/user bets are never retrospectively backfilled as Recommendations.
 - The canonical analytical governance is recorded in `docs/CalibraXI-Analytics-Architecture.md`; this product document retains the product-facing behavior and decision history.
 
+## 13.15 2026-09-25 - Data Bootstrap and Forecasting Foundation
+
+- The first governed EPL vertical slice is populated from the production acquisition path. The measured archive contains 33 seasons (`1993/94` through `2025/26`), 12,704 completed fixtures, and 51 canonical teams.
+- Coverage is reported by source and capability. The bootstrap preserves 697 quarantined rows and 9,120 historical odds observations whose publication chronology is unknown; those odds are not pre-match features for an earlier cutoff.
+- Forecast outputs are consumed through immutable, versioned Feature Snapshots and Prediction Runs. A historical view is always an as-known-at-time artifact with cutoff, knowledge time, feature schema, model, calibration, and evidence lineage.
+- Forecast Probability, Reliability, Signal, Recommendation, and Curation remain separate product concepts. This phase establishes forecasting only; it does not publish Recommendations, Signals, portfolios, or betting decisions.
+- Historical Football-Data rows remain canonical evidence but are withheld from production PIT training until source availability chronology is proven. Synthetic PIT backtests are labeled synthetic-only and cannot establish production model performance.
+
 ---
 
 ## Sonraki notlar için kural

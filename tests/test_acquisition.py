@@ -91,9 +91,11 @@ def test_fixture_fallback_policy_captures_primary_failure_and_sofascore_evidence
             "fixtures",
             "espn",
             ("sofascore",),
+            usage_rights_state="review_required",
             policy_version="fixtures-semantic-v1",
             evidence_refs=("live-semantic-validation",),
-        )
+        ),
+        allow_review_required=True,
     )
     result = AcquisitionCoordinator(
         registry=registry,
