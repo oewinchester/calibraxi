@@ -571,3 +571,9 @@ These open items do not authorize ad hoc production behavior. Their absence prod
 - Temporal evaluation uses expanding windows with training cutoffs strictly before each evaluation cutoff. The stored 48-example analytical dataset and 40-prediction backtest are `synthetic_only`; they do not select a production model. On that population Elo had raw log loss `1.097603382`, Brier `0.666741472`, RPS `0.239481680`, and ECE `0.053365968`.
 - Temperature calibration is measured separately and versioned with its training window. It worsened synthetic raw log loss, so no calibration or model is promoted to production from this evidence. Real historical EPL PIT backtesting remains withheld until a chronology-qualified result source and complete identity mappings are available.
 - Prediction Runs, model artifacts, calibration artifacts, dataset manifests, and supersession/currentness links are append-only. Later Recommendation, Signal, portfolio, and publication layers must consume these artifacts without mutating their historical meaning.
+
+### 15.3 2026-09-25 - ESPN fixture reconciliation measurement
+
+- A governed ESPN replay over the 114 known 2025/26 EPL match dates observed 380 fixtures and 20 teams. The explicit provider-team alias map yielded 380/380 confirmed fixture mappings, zero unresolved mappings, and zero ambiguous mappings in PostgreSQL.
+- Reconciliation retained 158 kickoff schedule revisions, all attributable to the one-hour Football-Data/ESPN kickoff representation difference. No score, team-pair, competition, season, or duplicate-canonical-fixture conflict was promoted away.
+- ESPN evidence is lineage-complete in canonical persistence, but historical provider availability remains unknown. These observations cannot establish production PIT training eligibility by retrieval time alone.

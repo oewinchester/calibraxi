@@ -16,7 +16,7 @@ import json
 import re
 import time
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from .acquisition import AcquisitionCoordinator
 from .capabilities import CapabilityRegistry, SourceManifestRegistry
 from .contracts import CapabilityState, EntityType, SourceIdentity, SourceResult
-from .espn import SourceObservation
+from .espn import EspnObservationParser, SourceObservation
 from .http_json import HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
 from .source_registry import default_source_manifests, qualified_capability_policies
 
@@ -403,6 +403,107 @@ class BootstrapReport:
         target.write_text(json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
 
 
+@dataclass(frozen=True, slots=True)
+class EspnFixtureAcquisitionReport:
+    """Measured result of a date-scoped ESPN fixture acquisition run."""
+
+    league: str
+    requested_dates: tuple[str, ...]
+    successful_dates: tuple[str, ...]
+    failed_dates: tuple[str, ...]
+    fixture_count: int
+    team_count: int
+    evidence_count: int
+    evidence_ids: tuple[str, ...]
+    errors: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
+
+
+def collect_espn_fixture_observations(
+    coordinator: AcquisitionCoordinator,
+    dates: Iterable[str],
+    *,
+    league: str = "eng.1",
+    parser: EspnObservationParser | None = None,
+) -> tuple[tuple[SourceObservation, ...], EspnFixtureAcquisitionReport]:
+    """Acquire a bounded set of ESPN scoreboard dates through governed evidence.
+
+    Date-scoped requests are deliberately driven by the canonical schedule's
+    known match dates.  Repeated events are deduplicated by provider entity ID,
+    while every evidence ID remains attached to the normalized observation.
+    """
+
+    requested_dates = tuple(dict.fromkeys(str(value).strip() for value in dates if str(value).strip()))
+    if not requested_dates:
+        raise ValueError("at least one ESPN date is required")
+    observation_parser = parser or EspnObservationParser()
+    observations_by_key: dict[tuple[EntityType, str], SourceObservation] = {}
+    successful_dates: list[str] = []
+    failed_dates: list[str] = []
+    errors: list[str] = []
+    evidence_ids: list[str] = []
+
+    for date in requested_dates:
+        acquired = coordinator.acquire("fixtures", params={"league": league, "date": date})
+        for attempt in acquired.attempts:
+            if attempt.evidence is not None:
+                evidence_ids.append(attempt.evidence.evidence_id)
+        if acquired.state is not CapabilityState.SUPPORTED or acquired.evidence is None:
+            failed_dates.append(date)
+            errors.append(f"{date}: {acquired.error or acquired.state.value}")
+            continue
+        successful_dates.append(date)
+        evidence = acquired.evidence
+        parsed = observation_parser.parse("fixtures", acquired.payload)
+        for observation in parsed:
+            if observation.entity_type not in {EntityType.FIXTURE, EntityType.TEAM}:
+                continue
+            attributes = dict(observation.attributes)
+            prior_ids = attributes.get("evidence_ids") or ()
+            if isinstance(prior_ids, str):
+                prior_ids = (prior_ids,)
+            merged_evidence_ids = tuple(sorted(set(str(item) for item in prior_ids) | {evidence.evidence_id}))
+            attributes["evidence_id"] = merged_evidence_ids[0]
+            attributes["evidence_ids"] = merged_evidence_ids
+            normalized = replace(
+                observation,
+                attributes=attributes,
+                observed_at=observation.observed_at or evidence.observed_at,
+                available_at=observation.available_at or evidence.available_at,
+                knowledge_at=observation.knowledge_at or evidence.knowledge_at,
+                processing_at=observation.processing_at or evidence.processing_at,
+            )
+            key = (normalized.entity_type, normalized.source_id)
+            previous = observations_by_key.get(key)
+            if previous is None:
+                observations_by_key[key] = normalized
+                continue
+            previous_attributes = dict(previous.attributes)
+            previous_ids = previous_attributes.get("evidence_ids") or ()
+            if isinstance(previous_ids, str):
+                previous_ids = (previous_ids,)
+            all_ids = tuple(sorted(set(str(item) for item in previous_ids) | set(merged_evidence_ids)))
+            previous_attributes["evidence_id"] = all_ids[0]
+            previous_attributes["evidence_ids"] = all_ids
+            observations_by_key[key] = replace(previous, attributes=previous_attributes)
+
+    observations = tuple(observations_by_key[key] for key in sorted(observations_by_key, key=lambda item: (item[0].value, item[1])))
+    report = EspnFixtureAcquisitionReport(
+        league=league,
+        requested_dates=requested_dates,
+        successful_dates=tuple(successful_dates),
+        failed_dates=tuple(failed_dates),
+        fixture_count=sum(item.entity_type is EntityType.FIXTURE for item in observations),
+        team_count=sum(item.entity_type is EntityType.TEAM for item in observations),
+        evidence_count=len(set(evidence_ids)),
+        evidence_ids=tuple(sorted(set(evidence_ids))),
+        errors=tuple(errors),
+    )
+    return observations, report
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -623,6 +724,7 @@ def reconcile_espn_fixtures(
     for observation in espn_observations:
         if observation.entity_type is not EntityType.FIXTURE:
             continue
+        observation_evidence = tuple(sorted(set(evidence) | set(_espn_observation_evidence_ids(observation))))
         attrs = observation.attributes
         source_id = observation.source_identity.source_id
         home_team = _mapped_team_id(observation, attrs, "home", mapping_store=mapping_store, team_identity_map=team_identity_map)
@@ -631,7 +733,7 @@ def reconcile_espn_fixtures(
         season = attrs.get("season") or attrs.get("season_label")
         if not home_team or not away_team or not isinstance(kickoff, datetime):
             unresolved += 1
-            issues.append(ReconciliationIssue(source_id, "unresolved_mapping", ("team_pair", "kickoff_at"), dict(attrs), {}, evidence))
+            issues.append(ReconciliationIssue(source_id, "unresolved_mapping", ("team_pair", "kickoff_at"), dict(attrs), {}, observation_evidence))
             continue
         candidates = [
             fixture
@@ -651,7 +753,7 @@ def reconcile_espn_fixtures(
                             source=observation.source_identity.source,
                             source_fixture_id=source_id,
                             canonical_fixture_id=fixture.fixture_id,
-                            evidence_ids=evidence,
+                            evidence_ids=observation_evidence,
                             kickoff_at=kickoff,
                             home_team_source_id=str(attrs.get("home_team_source_id")) if attrs.get("home_team_source_id") else None,
                             away_team_source_id=str(attrs.get("away_team_source_id")) if attrs.get("away_team_source_id") else None,
@@ -671,10 +773,10 @@ def reconcile_espn_fixtures(
                         source_fixture_id=source_id,
                         canonical_fixture_id=candidate.fixture_id,
                         status=FixtureMappingStatus.AMBIGUOUS,
-                        evidence_ids=evidence,
+                        evidence_ids=observation_evidence,
                         rationale="multiple deterministic candidates remain",
                     )
-            issues.append(ReconciliationIssue(source_id, "ambiguous_mapping", ("fixture_identity",), dict(attrs), {"candidates": [item.fixture_id for item in candidates]}, evidence))
+            issues.append(ReconciliationIssue(source_id, "ambiguous_mapping", ("fixture_identity",), dict(attrs), {"candidates": [item.fixture_id for item in candidates]}, observation_evidence))
             continue
         fixture = candidates[0]
         if index is not None:
@@ -683,7 +785,7 @@ def reconcile_espn_fixtures(
                 source_fixture_id=source_id,
                 canonical_fixture_id=fixture.fixture_id,
                 status=FixtureMappingStatus.CONFIRMED,
-                evidence_ids=evidence,
+                evidence_ids=observation_evidence,
                 rationale="exact canonical team pair; compatible season and kickoff",
             )
         differing: list[str] = []
@@ -708,7 +810,7 @@ def reconcile_espn_fixtures(
                     tuple(dict.fromkeys(differing)),
                     dict(attrs),
                     {field: getattr(fixture, field) for field in dict.fromkeys(differing) if hasattr(fixture, field)},
-                    evidence,
+                    observation_evidence,
                 )
             )
     return tuple(issues), unresolved, ambiguous
@@ -754,6 +856,66 @@ def build_coverage(fixtures: Sequence[EplFixture], *, source: str = SOURCE, fixt
         CoverageMetric(source, "pit_eligible_historical_rows", "quarantined", 0, 0, pit_ineligible=len(fixtures), notes="Historical snapshot source does not publish row availability chronology."),
     ]
     return tuple(metrics)
+
+
+def _espn_team_mapping(observation: SourceObservation, mapping: Mapping[Any, str]) -> str | None:
+    source = observation.source_identity.source
+    source_id = observation.source_identity.source_id
+    for key in ((source, source_id), source_id, observation.source_identity):
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _espn_observation_evidence_ids(observation: SourceObservation) -> tuple[str, ...]:
+    values: list[str] = []
+    value = observation.attributes.get("evidence_id")
+    if value not in (None, ""):
+        values.append(str(value))
+    raw_values = observation.attributes.get("evidence_ids") or ()
+    if isinstance(raw_values, str):
+        raw_values = (raw_values,)
+    values.extend(str(item) for item in raw_values if item not in (None, ""))
+    return tuple(sorted(set(values)))
+
+
+def _persist_mapped_espn_observations(
+    store: Any,
+    observations: Sequence[SourceObservation],
+    *,
+    team_identity_map: Mapping[Any, str],
+) -> None:
+    """Persist only rows with an explicit canonical identity and evidence link."""
+
+    confirmed: dict[str, str] = {}
+    if hasattr(store, "fixture_mapping_candidates"):
+        for candidate in store.fixture_mapping_candidates(source="espn", source_fixture_id="*"):
+            if getattr(candidate.status, "value", candidate.status) != "confirmed":
+                continue
+            previous = confirmed.get(candidate.source_fixture_id)
+            if previous is not None and previous != candidate.canonical_fixture_id:
+                continue
+            confirmed[candidate.source_fixture_id] = candidate.canonical_fixture_id
+    batches: dict[str, list[SourceObservation]] = {}
+    for observation in observations:
+        evidence_ids = _espn_observation_evidence_ids(observation)
+        if not evidence_ids:
+            continue
+        canonical_id: str | None
+        if observation.entity_type is EntityType.TEAM:
+            canonical_id = _espn_team_mapping(observation, team_identity_map)
+        elif observation.entity_type is EntityType.FIXTURE:
+            canonical_id = confirmed.get(observation.source_identity.source_id)
+        else:
+            canonical_id = None
+        if canonical_id is None:
+            continue
+        normalized = replace(observation, canonical_id=canonical_id)
+        for evidence_id in evidence_ids:
+            batches.setdefault(evidence_id, []).append(normalized)
+    for evidence_id, rows in batches.items():
+        store.persist(rows, evidence_id=evidence_id)
 
 
 class ForecastingPostgresStore:
@@ -1466,6 +1628,7 @@ class EplBootstrapper:
             coverage.append(CoverageMetric("canonical", "ambiguous_mappings", "missing", 0, 0, missing=1, notes="Mapping population is not measured without ESPN observations."))
         else:
             espn_rows = tuple(espn_observations)
+            espn_fixture_rows = tuple(item for item in espn_rows if item.entity_type is EntityType.FIXTURE)
             resolved_team_identity_map: dict[Any, str] = dict(team_identity_map or {})
             # Existing canonical source-identity mappings are authoritative;
             # team names remain suggestions only and are never promoted here.
@@ -1512,7 +1675,12 @@ class EplBootstrapper:
                 team_identity_map=resolved_team_identity_map,
             )
             reconciliation.extend(mapping_issues)
-            coverage.append(CoverageMetric("espn", "fixture_mappings", "supported", len(espn_rows), len(espn_rows) - unresolved - ambiguous, unresolved + ambiguous, 0, 0, notes="Deterministic team/season/kickoff reconciliation."))
+            _persist_mapped_espn_observations(
+                self.canonical_store,
+                espn_rows,
+                team_identity_map=resolved_team_identity_map,
+            )
+            coverage.append(CoverageMetric("espn", "fixture_mappings", "supported", len(espn_fixture_rows), len(espn_fixture_rows) - unresolved - ambiguous, unresolved + ambiguous, 0, 0, notes="Deterministic team/season/kickoff reconciliation."))
             coverage.append(CoverageMetric("canonical", "unresolved_mappings", "supported", unresolved, 0, unresolved))
             coverage.append(CoverageMetric("canonical", "ambiguous_mappings", "supported", ambiguous, 0, ambiguous))
         # These are distinct populations.  Keep the absence of a source

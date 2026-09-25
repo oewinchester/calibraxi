@@ -12728,6 +12728,12 @@ Detailed engineering specification: **MOVED / CONSOLIDATED** into `docs/CalibraX
 - Forecast Probability, Reliability, Signal, Recommendation, and Curation remain separate product concepts. This phase establishes forecasting only; it does not publish Recommendations, Signals, portfolios, or betting decisions.
 - Historical Football-Data rows remain canonical evidence but are withheld from production PIT training until source availability chronology is proven. Synthetic PIT backtests are labeled synthetic-only and cannot establish production model performance.
 
+### 13.16 2026-09-25 - EPL 2025/26 ESPN reconciliation
+
+- The production acquisition path collected 114 known EPL 2025/26 match dates and retained 380 ESPN fixtures plus 20 teams in raw evidence.
+- Explicit provider-to-canonical aliases confirmed 380/380 ESPN fixture mappings; unresolved and ambiguous populations are both zero. Reconciliation retains 158 one-hour kickoff schedule revisions as evidence.
+- ESPN retrieval knowledge time is preserved, but provider publication/availability chronology is unknown. The enriched rows remain outside historical production PIT training until that chronology is proven.
+
 ---
 
 ## Sonraki notlar için kural

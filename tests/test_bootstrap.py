@@ -1,11 +1,14 @@
+import json
 from datetime import datetime, timezone
 
 import calibraxi_data.bootstrap as bootstrap_module
 from calibraxi_data import EntityType, FileSystemCanonicalStore, FileSystemRawEvidenceStore
 from calibraxi_data.bootstrap import (
     EplBootstrapper,
+    EspnFixtureAcquisitionReport,
     build_coverage,
     canonical_fixture_id,
+    collect_espn_fixture_observations,
     epl_season_codes,
     parse_football_data_csv,
     reconcile_espn_fixtures,
@@ -33,6 +36,32 @@ class StaticCsvTransport:
         return HttpResponse(200, self.body, {"Last-Modified": "Wed, 24 Sep 2026 00:00:00 GMT"})
 
 
+ESPN_PAYLOAD = {
+    "leagues": [{"id": "23", "name": "English Premier League", "slug": "eng.1", "season": {"year": 2025, "displayName": "2025-26"}}],
+    "events": [{
+        "id": "espn-alpha-beta",
+        "name": "Alpha v Beta",
+        "date": "2025-08-01T15:00:00Z",
+        "competitions": [{"competitors": [
+            {"homeAway": "home", "team": {"id": "espn-alpha", "displayName": "Alpha"}, "score": "2"},
+            {"homeAway": "away", "team": {"id": "espn-beta", "displayName": "Beta"}, "score": "1"},
+        ]}],
+        "status": {"type": {"name": "STATUS_FINAL", "state": "post", "completed": True}},
+    }],
+}
+
+
+class MappingJsonTransport:
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.urls = []
+
+    def request(self, url, *, headers, timeout):
+        self.urls.append(url)
+        date = url.split("dates=", 1)[1]
+        return HttpResponse(200, json.dumps(self.payloads[date]).encode("utf-8"), {"content-type": "application/json"})
+
+
 def test_season_label_preserves_canonical_short_year_format():
     assert season_label("2526") == "2025/26"
     assert season_label("9394") == "1993/94"
@@ -56,6 +85,99 @@ def test_epl_season_codes_reject_in_progress_archive_as_of_boundary():
         assert "not completed" in str(exc)
     else:
         raise AssertionError("future EPL archive must be rejected")
+
+
+def test_espn_fixture_collection_is_date_scoped_deduplicated_and_evidence_bound(tmp_path):
+    from calibraxi_data import AcquisitionCoordinator, CapabilityRegistry, FileSystemRawEvidenceStore, SourceManifestRegistry
+    from calibraxi_data.capabilities import SourceCapability
+    from calibraxi_data.espn import EspnSourceAdapter
+    from calibraxi_data.source_registry import FIXTURE_IDENTITY_V1, default_source_manifests
+
+    manifest = next(item for item in default_source_manifests() if item.source == "espn")
+    registry = CapabilityRegistry(manifest_registry=SourceManifestRegistry((manifest,)))
+    registry.register(SourceCapability("fixtures", "espn", usage_rights_state="review_required", policy_version="test-v1", evidence_refs=("test",), semantic_contract=FIXTURE_IDENTITY_V1), allow_review_required=True)
+    transport = MappingJsonTransport({"20250801": ESPN_PAYLOAD, "20250802": ESPN_PAYLOAD})
+    evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    coordinator = AcquisitionCoordinator(registry=registry, adapters={"espn": EspnSourceAdapter(transport=transport)}, evidence_store=evidence)
+
+    observations, report = collect_espn_fixture_observations(coordinator, ("20250802", "20250801", "20250801"))
+
+    assert isinstance(report, EspnFixtureAcquisitionReport)
+    assert report.requested_dates == ("20250802", "20250801")
+    assert report.successful_dates == report.requested_dates
+    assert report.fixture_count == 1
+    assert report.evidence_count == 2
+    assert len({observation.source_id for observation in observations if observation.entity_type is EntityType.FIXTURE}) == 1
+    assert all(observation.attributes["evidence_id"] for observation in observations)
+    assert len(transport.urls) == 2
+
+
+def test_bootstrap_persists_only_explicitly_mapped_espn_rows(tmp_path):
+    canonical = FileSystemCanonicalStore(tmp_path / "canonical")
+    evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    fixtures, _, _ = parse_football_data_csv(CSV, season="2526", retrieved_at=datetime(2026, 9, 25, tzinfo=UTC))
+    espn = (
+        SourceObservation(EntityType.TEAM, SourceIdentity("espn", EntityType.TEAM, "espn-alpha"), "Alpha", attributes={"evidence_id": "espn-evidence"}),
+        SourceObservation(EntityType.TEAM, SourceIdentity("espn", EntityType.TEAM, "espn-beta"), "Beta", attributes={"evidence_id": "espn-evidence"}),
+        SourceObservation(
+            EntityType.FIXTURE,
+            SourceIdentity("espn", EntityType.FIXTURE, "espn-alpha-beta"),
+            attributes={
+                "kickoff_at": fixtures[0].kickoff_at,
+                "home_team_source_id": "espn-alpha",
+                "away_team_source_id": "espn-beta",
+                "season": "2526",
+                "evidence_id": "espn-evidence",
+            },
+        ),
+    )
+
+    report = EplBootstrapper(canonical_store=canonical, evidence_store=evidence).bootstrap(
+        ["2526"], payloads={"2526": CSV}, espn_observations=espn,
+        team_identity_map={("espn", "espn-alpha"): fixtures[0].home_team_id, ("espn", "espn-beta"): fixtures[0].away_team_id},
+    )
+
+    assert report.unresolved_mappings == 0
+    assert report.ambiguous_mappings == 0
+    assert canonical.canonical_id_for(SourceIdentity("espn", EntityType.TEAM, "espn-alpha")) == fixtures[0].home_team_id
+    assert canonical.canonical_id_for(SourceIdentity("espn", EntityType.FIXTURE, "espn-alpha-beta")) == fixtures[0].fixture_id
+    assert canonical.count(EntityType.FIXTURE) == 2
+
+
+def test_bootstrap_preserves_all_explicit_espn_evidence_ids(tmp_path):
+    canonical = FileSystemCanonicalStore(tmp_path / "canonical")
+    evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    fixtures, _, _ = parse_football_data_csv(CSV, season="2526", retrieved_at=datetime(2026, 9, 25, tzinfo=UTC))
+    espn = (
+        SourceObservation(
+            EntityType.TEAM,
+            SourceIdentity("espn", EntityType.TEAM, "espn-alpha"),
+            "Alpha",
+            attributes={"evidence_id": "espn-evidence-1", "evidence_ids": ("espn-evidence-1", "espn-evidence-2")},
+        ),
+        SourceObservation(
+            EntityType.FIXTURE,
+            SourceIdentity("espn", EntityType.FIXTURE, "espn-alpha-beta"),
+            attributes={
+                "kickoff_at": fixtures[0].kickoff_at,
+                "home_team_source_id": "espn-alpha",
+                "away_team_source_id": "espn-beta",
+                "season": "2526",
+                "evidence_id": "espn-evidence-1",
+                "evidence_ids": ("espn-evidence-1", "espn-evidence-2"),
+            },
+        ),
+    )
+
+    EplBootstrapper(canonical_store=canonical, evidence_store=evidence).bootstrap(
+        ["2526"],
+        payloads={"2526": CSV},
+        espn_observations=espn,
+        team_identity_map={("espn", "espn-alpha"): fixtures[0].home_team_id},
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "canonical" / "observations.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {row["evidence_id"] for row in rows if row["source"] == "espn" and row["source_id"] == "espn-alpha"} == {"espn-evidence-1", "espn-evidence-2"}
 
 
 def test_espn_reconciliation_preserves_unresolved_and_ambiguous_mappings():
@@ -117,6 +239,7 @@ def test_espn_reconciliation_accepts_provider_season_code_and_is_idempotent(tmp_
             "home_team_canonical_id": fixtures[0].home_team_id,
             "away_team_canonical_id": fixtures[0].away_team_id,
             "season": "2526",
+            "evidence_ids": ("espn-evidence-1", "espn-evidence-2"),
         },
     )
     store = FileSystemCanonicalStore(tmp_path / "canonical")
@@ -130,6 +253,7 @@ def test_espn_reconciliation_accepts_provider_season_code_and_is_idempotent(tmp_
     candidates = store.fixture_mapping_candidates(source="espn", source_fixture_id="espn-alpha-beta")
     assert len(candidates) == 1
     assert candidates[0].status.value == "confirmed"
+    assert candidates[0].evidence_ids == ("espn-evidence-1", "espn-evidence-2")
 
 
 def test_bootstrap_does_not_promote_team_names_to_fixture_identity(tmp_path):
