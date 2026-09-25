@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from .contracts import CapabilityState, EntityType, SourceResult, SourceIdentity
-from .http_json import HttpTransport, UrllibTransport
+from .http_json import HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +37,18 @@ class EspnSourceAdapter:
     adapter_version = "espn-http-json-v1"
     _base = "https://site.web.api.espn.com/apis/site/v2/sports/soccer"
 
-    def __init__(self, *, transport: HttpTransport | None = None, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        *,
+        transport: HttpTransport | None = None,
+        timeout: float = 20.0,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep or time.sleep
 
     def fetch(self, capability: str, **params: Any) -> SourceResult:
         league = str(params.get("league", "eng.1"))
@@ -46,19 +56,30 @@ class EspnSourceAdapter:
         if endpoint is None:
             return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, adapter_version=self.adapter_version)
         url = f"{endpoint}?{urlencode(query)}" if query else endpoint
-        try:
-            response = self._transport.request(
-                url, headers={"User-Agent": "Mozilla/5.0", "Origin": "https://www.espn.com", "Accept": "application/json"}, timeout=self._timeout
-            )
-            if response.status < 200 or response.status >= 300:
-                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata={"url": url})
-            try:
-                payload = json.loads(response.body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata={"url": url})
-        except Exception as exc:
-            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata={"url": url})
         metadata: dict[str, Any] = {"url": url}
+        try:
+            request = request_with_retry(
+                self._transport,
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Origin": "https://www.espn.com", "Accept": "application/json"},
+                timeout=self._timeout,
+                retry_policy=self._retry_policy,
+                sleep=self._sleep,
+            )
+        except Exception as exc:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata=metadata)
+        metadata.update(request_metadata(request))
+        if request.error is not None:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(request.error), adapter_version=self.adapter_version, metadata=metadata)
+        response = request.response
+        if response is None:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error="transport returned no response", adapter_version=self.adapter_version, metadata=metadata)
+        if response.status < 200 or response.status >= 300:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata=metadata)
+        try:
+            payload = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata=metadata)
         source_observed_at = _payload_timestamp(payload, "lastUpdatedAt", "lastUpdated", "updatedAt")
         if source_observed_at is not None:
             metadata["source_observed_at"] = source_observed_at
@@ -169,7 +190,26 @@ class EspnObservationParser:
         competitors = (event.get("competitions") or [{}])[0].get("competitors", [])
         home = next((c.get("team", {}) for c in competitors if c.get("homeAway") == "home"), {})
         away = next((c.get("team", {}) for c in competitors if c.get("homeAway") == "away"), {})
-        return SourceObservation(EntityType.FIXTURE, SourceIdentity("espn", EntityType.FIXTURE, str(source_id)), event.get("name"), {"kickoff_at": _parse_dt(kickoff), "home_team_source_id": str(home.get("id")) if home.get("id") else None, "away_team_source_id": str(away.get("id")) if away.get("id") else None})
+        status = event.get("status") if isinstance(event.get("status"), Mapping) else {}
+        status_type = status.get("type") if isinstance(status.get("type"), Mapping) else {}
+        home_competitor = next((c for c in competitors if c.get("homeAway") == "home"), {})
+        away_competitor = next((c for c in competitors if c.get("homeAway") == "away"), {})
+        return SourceObservation(
+            EntityType.FIXTURE,
+            SourceIdentity("espn", EntityType.FIXTURE, str(source_id)),
+            event.get("name"),
+            {
+                "kickoff_at": _parse_dt(kickoff),
+                "home_team_source_id": str(home.get("id")) if home.get("id") else None,
+                "away_team_source_id": str(away.get("id")) if away.get("id") else None,
+                "status": status_type.get("name") or status.get("type"),
+                "status_family": _status_family(status_type.get("name") or status.get("type"), status_type.get("completed")),
+                "status_state": status_type.get("state"),
+                "status_completed": status_type.get("completed"),
+                "home_score": _score_value(home_competitor.get("score")),
+                "away_score": _score_value(away_competitor.get("score")),
+            },
+        )
 
     def _fixture_teams(self, event: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
         competitors = (event.get("competitions") or [{}])[0].get("competitors", [])
@@ -208,3 +248,30 @@ def _payload_timestamp(payload: Mapping[str, Any], *keys: str) -> str | None:
                 continue
             return value
     return None
+
+
+def _score_value(value: Any) -> int | float | str | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return int(number) if number.is_integer() else number
+
+
+def _status_family(value: Any, completed: Any = None) -> str:
+    text = str(value or "").lower().replace("status_", "")
+    if "postpon" in text:
+        return "postponed"
+    if "cancel" in text or "abandon" in text:
+        return "cancelled"
+    if completed is True or text in {"final", "full_time", "finished", "complete", "completed"}:
+        return "finished"
+    if "live" in text or "progress" in text or text in {"in", "halftime"}:
+        return "live"
+    if "delay" in text:
+        return "delayed"
+    if text in {"scheduled", "pre", "not_started", "upcoming"}:
+        return "scheduled"
+    return text or "unknown"

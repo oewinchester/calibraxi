@@ -8,6 +8,11 @@ from calibraxi_data import (
     FileSystemRawEvidenceStore,
     SourceCapability,
     IngestionRunStatus,
+    SofascoreObservationParser,
+    SourceIdentity,
+    FixtureIdentityIndex,
+    FixtureMappingCandidate,
+    FixtureMappingStatus,
 )
 from calibraxi_data.acquisition import AcquisitionCoordinator
 from calibraxi_data.espn_vertical import EspnVerticalIngestor
@@ -67,6 +72,170 @@ def test_vertical_ingestor_reports_event_summary_coverage_without_persisting_una
     # The existing minimum vertical remains explicit: summary capabilities are
     # queried only by a dedicated event-scope path, never inferred as complete.
     assert SummaryAdapter().fetch("lineups").state.value == "supported"
+
+
+def test_vertical_ingestor_parses_a_governed_sofascore_fixture_fallback(tmp_path):
+    from calibraxi_data.contracts import CapabilityState, SourceResult
+
+    class FallbackAdapter:
+        def fetch(self, capability, **params):
+            if capability == "teams":
+                return SourceResult(
+                    CapabilityState.SUPPORTED,
+                    "espn",
+                    capability,
+                    payload={"sports": [{"leagues": [{"teams": [{"team": {"id": "349", "displayName": "Arsenal"}}]}]}]},
+                )
+            if capability == "fixtures":
+                return SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="primary unavailable")
+            return SourceResult(CapabilityState.SUPPORTED, "espn", capability, payload={"athletes": []})
+
+    class SofascoreFallback:
+        def fetch(self, capability, **params):
+            assert capability == "fixtures"
+            return SourceResult(
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                capability,
+                payload={
+                    "events": [
+                        {
+                            "id": 14025013,
+                            "startTimestamp": 1755284400,
+                            "status": {"type": "finished"},
+                            "homeTeam": {"id": 44, "name": "Liverpool FC"},
+                            "awayTeam": {"id": 60, "name": "Bournemouth"},
+                        }
+                    ]
+                },
+            )
+
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("teams", "espn"))
+    registry.register(SourceCapability("fixtures", "espn", ("sofascore",)))
+    registry.register(SourceCapability("players", "espn"))
+    coordinator = AcquisitionCoordinator(
+        registry=registry,
+        adapters={"espn": FallbackAdapter(), "sofascore": SofascoreFallback()},
+        evidence_store=FileSystemRawEvidenceStore(tmp_path / "evidence"),
+    )
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+
+    report = EspnVerticalIngestor(
+        coordinator=coordinator,
+        parser=EspnObservationParser(),
+        source_parsers={"sofascore": SofascoreObservationParser()},
+        validator=DataQualityValidator(),
+        store=store,
+    ).ingest(league="eng.1")
+
+    assert report.failures == ()
+    assert report.coverage["fixtures"].complete is True
+    assert store.count(EntityType.FIXTURE) == 1
+    assert store.canonical_id_for(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) is not None
+
+
+def test_vertical_ingestor_translates_confirmed_fixture_mapping_for_detail_fallback(tmp_path):
+    from calibraxi_data.contracts import CapabilityState, SourceResult
+
+    canonical_fixture_id = "fixture:epl:2025-08-16:liverpool-bournemouth"
+    mapping_index = FixtureIdentityIndex()
+    for source, source_id in (("espn", "espn-fixture"), ("sofascore", "14025013")):
+        mapping_index.propose(FixtureMappingCandidate(source, source_id, canonical_fixture_id))
+        mapping_index.adjudicate(
+            source=source,
+            source_fixture_id=source_id,
+            canonical_fixture_id=canonical_fixture_id,
+            status=FixtureMappingStatus.CONFIRMED,
+        )
+
+    class FallbackAdapter:
+        def __init__(self):
+            self.summary_calls = []
+
+        def fetch(self, capability, **params):
+            if capability == "teams":
+                return SourceResult(
+                    CapabilityState.SUPPORTED,
+                    "espn",
+                    capability,
+                    payload={"sports": [{"leagues": [{"teams": [
+                        {"team": {"id": "44", "displayName": "Liverpool"}},
+                        {"team": {"id": "60", "displayName": "Bournemouth"}},
+                    ]}]}]},
+                )
+            if capability == "fixtures":
+                return SourceResult(
+                    CapabilityState.SUPPORTED,
+                    "espn",
+                    capability,
+                    payload={"events": [{
+                        "id": "espn-fixture",
+                        "date": "2025-08-16T16:00Z",
+                        "competitions": [{"competitors": [
+                            {"homeAway": "home", "team": {"id": "44", "displayName": "Liverpool"}},
+                            {"homeAway": "away", "team": {"id": "60", "displayName": "Bournemouth"}},
+                        ]}],
+                    }]},
+                )
+            if capability == "players":
+                return SourceResult(CapabilityState.SUPPORTED, "espn", capability, payload={"athletes": []})
+            self.summary_calls.append((capability, params))
+            return SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="ESPN detail unavailable")
+
+    class SofascoreFallback:
+        def __init__(self):
+            self.summary_calls = []
+
+        def fetch(self, capability, **params):
+            self.summary_calls.append((capability, params))
+            assert params["event_id"] == "14025013"
+            assert params["event_id"] != "espn-fixture"
+            if capability == "lineups":
+                payload = {
+                    "home": {"players": [{"teamId": 44, "player": {"id": 101, "name": "Home Player"}}]},
+                    "away": {"players": [{"teamId": 60, "player": {"id": 202, "name": "Away Player"}}]},
+                }
+            elif capability == "player_stats":
+                payload = {
+                    "home": {"players": [{"teamId": 44, "player": {"id": 101, "name": "Home Player"}, "statistics": {"minutesPlayed": 90}}]},
+                    "away": {"players": [{"teamId": 60, "player": {"id": 202, "name": "Away Player"}, "statistics": {"minutesPlayed": 90}}]},
+                }
+            else:
+                payload = {"statistics": [{"period": "ALL", "groups": [{"statisticsItems": [{"name": "Ball possession", "home": "55%", "away": "45%"}]}]}]}
+            return SourceResult(CapabilityState.SUPPORTED, "sofascore", capability, payload=payload)
+
+    espn = FallbackAdapter()
+    sofascore = SofascoreFallback()
+    registry = CapabilityRegistry()
+    for key in ("teams", "fixtures", "players", "lineups", "player_stats", "match_stats"):
+        registry.register(SourceCapability(key, "espn", ("sofascore",) if key in {"lineups", "player_stats", "match_stats"} else ()))
+    coordinator = AcquisitionCoordinator(
+        registry=registry,
+        adapters={"espn": espn, "sofascore": sofascore},
+        evidence_store=FileSystemRawEvidenceStore(tmp_path / "evidence"),
+        fixture_identity_index=mapping_index,
+    )
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+
+    report = EspnVerticalIngestor(
+        coordinator=coordinator,
+        parser=EspnObservationParser(),
+        source_parsers={"sofascore": SofascoreObservationParser()},
+        validator=DataQualityValidator(),
+        store=store,
+        fixture_identity_index=mapping_index,
+    ).ingest(league="eng.1", include_summaries=True)
+
+    assert report.failures == ()
+    assert report.coverage["lineups"].complete is True
+    assert report.coverage["player_stats"].complete is True
+    assert report.coverage["match_stats"].complete is True
+    assert {capability for capability, _ in sofascore.summary_calls} == {"lineups", "player_stats", "match_stats"}
+    assert all(params["event_id"] == "14025013" for _, params in sofascore.summary_calls)
+    assert store.count(EntityType.LINEUP) == 2
+    assert store.count(EntityType.PLAYER_STAT) == 2
+    assert store.count(EntityType.TEAM_STAT) == 2
 
 
 def test_vertical_ingestor_does_not_persist_source_failure(tmp_path):

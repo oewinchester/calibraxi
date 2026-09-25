@@ -524,3 +524,11 @@ It does not redefine product behavior or analytical semantics. Product and UX de
 ### 3.1 2026-09-22 — Source Acquisition Consolidated
 
 The detailed Source Acquisition / Scraper Platform specification was moved from `docs/CalibraXI.md` and consolidated here. The product document retains a concise product-level boundary and its historical decision entry. No source-acquisition decision was intentionally removed.
+
+### 3.2 2026-09-24 - Implemented acquisition boundaries
+
+The repository now implements the source-registry and policy boundaries described above. ESPN is the qualified fixture identity primary and Sofascore is an explicitly translated fixture fallback; provider-specific Sofascore statistics and Understat xG remain separate semantic contracts. Football-Data.co.uk is a historical snapshot source whose odds are not treated as point-in-time movement. Global Sports Archive, StatBunker, Transfermarkt, TheSportsDB and OpenFootball remain measured candidates or references until rights, operational stability, or coverage evidence supports activation.
+
+Source manifests and append-only capability policies are versioned and persistable. Fixture mappings are proposed and explicitly adjudicated; ambiguous mappings remain unresolved. Raw evidence can be stored in S3/MinIO and replayed through the normal parser and PostgreSQL canonical persistence boundary. Native JSON adapters use bounded retries for transient HTTP/network failures, while health, quarantine, recovery leases, and per-source rate/concurrency controls remain operational signals and do not redefine authority.
+
+Capability roles are explicit: ESPN owns fixture identity and normalized lineup fallback may use Sofascore only through a confirmed canonical fixture mapping; Sofascore player/team statistics, incidents, and shots retain provider-specific contracts. A fallback request carrying a provider fixture ID is rejected unless the source-specific ID is confirmed against the canonical fixture, and competition/season identity proposals use explicit cross-provider maps when provider IDs differ.

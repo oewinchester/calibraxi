@@ -9,14 +9,16 @@ from typing import Iterable
 
 from .contracts import EntityType, SourceIdentity
 from .espn import SourceObservation
+from .fixture_identity import FixtureIdentityIndex
 
 
 class EntityResolutionIndex:
     """Requires explicit source-ID mappings; names only produce suggestions."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fixture_index: FixtureIdentityIndex | None = None) -> None:
         self._mappings: dict[SourceIdentity, str] = {}
         self._names: defaultdict[tuple[EntityType, str], set[str]] = defaultdict(set)
+        self._fixture_index = fixture_index
 
     def map_source_identity(self, identity: SourceIdentity, canonical_id: str, *, name: str | None = None) -> None:
         if not canonical_id.strip():
@@ -38,6 +40,8 @@ class EntityResolutionIndex:
         """Attach only an explicit mapping; name suggestions never resolve state."""
 
         canonical_id = self.resolve(observation.source_identity)
+        if canonical_id is None and self._fixture_index is not None:
+            canonical_id = self._fixture_index.resolve(observation.source_identity)
         return replace(observation, canonical_id=canonical_id)
 
     @staticmethod

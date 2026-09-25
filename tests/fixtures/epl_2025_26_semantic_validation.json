@@ -22,8 +22,34 @@
         "stable_id_field": "game_id",
         "latency_ms": 11300
       },
-      "match_level_measured": false,
-      "limitation": "installed SoccerData wrapper exposed schedule and league table; lineups, events, shots and match player stats were not measured through this boundary"
+      "match_level_measured": true,
+      "match_level": {
+        "sample_matches": 5,
+        "representative_event_ids": ["16363633", "16363648", "16363866", "16363867", "16363652"],
+        "lineup_rows": 200,
+        "player_match_stat_rows": 200,
+        "incident_rows": 86,
+        "shot_rows": 145,
+        "team_stat_sides": 10,
+        "team_stat_fields_observed": ["expectedGoals", "expectedGoalsOnTarget", "cornerKicks", "yellowCards", "totalShotsOnGoal"],
+        "direct_endpoints": ["event/{id}", "event/{id}/lineups", "event/{id}/incidents", "event/{id}/statistics", "event/{id}/shotmap"]
+      },
+      "identity_chronology": {
+        "fixture_identity": "stable Sofascore event IDs; schedule/round endpoints provide translation candidates",
+        "kickoff_matches_espn": "5/5",
+        "home_away_order_matches_espn": "5/5 after explicit source-ID mapping",
+        "status_family_matches_espn": "5/5 finished samples",
+        "completed_score_matches_espn": "5/5",
+        "source_observed_timestamp": "changes.changeTimestamp present in 5/5 detail samples",
+        "source_available_timestamp": "unknown in 5/5; updatedTimestamp null",
+        "reschedule_correction_sample": "not observed in selected live sample"
+      },
+      "semantics": {
+        "xg_xgot": "provider-specific team statistics and shotmap fields; not interchangeable with ESPN or Understat",
+        "player_stats": "lineup endpoint contains populated player statistics for completed sample",
+        "incidents": "raw incident/event payload preserved; substitutions observed"
+      },
+      "limitation": "direct detail requires a Sofascore event ID; ESPN-to-Sofascore translation must be resolved from schedule/round evidence before activating fixture fallback"
     },
     "Understat": {
       "fixtures": {
@@ -101,7 +127,7 @@
     },
     "lineups_events_stats": {
       "status": "not_yet_comparable",
-      "reason": "ESPN is measured; Sofascore match-level fields were not measured and Understat is not a lineup/event authority"
+      "reason": "ESPN and Sofascore match-level fields are measured, but provider-specific field semantics still require explicit compatibility rules; Understat is not a lineup/event authority"
     },
     "xg": {
       "status": "not_directly_comparable",

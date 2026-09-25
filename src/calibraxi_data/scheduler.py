@@ -22,6 +22,45 @@ class SchedulerRunResult:
     skipped: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SourceRatePolicy:
+    """Small per-source scheduling guard for worker processes."""
+
+    min_interval: timedelta = timedelta(0)
+    max_concurrency: int = 1
+
+    def __post_init__(self) -> None:
+        if self.min_interval < timedelta(0) or self.max_concurrency < 1:
+            raise ValueError("rate policy values must be non-negative and max_concurrency must be positive")
+
+
+class SourceRateLimiter:
+    """Process-local rate/concurrency limiter; durable leases remain store-owned."""
+
+    def __init__(self, policies: Mapping[str, SourceRatePolicy] | None = None) -> None:
+        self._policies = dict(policies or {})
+        self._next_allowed: dict[str, datetime] = {}
+        self._active: dict[str, int] = {}
+
+    def try_acquire(self, source: str, *, now: datetime | None = None) -> bool:
+        current = now or datetime.now(timezone.utc)
+        policy = self._policies.get(source, SourceRatePolicy())
+        if self._active.get(source, 0) >= policy.max_concurrency:
+            return False
+        if self._next_allowed.get(source, datetime.min.replace(tzinfo=timezone.utc)) > current:
+            return False
+        self._active[source] = self._active.get(source, 0) + 1
+        self._next_allowed[source] = current + policy.min_interval
+        return True
+
+    def release(self, source: str) -> None:
+        active = self._active.get(source, 0)
+        if active <= 1:
+            self._active.pop(source, None)
+        else:
+            self._active[source] = active - 1
+
+
 class EspnIngestionScheduler:
     """Serializes one source/league worker slot using durable store leases."""
 
@@ -37,6 +76,7 @@ class EspnIngestionScheduler:
         slot_key: str | None = None,
         source_name: str = "espn",
         ingestion_params: Mapping[str, Any] | None = None,
+        rate_limiter: SourceRateLimiter | None = None,
     ) -> None:
         self._store = store
         self._ingestor = ingestor
@@ -47,15 +87,25 @@ class EspnIngestionScheduler:
         self._source_name = source_name
         self._slot_key = slot_key or f"{source_name}:{league}"
         self._ingestion_params = dict(ingestion_params or {})
+        self._rate_limiter = rate_limiter
 
     def run_once(self, *, date: str | None = None, include_summaries: bool = False) -> SchedulerRunResult:
         token = str(uuid4())
         now = datetime.now(timezone.utc)
+        rate_acquired = False
+        if self._rate_limiter is not None:
+            rate_acquired = self._rate_limiter.try_acquire(self._source_name, now=now)
+            if not rate_acquired:
+                return SchedulerRunResult(None, skipped=True, error="source rate or concurrency limit is active")
         try:
             claimed = self._store.claim_worker_lease(self._slot_key, token=token, lease_until=now + self._lease_for)
         except Exception as exc:
+            if rate_acquired and self._rate_limiter is not None:
+                self._rate_limiter.release(self._source_name)
             return SchedulerRunResult(None, error=f"worker lease claim failed: {exc}")
         if not claimed:
+            if rate_acquired and self._rate_limiter is not None:
+                self._rate_limiter.release(self._source_name)
             return SchedulerRunResult(None, skipped=True, error="worker slot is leased by another worker")
 
         recovery: tuple[RecoveryOutcome, ...] = ()
@@ -92,3 +142,5 @@ class EspnIngestionScheduler:
                 self._store.release_worker_lease(self._slot_key, token=token)
             except Exception:
                 pass
+            if rate_acquired and self._rate_limiter is not None:
+                self._rate_limiter.release(self._source_name)

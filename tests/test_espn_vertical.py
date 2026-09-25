@@ -87,6 +87,32 @@ def test_espn_observation_parser_keeps_source_ids_and_fixture_relations():
     assert fixture.attributes["kickoff_at"] == datetime(2026, 10, 18, 13, 0, tzinfo=timezone.utc)
 
 
+def test_espn_fixture_parser_preserves_status_and_completed_score_state():
+    observations = EspnObservationParser().parse(
+        "fixtures",
+        {
+            "events": [{
+                "id": "401879301",
+                "date": "2026-08-21T19:00Z",
+                "status": {"type": {"name": "STATUS_FINAL", "state": "post", "completed": True}},
+                "competitions": [{"competitors": [
+                    {"homeAway": "home", "score": "3", "team": {"id": "359", "displayName": "Arsenal"}},
+                    {"homeAway": "away", "score": "0", "team": {"id": "388", "displayName": "Coventry City"}},
+                ]}],
+            }],
+        },
+    )
+
+    fixture = next(item for item in observations if item.entity_type is EntityType.FIXTURE)
+
+    assert fixture.attributes["status"] == "STATUS_FINAL"
+    assert fixture.attributes["status_family"] == "finished"
+    assert fixture.attributes["status_state"] == "post"
+    assert fixture.attributes["status_completed"] is True
+    assert fixture.attributes["home_score"] == 3
+    assert fixture.attributes["away_score"] == 0
+
+
 def test_espn_summary_parser_preserves_lineup_and_team_player_stats_identity():
     payload = {
         "rosters": [{

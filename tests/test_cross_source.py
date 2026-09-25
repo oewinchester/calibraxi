@@ -1,7 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
-from calibraxi_data import EntityResolutionIndex, EntityType, SourceIdentity
+from calibraxi_data import EntityResolutionIndex, EntityType, FixtureIdentityIndex, FixtureMappingCandidate, FixtureMappingStatus, SourceIdentity
 from calibraxi_data.espn import SourceObservation
 from calibraxi_data.persistence import CanonicalAuthorityPolicy, FileSystemCanonicalStore
 from calibraxi_data.entity_resolution import resolve_observations
@@ -110,3 +110,197 @@ def test_fixture_mapping_preserves_schedule_disagreement_while_authority_selects
     assert store.observation_count() == 2
     assert store.source_identity_count() == 2
     assert "19:05" in (tmp_path / "observations.jsonl").read_text(encoding="utf-8")
+
+
+def test_fixture_identity_requires_explicit_adjudication_and_survives_store_reload(tmp_path):
+    store = FileSystemCanonicalStore(tmp_path)
+    index = FixtureIdentityIndex(store=store)
+    index.propose(FixtureMappingCandidate("sofascore", "14025013", "fixture:arsenal-coventry:2026-08-21", evidence_ids=("e1",)))
+    index.propose(FixtureMappingCandidate("sofascore", "14025013", "fixture:other:2026-08-21", evidence_ids=("e2",)))
+
+    assert index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) is None
+    index.adjudicate(
+        source="sofascore",
+        source_fixture_id="14025013",
+        canonical_fixture_id="fixture:arsenal-coventry:2026-08-21",
+        status=FixtureMappingStatus.AMBIGUOUS,
+        rationale="two schedule candidates remain",
+    )
+    assert index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) is None
+
+    confirmed_index = FixtureIdentityIndex(store=FileSystemCanonicalStore(tmp_path))
+    confirmed_index.adjudicate(
+        source="sofascore",
+        source_fixture_id="14025013",
+        canonical_fixture_id="fixture:arsenal-coventry:2026-08-21",
+        status=FixtureMappingStatus.CONFIRMED,
+        evidence_ids=("e3",),
+    )
+    assert confirmed_index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) == "fixture:arsenal-coventry:2026-08-21"
+
+
+def _fixture_observation(
+    source: str,
+    source_id: str,
+    canonical_id: str | None,
+    *,
+    kickoff: datetime,
+    home_team_source_id: str,
+    away_team_source_id: str,
+    competition_source_id: str = "epl",
+    season_source_id: str = "2025-26",
+):
+    return SourceObservation(
+        EntityType.FIXTURE,
+        SourceIdentity(source, EntityType.FIXTURE, source_id),
+        "fixture",
+        {
+            "kickoff_at": kickoff,
+            "home_team_source_id": home_team_source_id,
+            "away_team_source_id": away_team_source_id,
+            "competition_source_id": competition_source_id,
+            "season_source_id": season_source_id,
+        },
+        canonical_id=canonical_id,
+    )
+
+
+def test_fixture_identity_generates_durable_reschedule_candidates_without_auto_confirming(tmp_path):
+    store = FileSystemCanonicalStore(tmp_path)
+    index = FixtureIdentityIndex(store=store)
+    source_fixture = _fixture_observation(
+        "sofascore",
+        "14025013",
+        None,
+        kickoff=datetime(2025, 8, 16, 16, 0, tzinfo=timezone.utc),
+        home_team_source_id="44",
+        away_team_source_id="60",
+    )
+    canonical_fixture = _fixture_observation(
+        "espn",
+        "401879276",
+        "fixture:liverpool-bournemouth:2025-08-15",
+        kickoff=datetime(2025, 8, 15, 19, 0, tzinfo=timezone.utc),
+        home_team_source_id="espn-liverpool",
+        away_team_source_id="espn-bournemouth",
+    )
+
+    proposals = index.propose_from_observations(
+        source_fixture,
+        (canonical_fixture,),
+        team_identity_map={
+            ("sofascore", "44"): "team:liverpool",
+            ("sofascore", "60"): "team:bournemouth",
+            ("espn", "espn-liverpool"): "team:liverpool",
+            ("espn", "espn-bournemouth"): "team:bournemouth",
+        },
+        evidence_ids=("schedule-evidence", "detail-evidence"),
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].status is FixtureMappingStatus.PROPOSED
+    assert "team_pair_exact" in (proposals[0].rationale or "")
+    assert index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) is None
+    assert store.fixture_mapping_candidates(source="sofascore", source_fixture_id="14025013") == proposals
+
+    confirmed = index.adjudicate(
+        source="sofascore",
+        source_fixture_id="14025013",
+        canonical_fixture_id="fixture:liverpool-bournemouth:2025-08-15",
+        status=FixtureMappingStatus.CONFIRMED,
+    )
+    assert confirmed.evidence_ids == ("schedule-evidence", "detail-evidence")
+    assert index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "14025013")) == "fixture:liverpool-bournemouth:2025-08-15"
+
+
+def test_fixture_identity_matches_provider_competition_and_season_ids_through_explicit_maps(tmp_path):
+    index = FixtureIdentityIndex(store=FileSystemCanonicalStore(tmp_path))
+    source_fixture = _fixture_observation(
+        "sofascore",
+        "provider-fixture",
+        None,
+        kickoff=datetime(2025, 8, 16, 16, 0, tzinfo=timezone.utc),
+        home_team_source_id="44",
+        away_team_source_id="60",
+        competition_source_id="17",
+        season_source_id="521",
+    )
+    canonical_fixture = _fixture_observation(
+        "espn",
+        "canonical-fixture",
+        "fixture:liverpool-bournemouth:2025-08-16",
+        kickoff=datetime(2025, 8, 16, 16, 5, tzinfo=timezone.utc),
+        home_team_source_id="espn-liverpool",
+        away_team_source_id="espn-bournemouth",
+        competition_source_id="eng.1",
+        season_source_id="2025",
+    )
+
+    proposals = index.propose_candidates(
+        source_fixture,
+        (canonical_fixture,),
+        team_identity_map={
+            ("sofascore", "44"): "team:liverpool",
+            ("sofascore", "60"): "team:bournemouth",
+            ("espn", "espn-liverpool"): "team:liverpool",
+            ("espn", "espn-bournemouth"): "team:bournemouth",
+        },
+        competition_identity_map={
+            ("sofascore", "17"): "competition:epl",
+            ("espn", "eng.1"): "competition:epl",
+        },
+        season_identity_map={
+            ("sofascore", "521"): "season:epl:2025-26",
+            ("espn", "2025"): "season:epl:2025-26",
+        },
+    )
+
+    assert len(proposals) == 1
+    assert "kickoff_delta_seconds=300" in (proposals[0].rationale or "")
+
+
+def test_fixture_identity_keeps_same_team_candidates_ambiguous(tmp_path):
+    index = FixtureIdentityIndex(store=FileSystemCanonicalStore(tmp_path))
+    source_fixture = _fixture_observation(
+        "sofascore",
+        "rescheduled-event",
+        None,
+        kickoff=datetime(2025, 12, 20, 15, 0, tzinfo=timezone.utc),
+        home_team_source_id="44",
+        away_team_source_id="60",
+    )
+    candidates = (
+        _fixture_observation(
+            "espn",
+            "first",
+            "fixture:liverpool-bournemouth:first",
+            kickoff=datetime(2025, 8, 15, 19, 0, tzinfo=timezone.utc),
+            home_team_source_id="espn-liverpool",
+            away_team_source_id="espn-bournemouth",
+        ),
+        _fixture_observation(
+            "espn",
+            "second",
+            "fixture:liverpool-bournemouth:second",
+            kickoff=datetime(2025, 12, 20, 15, 5, tzinfo=timezone.utc),
+            home_team_source_id="espn-liverpool",
+            away_team_source_id="espn-bournemouth",
+        ),
+    )
+
+    proposals = index.propose_candidates(
+        source_fixture,
+        candidates,
+        team_identity_map={
+            ("sofascore", "44"): "team:liverpool",
+            ("sofascore", "60"): "team:bournemouth",
+            ("espn", "espn-liverpool"): "team:liverpool",
+            ("espn", "espn-bournemouth"): "team:bournemouth",
+        },
+    )
+
+    assert {item.canonical_fixture_id for item in proposals} == {
+        "fixture:liverpool-bournemouth:first",
+        "fixture:liverpool-bournemouth:second",
+    }
+    assert index.resolve(SourceIdentity("sofascore", EntityType.FIXTURE, "rescheduled-event")) is None

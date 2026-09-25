@@ -224,6 +224,52 @@
       "unknown_capabilities": ["competitions", "seasons", "teams", "players", "fixtures", "lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
     },
     {
+      "source": "TheSportsDB",
+      "benchmark_stage": "second-stage",
+      "acquisition_mode": "direct-http-json",
+      "classification": "research-only",
+      "operational_difficulty": "low",
+      "limitation": "The repeated season feed was deterministic but exposed 15 of 380 expected fixtures; its overlap role is insufficient for production fixture coverage.",
+      "captures": [
+        {
+          "surface": "EPL 2025/26 season events",
+          "route": "/api/v1/json/{API_KEY}/eventsseason.php?id=4328&s=2025-2026",
+          "http_statuses": [200, 200],
+          "response_bytes": [18385, 18385],
+          "content_hashes": [
+            "417655a10aa5e4d8f80872f612faa70e916caca9f486fcc1119e29315159c19b",
+            "417655a10aa5e4d8f80872f612faa70e916caca9f486fcc1119e29315159c19b"
+          ],
+          "row_count": 15,
+          "unique_event_ids": 15,
+          "duplicate_event_ids": 0,
+          "latency_samples_ms": [270, 219],
+          "repeat_fetch_consistency": "The two response bodies were byte-identical."
+        }
+      ],
+      "measured": [
+        {
+          "capability": "fixtures",
+          "state": "supported",
+          "coverage_expected": 380,
+          "coverage_observed": 15,
+          "coverage_ratio": 0.039473684210526314,
+          "row_count": 15,
+          "unique_source_id_count": 15,
+          "duplicate_source_id_count": 0,
+          "http_statuses": [200, 200],
+          "latency_samples_ms": [270, 219],
+          "repeat_attempt_count": 2,
+          "repeat_success_count": 2,
+          "repeat_success_ratio": 1.0,
+          "schema_stable": true,
+          "rights_state": "review_required",
+          "note": "Numeric event IDs were stable across identical repeated captures; fixture identity overlap outside this feed was not qualified."
+        }
+      ],
+      "unknown_capabilities": ["lineups", "events", "team_match_stats", "player_match_stats", "shots", "xg", "cards", "corners", "standings", "ratings", "historical_results", "odds", "identity_assets"]
+    },
+    {
       "source": "SoFIFA",
       "benchmark_stage": "second-stage",
       "acquisition_mode": "browser-required",

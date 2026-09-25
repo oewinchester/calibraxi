@@ -5,7 +5,7 @@ from calibraxi_data.espn_vertical import VerticalIngestionReport
 from calibraxi_data.thesportsdb import TheSportsDbObservationParser
 from calibraxi_data.contracts import IngestionRunStatus
 from calibraxi_data.recovery import RecoveryWorker
-from calibraxi_data.scheduler import EspnIngestionScheduler
+from calibraxi_data.scheduler import EspnIngestionScheduler, SourceRateLimiter, SourceRatePolicy
 
 
 class CrashOnceIngestor:
@@ -85,3 +85,37 @@ def test_scheduler_can_run_a_non_espn_ingestor_through_the_same_lease_path(tmp_p
     assert ingestor.kwargs["league_id"] == "4328"
     assert ingestor.kwargs["run_id"] == result.run_id
     assert store.get_run(result.run_id).source == "thesportsdb"
+
+
+def test_source_rate_limiter_enforces_interval_and_concurrency():
+    limiter = SourceRateLimiter({"espn": SourceRatePolicy(min_interval=timedelta(seconds=10), max_concurrency=1)})
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    assert limiter.try_acquire("espn", now=now) is True
+    assert limiter.try_acquire("espn", now=now) is False
+    limiter.release("espn")
+    assert limiter.try_acquire("espn", now=now + timedelta(seconds=5)) is False
+    assert limiter.try_acquire("espn", now=now + timedelta(seconds=10)) is True
+
+
+def test_scheduler_releases_rate_slot_when_worker_lease_is_unavailable(tmp_path):
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    store.claim_worker_lease(
+        "espn:eng.1",
+        token="other-worker",
+        lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
+    limiter = SourceRateLimiter({"espn": SourceRatePolicy(max_concurrency=1)})
+    scheduler = EspnIngestionScheduler(
+        store=store,
+        ingestor=CrashOnceIngestor(store, "missing-evidence"),
+        recovery_worker=RecoveryWorker(store=store, evidence_store=evidence, parser=EspnObservationParser()),
+        rate_limiter=limiter,
+    )
+
+    result = scheduler.run_once()
+
+    assert result.skipped is True
+    assert limiter.try_acquire("espn") is True
+    limiter.release("espn")

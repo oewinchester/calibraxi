@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from collections import Counter
-from typing import Any
+from typing import Any, Mapping, Protocol
 
 from .acquisition import AcquisitionCoordinator
-from .contracts import EntityType, IngestionRunStatus, RawEvidence
+from .contracts import EntityType, IngestionRunStatus, RawEvidence, SourceIdentity
 from .espn import EspnObservationParser, SourceObservation
+from .fixture_identity import FixtureIdentityIndex
 from .persistence import CanonicalStore
 from .quality import DataQualityValidator, QualityIssue
 from .operations import OperationalRecorder
+
+
+class ObservationParser(Protocol):
+    def parse(self, capability: str, payload: Any, **context: Any) -> tuple[SourceObservation, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,12 +45,14 @@ class CoverageResult:
 class EspnVerticalIngestor:
     """Orchestrates request, evidence, quality, source normalization, and persistence."""
 
-    def __init__(self, *, coordinator: AcquisitionCoordinator, parser: EspnObservationParser, validator: DataQualityValidator, store: CanonicalStore, operations: OperationalRecorder | None = None) -> None:
+    def __init__(self, *, coordinator: AcquisitionCoordinator, parser: ObservationParser, validator: DataQualityValidator, store: CanonicalStore, operations: OperationalRecorder | None = None, source_parsers: Mapping[str, ObservationParser] | None = None, fixture_identity_index: FixtureIdentityIndex | None = None) -> None:
         self._coordinator = coordinator
         self._parser = parser
+        self._source_parsers = dict(source_parsers or {})
         self._validator = validator
         self._store = store
         self._operations = operations
+        self._fixture_identity_index = fixture_identity_index
 
     def ingest(self, *, league: str = "eng.1", date: str | None = None, include_summaries: bool = False, run_id: str | None = None) -> VerticalIngestionReport:
         all_capabilities = ["teams", "fixtures", "players"]
@@ -75,7 +82,9 @@ class EspnVerticalIngestor:
                 failures.append(f"{capability}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
                 continue
-            observations = self._with_evidence_chronology(self._parser.parse(capability, validation.payload), acquisition.evidence)
+            observations = self._with_evidence_chronology(self._parse(acquisition.source, capability, validation.payload), acquisition.evidence)
+            if capability == "fixtures":
+                observations = self._with_fixture_identity(observations)
             capability_observations[capability] = observations
             expected = self._expected_population(capability, validation.payload)
             observed = len({o.source_id for o in observations if o.entity_type is (EntityType.TEAM if capability == "teams" else EntityType.FIXTURE)})
@@ -95,12 +104,12 @@ class EspnVerticalIngestor:
                 failures.append(f"players:{team_id}:{validation.state.value}")
                 quality_issues.extend(validation.issues)
                 continue
-            observations = self._with_evidence_chronology(self._parser.parse("players", validation.payload), acquisition.evidence)
+            observations = self._with_evidence_chronology(self._parse(acquisition.source, "players", validation.payload), acquisition.evidence)
             pending_persists.append((observations, acquisition.evidence.evidence_id if acquisition.evidence else "missing-evidence"))
 
-        fixture_ids = tuple(o.source_id for o in capability_observations.get("fixtures", ()) if o.entity_type is EntityType.FIXTURE)
-        if include_summaries and fixture_ids:
-            self._ingest_summaries(run.run_id, league, fixture_ids, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists, evidence_refs=evidence_refs)
+        fixtures = tuple(o for o in capability_observations.get("fixtures", ()) if o.entity_type is EntityType.FIXTURE)
+        if include_summaries and fixtures:
+            self._ingest_summaries(run.run_id, league, fixtures, evidence_counter=[evidence_objects], coverage=coverage, failures=failures, quality_issues=quality_issues, pending_persists=pending_persists, evidence_refs=evidence_refs)
             evidence_objects = self._summary_evidence_count
 
         try:
@@ -126,31 +135,36 @@ class EspnVerticalIngestor:
             final_status = IngestionRunStatus.FAILED
         return VerticalIngestionReport("espn", tuple(all_capabilities), canonical_counts, evidence_objects, tuple(failures), tuple(quality_issues), tuple(unresolved), coverage, run.run_id, final_status)
 
-    def _ingest_summaries(self, run_id: str, league: str, fixture_ids: tuple[str, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]], evidence_refs: list[str]) -> None:
+    def _ingest_summaries(self, run_id: str, league: str, fixtures: tuple[SourceObservation, ...], *, evidence_counter: list[int], coverage: dict[str, CoverageResult], failures: list[str], quality_issues: list[QualityIssue], pending_persists: list[tuple[tuple[SourceObservation, ...], str]], evidence_refs: list[str]) -> None:
         covered_events: dict[str, int] = {"lineups": 0, "player_stats": 0, "match_stats": 0}
         self._summary_evidence_count = evidence_counter[0]
         for capability in covered_events:
-            for event_id in fixture_ids:
+            for fixture in fixtures:
+                source_fixture_ids = {fixture.source_identity.source: fixture.source_id}
+                request_params: dict[str, Any] = {"league": league, "source_fixture_ids": source_fixture_ids}
+                canonical_fixture_id = fixture.canonical_id or self._canonical_fixture_id(fixture.source_identity)
+                if canonical_fixture_id:
+                    request_params["canonical_fixture_id"] = canonical_fixture_id
                 try:
-                    acquisition = self._coordinator.acquire(capability, params={"league": league, "event_id": event_id})
+                    acquisition = self._coordinator.acquire(capability, params=request_params)
                 except KeyError:
-                    coverage[capability] = CoverageResult(len(fixture_ids), 0, False, "capability policy is not registered")
+                    coverage[capability] = CoverageResult(len(fixtures), 0, False, "capability policy is not registered")
                     break
                 self._summary_evidence_count += len(acquisition.attempts)
                 evidence_refs.extend(attempt.evidence.evidence_id for attempt in acquisition.attempts if attempt.evidence is not None)
-                field = "rosters" if capability in {"lineups", "player_stats"} else None
-                validation = self._validator.validate(acquisition, collection_field=field, required_fields=("boxscore",) if capability == "match_stats" else (), require_non_empty=False)
+                validation = self._validate_summary(acquisition, capability)
                 self._record_operations(run_id, acquisition, validation, failures)
                 if not validation.accepted:
-                    failures.append(f"{capability}:{event_id}:{validation.state.value}")
+                    failures.append(f"{capability}:{fixture.source_id}:{validation.state.value}")
                     quality_issues.extend(validation.issues)
                     continue
-                observations = self._with_evidence_chronology(self._parser.parse(capability, validation.payload, event_id=event_id), acquisition.evidence)
+                event_id = self._detail_source_fixture_id(acquisition, fixture)
+                observations = self._with_evidence_chronology(self._parse(acquisition.source, capability, validation.payload, event_id=event_id), acquisition.evidence)
                 if observations:
                     covered_events[capability] += 1
                 pending_persists.append((observations, acquisition.evidence.evidence_id if acquisition.evidence else "missing-evidence"))
         for capability, observed in covered_events.items():
-            coverage[capability] = CoverageResult(len(fixture_ids), observed, observed == len(fixture_ids), "summary response coverage; entity completeness is reported by canonical counts", None)
+            coverage[capability] = CoverageResult(len(fixtures), observed, observed == len(fixtures), "summary response coverage; entity completeness is reported by canonical counts", None)
 
     def _record_operations(self, run_id: str, acquisition, validation, failures: list[str]) -> None:
         if self._operations is None:
@@ -159,6 +173,52 @@ class EspnVerticalIngestor:
             self._operations.record_acquisition(run_id=run_id, acquisition=acquisition, validation=validation)
         except Exception as exc:
             failures.append(f"operational_recording_failed:{exc}")
+
+    def _parse(self, source: str | None, capability: str, payload: Any, **context: Any) -> tuple[SourceObservation, ...]:
+        parser = self._source_parsers.get(source or "", self._parser)
+        return parser.parse(capability, payload, **context)
+
+    def _validate_summary(self, acquisition, capability: str):
+        if acquisition.source == "sofascore":
+            required_fields = ("home", "away") if capability in {"lineups", "player_stats"} else ("statistics",)
+            return self._validator.validate(acquisition, required_fields=required_fields)
+        field = "rosters" if capability in {"lineups", "player_stats"} else None
+        return self._validator.validate(acquisition, collection_field=field, required_fields=("boxscore",) if capability == "match_stats" else (), require_non_empty=False)
+
+    def _canonical_fixture_id(self, identity: SourceIdentity) -> str | None:
+        if self._fixture_identity_index is None:
+            return None
+        return self._fixture_identity_index.resolve(identity)
+
+    def _with_fixture_identity(self, observations: tuple[SourceObservation, ...]) -> tuple[SourceObservation, ...]:
+        if self._fixture_identity_index is None:
+            return observations
+        return tuple(
+            replace(observation, canonical_id=observation.canonical_id or self._canonical_fixture_id(observation.source_identity))
+            if observation.entity_type is EntityType.FIXTURE
+            else observation
+            for observation in observations
+        )
+
+    def _detail_source_fixture_id(self, acquisition, fixture: SourceObservation) -> str | None:
+        if acquisition.source:
+            for attempt in reversed(acquisition.attempts):
+                if attempt.source != acquisition.source:
+                    continue
+                event_id = attempt.result.metadata.get("event_id")
+                if event_id not in (None, ""):
+                    return str(event_id)
+            canonical_fixture_id = fixture.canonical_id or self._canonical_fixture_id(fixture.source_identity)
+            if canonical_fixture_id and self._fixture_identity_index is not None:
+                mapped = self._fixture_identity_index.source_fixture_id(
+                    source=acquisition.source,
+                    canonical_fixture_id=canonical_fixture_id,
+                )
+                if mapped is not None:
+                    return mapped
+            if acquisition.source == fixture.source_identity.source:
+                return fixture.source_id
+        return None
 
     @staticmethod
     def _expected_population(capability: str, payload: Any) -> int:

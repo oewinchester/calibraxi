@@ -18,8 +18,12 @@ from .contracts import (
     IngestionRunStatus,
     QuarantineDecision,
     SourceCapabilityHealthSnapshot,
+    SourceCapability,
     SourceHealthSignal,
     SourceIdentity,
+    SourceManifest,
+    FixtureMappingCandidate,
+    FixtureMappingStatus,
 )
 from .espn import SourceObservation
 
@@ -76,8 +80,15 @@ class CanonicalStore(Protocol):
     def list_quarantines(self, *, run_id: str | None = None) -> tuple[QuarantineDecision, ...]: ...
     def record_health_signal(self, signal: SourceHealthSignal) -> SourceCapabilityHealthSnapshot: ...
     def health_for(self, capability: str, source: str) -> SourceCapabilityHealthSnapshot | None: ...
+    def save_capability_policy(self, policy: SourceCapability) -> None: ...
+    def capability_policy_history(self, key: str) -> tuple[SourceCapability, ...]: ...
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool: ...
     def release_worker_lease(self, lease_key: str, *, token: str) -> None: ...
+    def save_source_manifest(self, manifest: SourceManifest) -> None: ...
+    def source_manifest(self, source: str) -> SourceManifest | None: ...
+    def propose_fixture_mapping(self, candidate: FixtureMappingCandidate) -> None: ...
+    def adjudicate_fixture_mapping(self, *, source: str, source_fixture_id: str, canonical_fixture_id: str, status: FixtureMappingStatus, evidence_ids: Iterable[str] = (), rationale: str | None = None, decided_at: datetime | None = None) -> FixtureMappingCandidate: ...
+    def fixture_mapping_candidates(self, *, source: str, source_fixture_id: str) -> tuple[FixtureMappingCandidate, ...]: ...
 
 
 def _canonical_id(identity: SourceIdentity) -> str:
@@ -104,6 +115,9 @@ class FileSystemCanonicalStore:
         self._quarantines: list[QuarantineDecision] = []
         self._health: dict[tuple[str, str], SourceCapabilityHealthSnapshot] = {}
         self._worker_leases: dict[str, tuple[str, datetime]] = {}
+        self._policy_history: dict[str, list[SourceCapability]] = {}
+        self._source_manifests: dict[str, SourceManifest] = {}
+        self._fixture_mappings: dict[tuple[str, str, str], FixtureMappingCandidate] = {}
         self._load()
 
     def persist(self, observations: Iterable[SourceObservation], *, evidence_id: str, run_id: str | None = None) -> PersistenceResult:
@@ -177,6 +191,11 @@ class FileSystemCanonicalStore:
         return len(self._observations)
 
     def start_run(self, source: str, *, run_id: str | None = None, replay_of: str | None = None) -> IngestionRun:
+        if run_id is not None and run_id in self._runs:
+            existing = self._runs[run_id]
+            if existing.source != source:
+                raise ValueError(f"ingestion run {run_id} already belongs to source {existing.source}")
+            return existing
         now = datetime.now(timezone.utc)
         run = IngestionRun(run_id or str(uuid4()), source, IngestionRunStatus.STARTED, now, now, replay_of=replay_of)
         self._runs[run.run_id] = run
@@ -264,6 +283,74 @@ class FileSystemCanonicalStore:
     def health_for(self, capability: str, source: str) -> SourceCapabilityHealthSnapshot | None:
         return self._health.get((capability, source))
 
+    def save_capability_policy(self, policy: SourceCapability) -> None:
+        versions = self._policy_history.setdefault(policy.key, [])
+        if any(item.policy_version == policy.policy_version for item in versions):
+            raise ValueError(f"capability policy version already persisted: {policy.key}:{policy.policy_version}")
+        versions.append(policy)
+        self._flush()
+
+    def capability_policy_history(self, key: str) -> tuple[SourceCapability, ...]:
+        return tuple(self._policy_history.get(key, ()))
+
+    def save_source_manifest(self, manifest: SourceManifest) -> None:
+        existing = self._source_manifests.get(manifest.source)
+        if existing is not None and existing != manifest:
+            raise ValueError(f"source manifest already persisted: {manifest.source}")
+        self._source_manifests[manifest.source] = manifest
+        self._flush()
+
+    def source_manifest(self, source: str) -> SourceManifest | None:
+        return self._source_manifests.get(source)
+
+    def propose_fixture_mapping(self, candidate: FixtureMappingCandidate) -> None:
+        key = (candidate.source, candidate.source_fixture_id, candidate.canonical_fixture_id)
+        existing = self._fixture_mappings.get(key)
+        if existing is not None and existing != candidate:
+            raise ValueError("fixture mapping candidate already exists with different evidence")
+        self._fixture_mappings[key] = candidate
+        self._flush()
+
+    def adjudicate_fixture_mapping(
+        self,
+        *,
+        source: str,
+        source_fixture_id: str,
+        canonical_fixture_id: str,
+        status: FixtureMappingStatus,
+        evidence_ids: Iterable[str] = (),
+        rationale: str | None = None,
+        decided_at: datetime | None = None,
+    ) -> FixtureMappingCandidate:
+        status = FixtureMappingStatus(status)
+        key = (source, source_fixture_id, canonical_fixture_id)
+        current = self._fixture_mappings.get(key)
+        if current is None:
+            raise KeyError(f"fixture mapping candidate not found: {source}:{source_fixture_id}->{canonical_fixture_id}")
+        updated = FixtureMappingCandidate(
+            **{
+                **asdict(current),
+                "status": status,
+                "evidence_ids": tuple(evidence_ids) or current.evidence_ids,
+                "rationale": rationale if rationale is not None else current.rationale,
+                "decided_at": decided_at or datetime.now(timezone.utc),
+            }
+        )
+        if status is FixtureMappingStatus.CONFIRMED:
+            for other_key, other in self._fixture_mappings.items():
+                if other_key[:2] == key[:2] and other_key != key and other.status is FixtureMappingStatus.CONFIRMED:
+                    raise ValueError("a source fixture ID cannot be confirmed to multiple canonical fixtures")
+        self._fixture_mappings[key] = updated
+        self._flush()
+        return updated
+
+    def fixture_mapping_candidates(self, *, source: str, source_fixture_id: str) -> tuple[FixtureMappingCandidate, ...]:
+        return tuple(
+            item
+            for (item_source, item_source_id, _), item in self._fixture_mappings.items()
+            if item_source == source and (source_fixture_id == "*" or item_source_id == source_fixture_id)
+        )
+
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool:
         current = self._worker_leases.get(lease_key)
         now = datetime.now(timezone.utc)
@@ -288,6 +375,9 @@ class FileSystemCanonicalStore:
         (self.root / "quarantines.jsonl").write_text("".join(json.dumps(asdict(item), ensure_ascii=False, sort_keys=True, default=str) + "\n" for item in self._quarantines), encoding="utf-8")
         (self.root / "source-health.json").write_text(json.dumps([asdict(item) for item in self._health.values()], ensure_ascii=False, sort_keys=True, default=str, indent=2), encoding="utf-8")
         (self.root / "worker-leases.json").write_text(json.dumps({key: {"token": token, "lease_until": lease_until} for key, (token, lease_until) in self._worker_leases.items()}, ensure_ascii=False, sort_keys=True, default=str, indent=2), encoding="utf-8")
+        (self.root / "capability-policies.json").write_text(json.dumps({key: [asdict(item) for item in policies] for key, policies in self._policy_history.items()}, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        (self.root / "source-manifests.json").write_text(json.dumps([asdict(item) for item in self._source_manifests.values()], ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        (self.root / "fixture-mappings.json").write_text(json.dumps([asdict(item) for item in self._fixture_mappings.values()], ensure_ascii=False, sort_keys=True, default=str, indent=2), encoding="utf-8")
 
     def _load(self) -> None:
         identities_path = self.root / "source-identities.json"
@@ -337,6 +427,26 @@ class FileSystemCanonicalStore:
         if leases_path.exists():
             for key, item in json.loads(leases_path.read_text(encoding="utf-8")).items():
                 self._worker_leases[key] = (item["token"], datetime.fromisoformat(item["lease_until"]))
+        policies_path = self.root / "capability-policies.json"
+        if policies_path.exists():
+            for key, policies in json.loads(policies_path.read_text(encoding="utf-8")).items():
+                self._policy_history[key] = [SourceCapability(**{**item, "fallback_sources": tuple(item.get("fallback_sources") or ()), "competition_season_coverage": tuple(item.get("competition_season_coverage") or ()), "evidence_refs": tuple(item.get("evidence_refs") or ())}) for item in policies]
+        manifests_path = self.root / "source-manifests.json"
+        if manifests_path.exists():
+            for item in json.loads(manifests_path.read_text(encoding="utf-8")):
+                item["capabilities"] = tuple(item.get("capabilities") or ())
+                item["semantic_contracts"] = dict(item.get("semantic_contracts") or {})
+                self._source_manifests[item["source"]] = SourceManifest(**item)
+        mappings_path = self.root / "fixture-mappings.json"
+        if mappings_path.exists():
+            for item in json.loads(mappings_path.read_text(encoding="utf-8")):
+                item["status"] = FixtureMappingStatus(item["status"])
+                item["evidence_ids"] = tuple(item.get("evidence_ids") or ())
+                for field in ("kickoff_at", "proposed_at", "decided_at"):
+                    if item.get(field):
+                        item[field] = datetime.fromisoformat(item[field])
+                candidate = FixtureMappingCandidate(**item)
+                self._fixture_mappings[(candidate.source, candidate.source_fixture_id, candidate.canonical_fixture_id)] = candidate
 
 
 class PostgresCanonicalStore:
@@ -473,6 +583,57 @@ class PostgresCanonicalStore:
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS capability_policies (
+            capability TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            primary_source TEXT NOT NULL,
+            fallback_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+            competition_season_coverage JSONB NOT NULL DEFAULT '[]'::jsonb,
+            historical_depth TEXT,
+            current_live_support BOOLEAN NOT NULL DEFAULT FALSE,
+            pit_suitability TEXT NOT NULL,
+            known_delay_cadence TEXT,
+            usage_rights_state TEXT NOT NULL,
+            evidence_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+            semantic_contract TEXT,
+            activated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (capability, policy_version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS source_manifests (
+            source TEXT PRIMARY KEY,
+            implementation_version TEXT NOT NULL,
+            acquisition_mode TEXT NOT NULL,
+            capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+            rights_state TEXT NOT NULL,
+            operational_eligibility TEXT NOT NULL,
+            semantic_contracts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            notes TEXT,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        ALTER TABLE capability_policies
+            ADD COLUMN IF NOT EXISTS semantic_contract TEXT
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fixture_mapping_candidates (
+            source TEXT NOT NULL,
+            source_fixture_id TEXT NOT NULL,
+            canonical_fixture_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+            kickoff_at TIMESTAMPTZ,
+            home_team_source_id TEXT,
+            away_team_source_id TEXT,
+            rationale TEXT,
+            proposed_at TIMESTAMPTZ,
+            decided_at TIMESTAMPTZ,
+            PRIMARY KEY (source, source_fixture_id, canonical_fixture_id)
+        )
+        """,
     )
 
     def __init__(self, *, connection_factory: Callable[[], Any], auto_migrate: bool = True, authority_policy: CanonicalAuthorityPolicy | None = None) -> None:
@@ -505,6 +666,59 @@ class PostgresCanonicalStore:
                 cursor.close()
             connection.close()
 
+    def save_source_manifest(self, manifest: SourceManifest) -> None:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO source_manifests
+                    (source, implementation_version, acquisition_mode, capabilities, rights_state,
+                     operational_eligibility, semantic_contracts, notes)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (source) DO NOTHING
+                """,
+                (manifest.source, manifest.implementation_version, manifest.acquisition_mode, _json_value(list(manifest.capabilities)), manifest.rights_state, manifest.operational_eligibility, _json_value(dict(manifest.semantic_contracts)), manifest.notes),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute("SELECT source, implementation_version, acquisition_mode, capabilities, rights_state, operational_eligibility, semantic_contracts, notes FROM source_manifests WHERE source = %s", (manifest.source,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError(f"source manifest conflict could not be read: {manifest.source}")
+                existing = self._source_manifest_from_row(row)
+                if existing != manifest:
+                    raise ValueError(f"source manifest already persisted: {manifest.source}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def source_manifest(self, source: str) -> SourceManifest | None:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT source, implementation_version, acquisition_mode, capabilities, rights_state, operational_eligibility, semantic_contracts, notes FROM source_manifests WHERE source = %s", (source,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return self._source_manifest_from_row(row)
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    @staticmethod
+    def _source_manifest_from_row(row: tuple[Any, ...]) -> SourceManifest:
+        capabilities = row[3] if isinstance(row[3], list) else json.loads(row[3] or "[]")
+        semantics = row[6] if isinstance(row[6], dict) else json.loads(row[6] or "{}")
+        return SourceManifest(row[0], row[1], row[2], tuple(capabilities or ()), row[4], row[5], dict(semantics or {}), row[7])
+
     def persist(self, observations: Iterable[SourceObservation], *, evidence_id: str, run_id: str | None = None) -> PersistenceResult:
         return self.persist_batch(((observations, evidence_id),), run_id=run_id)
 
@@ -517,7 +731,14 @@ class PostgresCanonicalStore:
             cursor = connection.cursor()
             for observation, evidence_id in ((observation, evidence_id) for observations, evidence_id in materialized for observation in observations):
                 identity = observation.source_identity
-                canonical_id = observation.canonical_id or _canonical_id(identity)
+                knowledge_at = observation.knowledge_at or datetime.now(timezone.utc)
+                processing_at = observation.processing_at or datetime.now(timezone.utc)
+                cursor.execute("SELECT canonical_id FROM source_identities WHERE source = %s AND entity_type = %s AND source_id = %s", (identity.source, identity.entity_type.value, identity.source_id))
+                existing_identity = cursor.fetchone()
+                mapped_canonical_id = existing_identity[0] if existing_identity is not None else None
+                if observation.canonical_id is not None and mapped_canonical_id is not None and mapped_canonical_id != observation.canonical_id:
+                    raise ValueError(f"source identity already mapped to {mapped_canonical_id}")
+                canonical_id = observation.canonical_id or mapped_canonical_id or _canonical_id(identity)
                 attributes = _json_value(observation.attributes)
                 current_source = None
                 cursor.execute("SELECT current_source FROM canonical_entities WHERE canonical_id = %s", (canonical_id,))
@@ -546,7 +767,7 @@ class PostgresCanonicalStore:
                        OR canonical_entities.attributes IS DISTINCT FROM EXCLUDED.attributes)
                     RETURNING (xmax = 0) AS inserted
                     """,
-                    (canonical_id, observation.entity_type.value, observation.name, attributes, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at, identity.source, identity.source_id, evidence_id, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at, identity.source, identity.source_id, should_update),
+                    (canonical_id, observation.entity_type.value, observation.name, attributes, evidence_id, observation.observed_at, observation.available_at, knowledge_at, processing_at, identity.source, identity.source_id, evidence_id, observation.observed_at, observation.available_at, knowledge_at, processing_at, identity.source, identity.source_id, should_update),
                 )
                 if cursor.rowcount == 1:
                     returned = cursor.fetchone()
@@ -563,11 +784,11 @@ class PostgresCanonicalStore:
                     (identity.source, identity.entity_type.value, identity.source_id, canonical_id),
                 )
                 identity_inserted = cursor.rowcount == 1
-                if observation.canonical_id is not None:
+                if not identity_inserted:
                     cursor.execute("SELECT canonical_id FROM source_identities WHERE source = %s AND entity_type = %s AND source_id = %s", (identity.source, identity.entity_type.value, identity.source_id))
-                    existing_identity = cursor.fetchone()
-                    if existing_identity is not None and isinstance(existing_identity[0], str) and existing_identity[0] != canonical_id:
-                        raise ValueError(f"source identity already mapped to {existing_identity[0]}")
+                    stored_identity = cursor.fetchone()
+                    if stored_identity is None or stored_identity[0] != canonical_id:
+                        raise ValueError(f"source identity mapping changed during persistence: {identity.source}:{identity.source_id}")
                 identities += int(identity_inserted)
                 fingerprint = hashlib.sha256(_json_value({"name": observation.name, "attributes": observation.attributes}).encode("utf-8")).hexdigest()
                 cursor.execute(
@@ -577,7 +798,7 @@ class PostgresCanonicalStore:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                     ON CONFLICT (evidence_id, entity_type, source, source_id, observation_hash) DO NOTHING
                     """,
-                    (evidence_id, identity.source, observation.entity_type.value, identity.source_id, canonical_id, fingerprint, observation.name, attributes, observation.observed_at, observation.available_at, observation.knowledge_at, observation.processing_at),
+                    (evidence_id, identity.source, observation.entity_type.value, identity.source_id, canonical_id, fingerprint, observation.name, attributes, observation.observed_at, observation.available_at, knowledge_at, processing_at),
                 )
                 lineage += int(cursor.rowcount == 1)
                 if run_id is not None:
@@ -630,6 +851,14 @@ class PostgresCanonicalStore:
         cursor = None
         try:
             cursor = connection.cursor()
+            if run_id is not None:
+                cursor.execute("SELECT run_id, source, status, started_at, updated_at, evidence_stored_at, canonical_persisted_at, completed_at, failed_at, error, counts, evidence_refs, replay_of, claim_token, claim_until FROM ingestion_runs WHERE run_id = %s", (run_id,))
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing[1] != source:
+                        raise ValueError(f"ingestion run {run_id} already belongs to source {existing[1]}")
+                    connection.commit()
+                    return self._run_from_row(existing)
             cursor.execute(
                 """
                 INSERT INTO ingestion_runs
@@ -639,6 +868,13 @@ class PostgresCanonicalStore:
                 """,
                 (run.run_id, run.source, run.status.value, run.started_at, run.updated_at, "{}", "[]", run.replay_of),
             )
+            if run_id is not None and cursor.rowcount == 0:
+                cursor.execute("SELECT run_id, source, status, started_at, updated_at, evidence_stored_at, canonical_persisted_at, completed_at, failed_at, error, counts, evidence_refs, replay_of, claim_token, claim_until FROM ingestion_runs WHERE run_id = %s", (run_id,))
+                existing = cursor.fetchone()
+                if existing is None:
+                    raise ValueError(f"ingestion run conflict could not be read: {run_id}")
+                if existing[1] != source:
+                    raise ValueError(f"ingestion run {run_id} already belongs to source {existing[1]}")
             connection.commit()
         except Exception:
             connection.rollback()
@@ -709,9 +945,7 @@ class PostgresCanonicalStore:
             row = cursor.fetchone()
             if row is None:
                 return None
-            counts = row[10] if isinstance(row[10], dict) else json.loads(row[10] or "{}")
-            refs = row[11] if isinstance(row[11], list) else json.loads(row[11] or "[]")
-            return IngestionRun(run_id=row[0], source=row[1], status=IngestionRunStatus(row[2]), started_at=row[3], updated_at=row[4], evidence_stored_at=row[5], canonical_persisted_at=row[6], completed_at=row[7], failed_at=row[8], error=row[9], counts=counts, evidence_refs=tuple(refs), replay_of=row[12], claim_token=row[13], claim_until=row[14])
+            return self._run_from_row(row)
         finally:
             if cursor is not None:
                 cursor.close()
@@ -738,14 +972,18 @@ class PostgresCanonicalStore:
             rows = cursor.fetchall()
             runs: list[IngestionRun] = []
             for row in rows:
-                counts = row[10] if isinstance(row[10], dict) else json.loads(row[10] or "{}")
-                refs = row[11] if isinstance(row[11], list) else json.loads(row[11] or "[]")
-                runs.append(IngestionRun(run_id=row[0], source=row[1], status=IngestionRunStatus(row[2]), started_at=row[3], updated_at=row[4], evidence_stored_at=row[5], canonical_persisted_at=row[6], completed_at=row[7], failed_at=row[8], error=row[9], counts=counts, evidence_refs=tuple(refs), replay_of=row[12], claim_token=row[13], claim_until=row[14]))
+                runs.append(self._run_from_row(row))
             return tuple(runs)
         finally:
             if cursor is not None:
                 cursor.close()
             connection.close()
+
+    @staticmethod
+    def _run_from_row(row: tuple[Any, ...]) -> IngestionRun:
+        counts = row[10] if isinstance(row[10], dict) else json.loads(row[10] or "{}")
+        refs = row[11] if isinstance(row[11], list) else json.loads(row[11] or "[]")
+        return IngestionRun(run_id=row[0], source=row[1], status=IngestionRunStatus(row[2]), started_at=row[3], updated_at=row[4], evidence_stored_at=row[5], canonical_persisted_at=row[6], completed_at=row[7], failed_at=row[8], error=row[9], counts=counts, evidence_refs=tuple(refs), replay_of=row[12], claim_token=row[13], claim_until=row[14])
 
     def claim_run(self, run_id: str, *, token: str, lease_until: datetime) -> bool:
         connection = self._connection_factory()
@@ -897,6 +1135,146 @@ class PostgresCanonicalStore:
             if cursor is not None:
                 cursor.close()
             connection.close()
+
+    def save_capability_policy(self, policy: SourceCapability) -> None:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO capability_policies
+                    (capability, policy_version, primary_source, fallback_sources, competition_season_coverage,
+                     historical_depth, current_live_support, pit_suitability, known_delay_cadence,
+                     usage_rights_state, evidence_refs, semantic_contract)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (capability, policy_version) DO NOTHING
+                """,
+                (policy.key, policy.policy_version, policy.primary_source, _json_value(list(policy.fallback_sources)), _json_value(list(policy.competition_season_coverage)), policy.historical_depth, policy.current_live_support, policy.pit_suitability, policy.known_delay_cadence, policy.usage_rights_state, _json_value(list(policy.evidence_refs)), policy.semantic_contract),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"capability policy version already persisted: {policy.key}:{policy.policy_version}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def capability_policy_history(self, key: str) -> tuple[SourceCapability, ...]:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT capability, policy_version, primary_source, fallback_sources, competition_season_coverage, historical_depth, current_live_support, pit_suitability, known_delay_cadence, usage_rights_state, evidence_refs, semantic_contract FROM capability_policies WHERE capability = %s ORDER BY activated_at, policy_version",
+                (key,),
+            )
+            policies = []
+            for row in cursor.fetchall():
+                fallback = row[3] if isinstance(row[3], list) else json.loads(row[3] or "[]")
+                coverage = row[4] if isinstance(row[4], list) else json.loads(row[4] or "[]")
+                evidence = row[10] if isinstance(row[10], list) else json.loads(row[10] or "[]")
+                policies.append(SourceCapability(row[0], row[2], tuple(fallback), tuple(coverage), row[5], row[6], row[7], row[8], row[9], row[1], tuple(evidence), row[11]))
+            return tuple(policies)
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def propose_fixture_mapping(self, candidate: FixtureMappingCandidate) -> None:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO fixture_mapping_candidates
+                    (source, source_fixture_id, canonical_fixture_id, status, evidence_ids, kickoff_at,
+                     home_team_source_id, away_team_source_id, rationale, proposed_at, decided_at)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source, source_fixture_id, canonical_fixture_id) DO NOTHING
+                """,
+                (candidate.source, candidate.source_fixture_id, candidate.canonical_fixture_id, candidate.status.value, _json_value(list(candidate.evidence_ids)), candidate.kickoff_at, candidate.home_team_source_id, candidate.away_team_source_id, candidate.rationale, candidate.proposed_at, candidate.decided_at),
+            )
+            if cursor.rowcount not in {0, 1}:
+                raise ValueError("fixture mapping candidate was not persisted")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def adjudicate_fixture_mapping(
+        self,
+        *,
+        source: str,
+        source_fixture_id: str,
+        canonical_fixture_id: str,
+        status: FixtureMappingStatus,
+        evidence_ids: Iterable[str] = (),
+        rationale: str | None = None,
+        decided_at: datetime | None = None,
+    ) -> FixtureMappingCandidate:
+        status = FixtureMappingStatus(status)
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE fixture_mapping_candidates
+                SET status = %s, evidence_ids = %s::jsonb, rationale = COALESCE(%s, rationale), decided_at = %s
+                WHERE source = %s AND source_fixture_id = %s AND canonical_fixture_id = %s
+                RETURNING source, source_fixture_id, canonical_fixture_id, status, evidence_ids, kickoff_at,
+                          home_team_source_id, away_team_source_id, rationale, proposed_at, decided_at
+                """,
+                (status.value, _json_value(list(evidence_ids)), rationale, decided_at or datetime.now(timezone.utc), source, source_fixture_id, canonical_fixture_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(f"fixture mapping candidate not found: {source}:{source_fixture_id}->{canonical_fixture_id}")
+            if status is FixtureMappingStatus.CONFIRMED:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM fixture_mapping_candidates WHERE source = %s AND source_fixture_id = %s AND status = %s AND canonical_fixture_id <> %s",
+                    (source, source_fixture_id, FixtureMappingStatus.CONFIRMED.value, canonical_fixture_id),
+                )
+                if cursor.fetchone()[0]:
+                    raise ValueError("a source fixture ID cannot be confirmed to multiple canonical fixtures")
+            connection.commit()
+            return self._fixture_mapping_from_row(row)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def fixture_mapping_candidates(self, *, source: str, source_fixture_id: str) -> tuple[FixtureMappingCandidate, ...]:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            if source_fixture_id == "*":
+                cursor.execute("SELECT source, source_fixture_id, canonical_fixture_id, status, evidence_ids, kickoff_at, home_team_source_id, away_team_source_id, rationale, proposed_at, decided_at FROM fixture_mapping_candidates WHERE source = %s", (source,))
+            else:
+                cursor.execute("SELECT source, source_fixture_id, canonical_fixture_id, status, evidence_ids, kickoff_at, home_team_source_id, away_team_source_id, rationale, proposed_at, decided_at FROM fixture_mapping_candidates WHERE source = %s AND source_fixture_id = %s", (source, source_fixture_id))
+            return tuple(self._fixture_mapping_from_row(row) for row in cursor.fetchall())
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    @staticmethod
+    def _fixture_mapping_from_row(row: Any) -> FixtureMappingCandidate:
+        evidence_ids = row[4] if isinstance(row[4], list) else json.loads(row[4] or "[]")
+        return FixtureMappingCandidate(row[0], row[1], row[2], FixtureMappingStatus(row[3]), tuple(evidence_ids or ()), row[5], row[6], row[7], row[8], row[9], row[10])
 
     @staticmethod
     def _health_snapshot(row: Any) -> SourceCapabilityHealthSnapshot:

@@ -34,6 +34,15 @@ class IngestionRunStatus(StrEnum):
     RECOVERY_PENDING = "recovery_pending"
 
 
+class FixtureMappingStatus(StrEnum):
+    """Lifecycle for a cross-source fixture identity proposal."""
+
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    AMBIGUOUS = "ambiguous"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True, slots=True)
 class IngestionRun:
     run_id: str
@@ -66,6 +75,8 @@ class EntityType(StrEnum):
     LINEUP = "lineup"
     TEAM_STAT = "team_stat"
     PLAYER_STAT = "player_stat"
+    EVENT = "event"
+    SHOT = "shot"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +90,23 @@ class SourceCapability:
     pit_suitability: str = "unknown"
     known_delay_cadence: str | None = None
     usage_rights_state: str = "unknown"
+    policy_version: str = "unversioned"
+    evidence_refs: tuple[str, ...] = ()
+    semantic_contract: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceManifest:
+    """Operational and semantic contract for one source implementation."""
+
+    source: str
+    implementation_version: str
+    acquisition_mode: str
+    capabilities: tuple[str, ...] = ()
+    rights_state: str = "review_required"
+    operational_eligibility: str = "research_only"
+    semantic_contracts: Mapping[str, str] = field(default_factory=dict)
+    notes: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,3 +204,20 @@ class SourceResult:
     integration: str | None = None
     adapter_version: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureMappingCandidate:
+    """A proposed mapping from one provider fixture ID to a canonical fixture."""
+
+    source: str
+    source_fixture_id: str
+    canonical_fixture_id: str
+    status: FixtureMappingStatus = FixtureMappingStatus.PROPOSED
+    evidence_ids: tuple[str, ...] = ()
+    kickoff_at: datetime | None = None
+    home_team_source_id: str | None = None
+    away_team_source_id: str | None = None
+    rationale: str | None = None
+    proposed_at: datetime | None = None
+    decided_at: datetime | None = None

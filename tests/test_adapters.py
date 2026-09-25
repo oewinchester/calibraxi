@@ -1,10 +1,11 @@
 from calibraxi_data import CapabilityState, HttpJsonSourceAdapter, SoccerDataAdapter
+from calibraxi_data.espn import EspnSourceAdapter
 from calibraxi_data.soccerdata import (
     SoccerDataCapabilitySpec,
     SoccerDataProviderBridge,
     SoccerDataProviderSpec,
 )
-from calibraxi_data.http_json import HttpResponse
+from calibraxi_data.http_json import HttpResponse, RetryPolicy
 
 
 class FakeSoccerData:
@@ -166,6 +167,16 @@ class FakeTransport:
         return self.response
 
 
+class SequenceTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def request(self, url, *, headers, timeout):
+        self.calls += 1
+        return self.responses.pop(0)
+
+
 def test_http_json_adapter_builds_url_and_returns_decoded_payload():
     transport = FakeTransport(HttpResponse(200, b'{"fixtures":[1]}', {"content-type": "application/json"}))
     adapter = HttpJsonSourceAdapter(source_name="native", endpoints={"fixtures": "https://example.test/fixtures"}, transport=transport)
@@ -185,6 +196,78 @@ def test_http_json_adapter_preserves_http_failure_state():
 
     assert result.state is CapabilityState.SOURCE_FAILED
     assert result.payload is None
+
+
+def test_http_json_adapter_retries_transient_http_failures_with_bounded_backoff():
+    transport = SequenceTransport(
+        [
+            HttpResponse(503, b"{}", {}),
+            HttpResponse(429, b"{}", {"Retry-After": "0.4"}),
+            HttpResponse(200, b'{"fixtures":[1]}', {}),
+        ]
+    )
+    delays = []
+    adapter = HttpJsonSourceAdapter(
+        source_name="native",
+        endpoints={"fixtures": "https://example.test/fixtures"},
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.1, max_delay_seconds=0.3),
+        sleep=delays.append,
+    )
+
+    result = adapter.fetch("fixtures")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.payload == {"fixtures": [1]}
+    assert transport.calls == 3
+    assert delays == [0.1, 0.3]
+    assert result.metadata["request_attempts"] == 3
+    assert result.metadata["retry_count"] == 2
+
+
+def test_http_json_adapter_does_not_retry_permanent_http_failures():
+    transport = SequenceTransport([HttpResponse(404, b"{}", {})])
+    delays = []
+    adapter = HttpJsonSourceAdapter(
+        source_name="native",
+        endpoints={"fixtures": "https://example.test/fixtures"},
+        transport=transport,
+        sleep=delays.append,
+    )
+
+    result = adapter.fetch("fixtures")
+
+    assert result.state is CapabilityState.SOURCE_FAILED
+    assert result.http_status == 404
+    assert transport.calls == 1
+    assert delays == []
+
+
+def test_http_json_adapter_retries_transient_transport_errors():
+    class FlakyTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, url, *, headers, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("upstream timeout")
+            return HttpResponse(200, b'{"fixtures":[1]}', {})
+
+    transport = FlakyTransport()
+    delays = []
+    result = HttpJsonSourceAdapter(
+        source_name="native",
+        endpoints={"fixtures": "https://example.test/fixtures"},
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=2, base_delay_seconds=0.05),
+        sleep=delays.append,
+    ).fetch("fixtures")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert transport.calls == 2
+    assert delays == [0.05]
+    assert result.metadata["request_attempts"] == 2
 
 
 def test_http_json_adapter_converts_unexpected_transport_failure_to_source_failed():
@@ -214,3 +297,18 @@ def test_http_json_adapter_malformed_json_is_source_failed():
     assert result.state is CapabilityState.SOURCE_FAILED
     assert result.http_status == 200
     assert "JSON" in (result.error or "") or "json" in (result.error or "")
+
+
+def test_espn_adapter_uses_the_shared_transient_retry_policy():
+    transport = SequenceTransport([HttpResponse(503, b"{}", {}), HttpResponse(200, b'{"events":[]}', {})])
+    delays = []
+    result = EspnSourceAdapter(
+        transport=transport,
+        retry_policy=RetryPolicy(max_attempts=2, base_delay_seconds=0.05),
+        sleep=delays.append,
+    ).fetch("fixtures", league="eng.1")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert transport.calls == 2
+    assert delays == [0.05]
+    assert result.metadata["request_attempts"] == 2

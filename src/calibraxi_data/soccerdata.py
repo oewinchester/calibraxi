@@ -114,6 +114,8 @@ SOCCERDATA_PROVIDER_SPECS: Mapping[str, SoccerDataProviderSpec] = {
         provider_class="MatchHistory",
         capabilities={
             "fixtures": _capability("fixtures", "read_games", entity_type=EntityType.FIXTURE, name_fields=("home_team", "away_team"), required_fields=("date", "home_team", "away_team"), pit_suitability="limited"),
+            "historical_results": _capability("historical_results", "read_games", entity_type=EntityType.FIXTURE, name_fields=("home_team", "away_team"), required_fields=("date", "home_team", "away_team"), pit_suitability="limited"),
+            "odds": _capability("odds", "read_games", entity_type=EntityType.MARKET, name_fields=("home_team", "away_team"), pit_suitability="limited"),
         },
         notes="Historical Football-Data.co.uk results; current/live freshness is limited.",
     ),
@@ -148,6 +150,9 @@ SOCCERDATA_PROVIDER_SPECS: Mapping[str, SoccerDataProviderSpec] = {
             "player_stats": _capability("player_stats", "read_player_season_stats", entity_type=EntityType.PLAYER_STAT, source_id_fields=("player_id",), name_fields=("player",), required_fields=("player_id", "matches", "minutes", "xg", "xa"), pit_suitability="limited"),
             "player_match_stats": _capability("player_match_stats", "read_player_match_stats", entity_type=EntityType.PLAYER_STAT, source_id_fields=("player_id",), name_fields=("player",), required_fields=("game_id", "team_id", "player_id", "minutes", "xg", "xa"), pit_suitability="limited"),
             "team_stats": _capability("team_stats", "read_team_match_stats", entity_type=EntityType.TEAM_STAT, source_id_fields=("game_id",), name_fields=("home_team", "away_team"), required_fields=("game_id", "home_xg", "away_xg", "home_ppda", "away_ppda"), pit_suitability="limited"),
+            "xg": _capability("xg", "read_team_match_stats", entity_type=EntityType.TEAM_STAT, source_id_fields=("game_id",), name_fields=("home_team", "away_team"), pit_suitability="limited"),
+            "xg_a": _capability("xg_a", "read_player_season_stats", entity_type=EntityType.PLAYER_STAT, source_id_fields=("player_id",), name_fields=("player",), pit_suitability="limited"),
+            "shots": _capability("shots", "read_shot_events", entity_type=EntityType.FIXTURE, source_id_fields=(), name_fields=("match", "name"), pit_suitability="limited"),
             "shot_events": _capability("shot_events", "read_shot_events", entity_type=EntityType.FIXTURE, source_id_fields=(), name_fields=("match", "name"), pit_suitability="limited"),
         },
         notes="Useful expected-goals/shots research source; schedule identity and rights need review.",

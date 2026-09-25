@@ -1,6 +1,6 @@
 """CalibraXI data-foundation interfaces and adapters."""
 
-from .capabilities import CapabilityRegistry
+from .capabilities import CapabilityRegistry, SourceManifestRegistry
 from .acquisition import AcquisitionAttempt, AcquisitionCoordinator, AcquisitionResult
 from .contracts import (
     CapabilityState,
@@ -16,10 +16,15 @@ from .contracts import (
     SourceHealthSignal,
     SourceIdentity,
     SourceResult,
+    FixtureMappingCandidate,
+    FixtureMappingStatus,
+    SourceManifest,
 )
 from .evidence import FileSystemRawEvidenceStore, MinioRawEvidenceStore, RawEvidenceStore, S3RawEvidenceStore
 from .entity_resolution import EntityResolutionIndex, resolve_observations
-from .http_json import HttpJsonSourceAdapter, UrllibTransport
+from .fixture_identity import FixtureIdentityIndex
+from .http_json import HttpJsonSourceAdapter, RetryPolicy, UrllibTransport
+from .sofascore import SofascoreObservationParser, SofascoreSourceAdapter
 from .soccerdata import (
     SOCCERDATA_PROVIDER_SPECS,
     SoccerDataAdapter,
@@ -40,10 +45,14 @@ from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngesti
 from .replay import replay_evidence
 from .recovery import RecoveryAction, RecoveryOutcome, RecoveryWorker
 from .operations import OperationalRecorder
-from .scheduler import EspnIngestionScheduler, SchedulerRunResult
+from .scheduler import EspnIngestionScheduler, SchedulerRunResult, SourceRateLimiter, SourceRatePolicy
+from .source_registry import default_source_manifests, qualified_capability_policies
 
 __all__ = [
     "CapabilityRegistry",
+    "SourceManifestRegistry",
+    "default_source_manifests",
+    "qualified_capability_policies",
     "AcquisitionAttempt",
     "AcquisitionCoordinator",
     "AcquisitionResult",
@@ -60,6 +69,7 @@ __all__ = [
     "IngestionRunStatus",
     "QuarantineDecision",
     "HttpJsonSourceAdapter",
+    "RetryPolicy",
     "RawEvidence",
     "SoccerDataAdapter",
     "SoccerDataCapabilitySpec",
@@ -77,12 +87,18 @@ __all__ = [
     "SourceHealthSignal",
     "SourceIdentity",
     "SourceResult",
+    "SourceManifest",
+    "FixtureMappingCandidate",
+    "FixtureMappingStatus",
+    "FixtureIdentityIndex",
     "DataQualityValidator",
     "QualityIssue",
     "ValidationResult",
     "UrllibTransport",
     "EspnObservationParser",
     "EspnSourceAdapter",
+    "SofascoreSourceAdapter",
+    "SofascoreObservationParser",
     "SourceObservation",
     "TheSportsDbObservationParser",
     "TheSportsDbSourceAdapter",
@@ -103,4 +119,6 @@ __all__ = [
     "OperationalRecorder",
     "EspnIngestionScheduler",
     "SchedulerRunResult",
+    "SourceRateLimiter",
+    "SourceRatePolicy",
 ]

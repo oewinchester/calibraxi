@@ -20,6 +20,11 @@ from calibraxi_data.contracts import CapabilityState, SourceResult
 def test_matchhistory_manifest_preserves_football_data_upstream_identity():
     assert SOCCERDATA_PROVIDER_SPECS["matchhistory"].source == "football-data.co.uk"
     assert SOCCERDATA_PROVIDER_SPECS["football-data.co.uk"].provider_class == "MatchHistory"
+    assert {"historical_results", "odds"}.issubset(SOCCERDATA_PROVIDER_SPECS["matchhistory"].capabilities)
+
+
+def test_understat_manifest_exposes_provider_specific_xg_boundaries():
+    assert {"xg", "xg_a", "shots"}.issubset(SOCCERDATA_PROVIDER_SPECS["understat"].capabilities)
 
 
 def test_provider_manifest_does_not_declare_display_names_as_source_ids():
@@ -526,7 +531,12 @@ def test_checked_in_semantic_validation_preserves_measured_compatibility_limits(
     assert sources["ESPN"]["chronology"]["pit_quality"] == "strong"
 
     assert sources["Sofascore"]["fixtures"]["coverage"] == "380/380"
-    assert sources["Sofascore"]["match_level_measured"] is False
+    assert sources["Sofascore"]["match_level_measured"] is True
+    assert sources["Sofascore"]["match_level"]["sample_matches"] == 5
+    assert sources["Sofascore"]["match_level"]["lineup_rows"] == 200
+    assert sources["Sofascore"]["identity_chronology"]["kickoff_matches_espn"] == "5/5"
+    assert sources["Sofascore"]["identity_chronology"]["source_available_timestamp"] == "unknown in 5/5; updatedTimestamp null"
+    assert "fields are measured" in payload["capability_compatibility"]["lineups_events_stats"]["reason"]
 
     understat = sources["Understat"]
     assert understat["fixtures"]["coverage"] == "380/380"
@@ -622,3 +632,45 @@ def test_corrected_source_evidence_is_additive_to_historical_qualification_stage
     assert corrected["OpenFootball"]["classification"] == "verification-reference"
     assert next(item for item in corrected["11v11"]["measured"] if item["capability"] == "fixtures")["row_count"] == 380
     assert "no normalized standings" in corrected["Mackolik"]["limitation"]
+
+
+def test_thesportsdb_season_measurement_preserves_undercoverage_and_repeatability():
+    payload = json.loads(
+        Path("tests/fixtures/epl_2025_26_source_qualification.json").read_text(encoding="utf-8")
+    )
+    stages = [
+        item
+        for item in payload["sources"]
+        if item["source"] == "TheSportsDB"
+    ]
+
+    assert any(item["benchmark_stage"] == "first-stage" for item in stages)
+    measured = next(item for item in stages if item["benchmark_stage"] == "second-stage")
+    fixtures = next(item for item in measured["measured"] if item["capability"] == "fixtures")
+    matrix = SoccerDataQualificationMatrix.from_fixture(
+        "tests/fixtures/epl_2025_26_source_qualification.json"
+    )
+    row = next(
+        result
+        for result in matrix.results
+        if result.source == "TheSportsDB"
+        and result.benchmark_stage == "second-stage"
+        and result.capability == "fixtures"
+    )
+
+    assert measured["classification"] == "research-only"
+    assert fixtures["coverage_expected"] == 380
+    assert fixtures["coverage_observed"] == 15
+    assert fixtures["unique_source_id_count"] == 15
+    assert fixtures["duplicate_source_id_count"] == 0
+    assert fixtures["http_statuses"] == [200, 200]
+    assert fixtures["latency_samples_ms"] == [270, 219]
+    capture = measured["captures"][0]
+    assert capture["route"] == "/api/v1/json/{API_KEY}/eventsseason.php?id=4328&s=2025-2026"
+    assert capture["response_bytes"] == [18385, 18385]
+    assert capture["content_hashes"] == [
+        "417655a10aa5e4d8f80872f612faa70e916caca9f486fcc1119e29315159c19b",
+        "417655a10aa5e4d8f80872f612faa70e916caca9f486fcc1119e29315159c19b",
+    ]
+    assert row.coverage_ratio == 15 / 380
+    assert row.repeat_success_count == 2

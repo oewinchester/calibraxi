@@ -13,6 +13,7 @@ dev = ["pytest>=8,<9"]
 postgres = ["psycopg[binary]>=3.2,<4"]
 storage = ["boto3>=1.35,<2"]
 soccerdata = ["soccerdata>=1.9,<2"]
+sofascore = ["wrapper-tls-requests>=1.2,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

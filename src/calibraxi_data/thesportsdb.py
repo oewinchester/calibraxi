@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from .contracts import CapabilityState, EntityType, IngestionRunStatus, SourceIdentity, SourceResult
 from .espn import SourceObservation
-from .http_json import HttpTransport, UrllibTransport
+from .http_json import HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
 from .entity_resolution import EntityResolutionIndex, resolve_observations
 from .espn_vertical import CoverageResult, VerticalIngestionReport
 from .persistence import CanonicalStore
@@ -26,27 +27,51 @@ class TheSportsDbSourceAdapter:
     adapter_version = "thesportsdb-http-json-v1"
     _base_template = "https://www.thesportsdb.com/api/v1/json/{api_key}"
 
-    def __init__(self, *, transport: HttpTransport | None = None, timeout: float = 20.0, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        transport: HttpTransport | None = None,
+        timeout: float = 20.0,
+        api_key: str | None = None,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
         self._base = self._base_template.format(api_key=api_key or os.getenv("CALIBRAXI_THESPORTSDB_API_KEY", "3"))
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep or time.sleep
 
     def fetch(self, capability: str, **params: Any) -> SourceResult:
         endpoint, query = self._endpoint(capability, params)
         if endpoint is None:
             return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, adapter_version=self.adapter_version)
         url = f"{endpoint}?{urlencode(query)}" if query else endpoint
+        metadata = {"url": url}
         try:
-            response = self._transport.request(url, headers={"Accept": "application/json", "User-Agent": "CalibraXI/0.1"}, timeout=self._timeout)
-            if response.status < 200 or response.status >= 300:
-                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata={"url": url})
-            try:
-                payload = json.loads(response.body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata={"url": url})
+            request = request_with_retry(
+                self._transport,
+                url,
+                headers={"Accept": "application/json", "User-Agent": "CalibraXI/0.1"},
+                timeout=self._timeout,
+                retry_policy=self._retry_policy,
+                sleep=self._sleep,
+            )
         except Exception as exc:
-            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata={"url": url})
-        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, adapter_version=self.adapter_version, metadata={"url": url})
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata=metadata)
+        metadata.update(request_metadata(request))
+        if request.error is not None:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(request.error), adapter_version=self.adapter_version, metadata=metadata)
+        response = request.response
+        if response is None:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error="transport returned no response", adapter_version=self.adapter_version, metadata=metadata)
+        if response.status < 200 or response.status >= 300:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata=metadata)
+        try:
+            payload = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata=metadata)
+        return SourceResult(CapabilityState.SUPPORTED, self.source_name, capability, payload=payload, http_status=response.status, adapter_version=self.adapter_version, metadata=metadata)
 
     def _endpoint(self, capability: str, params: Mapping[str, Any]) -> tuple[str | None, Mapping[str, Any]]:
         if capability in {"competition", "season"}:
