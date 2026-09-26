@@ -754,7 +754,12 @@ class ScoreDistribution:
         total = sum(sum(row) for row in rows)
         if total <= 0:
             raise ValueError("score distribution must have positive mass")
-        normalized = tuple(tuple(value / total for value in row) for row in rows)
+        if math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
+            # Preserve already-normalized serialized values exactly. Rescaling
+            # them again can shift probabilities by one ULP on every replay.
+            normalized = rows
+        else:
+            normalized = tuple(tuple(value / total for value in row) for row in rows)
         object.__setattr__(self, "probabilities", normalized)
 
     @property

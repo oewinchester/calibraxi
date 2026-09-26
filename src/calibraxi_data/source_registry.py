@@ -156,6 +156,17 @@ def qualified_capability_policies() -> tuple[SourceCapability, ...]:
             semantic_contract=PROVIDER_XG_V1,
         ),
         SourceCapability(
+            "xg_a",
+            "understat",
+            competition_season_coverage=("EPL:2025/26",),
+            historical_depth="season history measured",
+            pit_suitability="limited",
+            usage_rights_state="review_required",
+            policy_version="understat-xa-v1",
+            evidence_refs=("source-qualification:understat",),
+            semantic_contract=PROVIDER_XG_V1,
+        ),
+        SourceCapability(
             "lineups",
             "espn",
             ("sofascore",),

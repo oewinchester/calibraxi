@@ -269,6 +269,14 @@ def test_score_distribution_is_coherent_for_outcome_btts_and_totals():
     assert sum(sum(row) for row in distribution.probabilities) == pytest.approx(1.0)
 
 
+def test_score_distribution_serialization_round_trip_is_exact():
+    distribution = ScoreDistribution.independent_poisson(0.05, 0.05, max_goals=10)
+
+    restored = ScoreDistribution.from_dict(distribution.to_dict())
+
+    assert restored.to_dict() == distribution.to_dict()
+
+
 def test_score_distribution_exposes_coherent_derived_markets():
     distribution = ScoreDistribution.independent_poisson(1.4, 0.9, max_goals=8)
 

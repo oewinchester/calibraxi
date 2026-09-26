@@ -187,8 +187,17 @@ def test_local_activation_requires_explicit_review_required_opt_in():
     policy = qualified_capability_policies()[0]
 
     registry.activate(policy, allow_review_required=True)
-
     assert registry.get("fixtures") is policy
+
+
+def test_understat_xga_has_provider_specific_review_required_policy():
+    policies = {policy.key: policy for policy in qualified_capability_policies()}
+
+    policy = policies["xg_a"]
+
+    assert policy.primary_source == "understat"
+    assert policy.usage_rights_state == "review_required"
+    assert policy.semantic_contract == "provider_specific_xg_v1"
 
 
 def test_production_activation_checks_capability_rights_state():

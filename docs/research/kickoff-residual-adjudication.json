@@ -1,0 +1,120 @@
+{
+  "schema_version": "kickoff-residual-adjudication-v1",
+  "decision_date": "2026-09-26",
+  "scope": "EPL 2025/26 Football-Data versus ESPN kickoff reconciliation",
+  "source_timezone": "Europe/London",
+  "population": {
+    "input_kickoff_only_differences": 158,
+    "timezone_normalization_artifacts": 156,
+    "residual_candidates": 2,
+    "confirmed_schedule_revisions": 0,
+    "provider_timestamp_discrepancies": 0,
+    "source_corrections": 0,
+    "unresolved": 2
+  },
+  "classification_policy": {
+    "confirmed_schedule_revision": "Requires retained evidence that a source published or changed the fixture kickoff, or an independently retained qualified source that corroborates a change.",
+    "provider_timestamp_discrepancy": "Use only when evidence establishes that the compared provider values represent different timestamp semantics rather than different fixture schedule values.",
+    "source_correction": "Use only when a later retained source observation explicitly supersedes an earlier source value and preserves correction lineage.",
+    "unresolved": "Use when source values differ but retained evidence cannot establish a schedule change, timestamp semantic mismatch, or correction chronology. Preserve both observations and do not promote either disposition."
+  },
+  "fixtures": [
+    {
+      "fixture_id": "fixture:epl:2025-26:crystal-palace:burnley",
+      "home_team": "Crystal Palace",
+      "away_team": "Burnley",
+      "date": "2026-02-11",
+      "difference_minutes": 10,
+      "classification": "unresolved",
+      "source_observations": [
+        {
+          "source": "football-data.co.uk",
+          "capability": "historical_results",
+          "source_fixture_id": "2526:11/02/2026:Crystal Palace:Burnley",
+          "source_local_date": "11/02/2026",
+          "source_local_time": "19:30",
+          "source_timezone": "Europe/London",
+          "normalized_kickoff_at": "2026-02-11T19:30:00Z",
+          "result": "A",
+          "score": {
+            "home": 2,
+            "away": 3
+          },
+          "evidence_ids": [
+            "63abc2d1-e692-43d0-97e7-bbae9b30095d",
+            "77fc4227-64d2-4b6d-952b-f38ee74916cb"
+          ],
+          "availability_chronology": "unknown"
+        },
+        {
+          "source": "espn",
+          "capability": "fixtures",
+          "source_event_id": "740851",
+          "provider_kickoff_at": "2026-02-11T19:40:00Z",
+          "status": "STATUS_FULL_TIME",
+          "evidence_ids": [
+            "3b4207e1-bfc6-4432-94fb-d4738926b3d2"
+          ],
+          "knowledge_at": "2026-09-25T17:19:42.773746Z",
+          "provider_publication_or_change_time": null
+        }
+      ],
+      "rationale": [
+        "The February date is in UK winter time, so 19:30 Europe/London normalizes to 19:30 UTC; the ten-minute difference is not a DST conversion artifact.",
+        "The retained ESPN observation and Football-Data row agree on teams, date, score, and fixture identity but disagree on kickoff minutes.",
+        "Retained evidence has no source publication, update, or revision timestamp that proves which value was first or whether either value was a schedule revision.",
+        "No independently retained qualified fixture observation corroborating a change is available in this audit population."
+      ],
+      "eligibility_effect": "Keep both source observations and the residual discrepancy visible; do not count it as a timezone artifact or confirmed schedule revision."
+    },
+    {
+      "fixture_id": "fixture:epl:2025-26:brighton:liverpool",
+      "home_team": "Brighton",
+      "away_team": "Liverpool",
+      "date": "2026-03-21",
+      "difference_minutes": 15,
+      "classification": "unresolved",
+      "source_observations": [
+        {
+          "source": "football-data.co.uk",
+          "capability": "historical_results",
+          "source_fixture_id": "2526:21/03/2026:Brighton:Liverpool",
+          "source_local_date": "21/03/2026",
+          "source_local_time": "12:30",
+          "source_timezone": "Europe/London",
+          "normalized_kickoff_at": "2026-03-21T12:30:00Z",
+          "result": "H",
+          "score": {
+            "home": 2,
+            "away": 1
+          },
+          "evidence_ids": [
+            "63abc2d1-e692-43d0-97e7-bbae9b30095d",
+            "77fc4227-64d2-4b6d-952b-f38ee74916cb"
+          ],
+          "availability_chronology": "unknown"
+        },
+        {
+          "source": "espn",
+          "capability": "fixtures",
+          "source_event_id": "740898",
+          "provider_kickoff_at": "2026-03-21T12:45:00Z",
+          "status": "STATUS_FULL_TIME",
+          "evidence_ids": [
+            "c59243ce-659b-4d06-af7c-08ea942afc7a"
+          ],
+          "knowledge_at": "2026-09-25T17:19:55.515491Z",
+          "provider_publication_or_change_time": null
+        }
+      ],
+      "rationale": [
+        "21 March 2026 precedes the UK DST transition, so 12:30 Europe/London normalizes to 12:30 UTC; the fifteen-minute difference is not a DST conversion artifact.",
+        "The retained ESPN observation and Football-Data row agree on teams, date, score, and fixture identity but disagree on kickoff minutes.",
+        "Retained evidence has no source publication, update, or revision timestamp that proves which value was first or whether either value was a schedule revision.",
+        "No independently retained qualified fixture observation corroborating a change is available in this audit population."
+      ],
+      "eligibility_effect": "Keep both source observations and the residual discrepancy visible; do not count it as a timezone artifact or confirmed schedule revision."
+    }
+  ],
+  "final_disposition": "Both residual kickoff candidates remain unresolved. The corrected reconciliation count is two residual unresolved differences after 156 Europe/London normalization artifacts are removed."
+}
