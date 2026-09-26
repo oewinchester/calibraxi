@@ -45,7 +45,15 @@ from .espn_vertical import CoverageResult, EspnVerticalIngestor, VerticalIngesti
 from .replay import replay_evidence
 from .recovery import RecoveryAction, RecoveryOutcome, RecoveryWorker
 from .operations import OperationalRecorder
-from .scheduler import EspnIngestionScheduler, SchedulerRunResult, SourceRateLimiter, SourceRatePolicy
+from .scheduler import (
+    EspnIngestionScheduler,
+    FileProspectiveObservationStore,
+    ProspectiveObservation,
+    ProspectiveObservationCollector,
+    SchedulerRunResult,
+    SourceRateLimiter,
+    SourceRatePolicy,
+)
 from .source_registry import default_source_manifests, qualified_capability_policies
 from .bootstrap import (
     BootstrapReport,
@@ -56,6 +64,7 @@ from .bootstrap import (
     ForecastingPostgresStore,
     ReconciliationIssue,
     build_coverage,
+    audit_timezone_reconciliation,
     canonical_fixture_id,
     canonical_team_id,
     collect_espn_fixture_observations,
@@ -69,7 +78,10 @@ from .bootstrap import (
 from .forecasting import (
     BacktestResult,
     DataQualityError,
+    DixonColesBaseline,
     EloBaseline,
+    EligibilityBasis,
+    EventDerivedEligibilityPolicy,
     EvaluationMetrics,
     FeatureSnapshot,
     FeatureSnapshotBuilder,
@@ -95,6 +107,20 @@ from .forecasting import (
     build_training_dataset,
     compare_models,
     evaluate_predictions,
+)
+from .historical_evaluation import (
+    CalibrationComparison,
+    HistoricalEvaluation,
+    HistoricalPopulation,
+    PowerRatingPoint,
+    REAL_DATASET_MANIFEST_VERSION,
+    REAL_FEATURE_SCHEMA_VERSION,
+    SkippedFixture,
+    build_real_historical_population,
+    load_football_data_archive,
+    run_real_walk_forward,
+    select_production_candidate,
+    write_evaluation_artifacts,
 )
 
 __all__ = [
@@ -168,11 +194,17 @@ __all__ = [
     "OperationalRecorder",
     "EspnIngestionScheduler",
     "SchedulerRunResult",
+    "ProspectiveObservation",
+    "FileProspectiveObservationStore",
+    "ProspectiveObservationCollector",
     "SourceRateLimiter",
     "SourceRatePolicy",
     "BacktestResult",
     "DataQualityError",
+    "DixonColesBaseline",
     "EloBaseline",
+    "EligibilityBasis",
+    "EventDerivedEligibilityPolicy",
     "EvaluationMetrics",
     "FeatureSnapshot",
     "FeatureSnapshotBuilder",
@@ -198,6 +230,19 @@ __all__ = [
     "build_training_dataset",
     "compare_models",
     "evaluate_predictions",
+    "CalibrationComparison",
+    "HistoricalEvaluation",
+    "HistoricalPopulation",
+    "PowerRatingPoint",
+    "REAL_DATASET_MANIFEST_VERSION",
+    "REAL_FEATURE_SCHEMA_VERSION",
+    "SkippedFixture",
+    "audit_timezone_reconciliation",
+    "build_real_historical_population",
+    "load_football_data_archive",
+    "run_real_walk_forward",
+    "select_production_candidate",
+    "write_evaluation_artifacts",
     "BootstrapReport",
     "CoverageMetric",
     "EplBootstrapper",

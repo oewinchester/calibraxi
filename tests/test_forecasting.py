@@ -269,6 +269,29 @@ def test_score_distribution_is_coherent_for_outcome_btts_and_totals():
     assert sum(sum(row) for row in distribution.probabilities) == pytest.approx(1.0)
 
 
+def test_score_distribution_exposes_coherent_derived_markets():
+    distribution = ScoreDistribution.independent_poisson(1.4, 0.9, max_goals=8)
+
+    markets = distribution.derived_markets()
+
+    assert set(markets["one_x_two"]) == {"home", "draw", "away"}
+    assert sum(markets["one_x_two"].values()) == pytest.approx(1.0)
+    assert sum(markets["total_goals"].values()) == pytest.approx(1.0)
+    assert markets["over_under"]["2.5"]["over"] + markets["over_under"]["2.5"]["under"] == pytest.approx(1.0)
+    assert markets["btts"]["yes"] + markets["btts"]["no"] == pytest.approx(1.0)
+
+
+def test_forecast_prediction_serializes_primary_distribution_and_derived_markets_separately():
+    distribution = ScoreDistribution.independent_poisson(1.0, 1.0)
+    prediction = ForecastPrediction("f1", dt(2), distribution, 1, 1)
+
+    payload = prediction.to_dict()
+
+    assert payload["distribution"] == distribution.to_dict()
+    assert payload["derived_markets"] == distribution.derived_markets()
+    assert payload["calibrated_derived_markets"] is None
+
+
 def test_baselines_fit_only_supplied_history_and_produce_valid_distributions():
     records = [
         match("f1", 1, "A", "B", 2, 0, knowledge_day=2),

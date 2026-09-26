@@ -56,7 +56,7 @@ class _Cursor:
             self.connection.snapshots[snapshot_id] = (
                 params[1], params[2], params[3], params[4], params[5],
                 json.loads(params[6]), json.loads(params[7]), json.loads(params[8]),
-                params[9], params[10], params[11], params[12], params[13], json.loads(params[14]),
+                params[9], params[10], params[11], params[12], params[13], json.loads(params[14]), json.loads(params[15]),
             )
             self.rowcount = 1
         elif normalized.startswith("select snapshot_id from calibraxi_feature_snapshots"):
@@ -91,6 +91,14 @@ class _Cursor:
             self._result = tuple(self.connection.runs.values())
         elif normalized.startswith("select family, version, config, training_dataset_id"):
             self._result = self.connection.artifacts.get(("model", params[0]))
+        elif normalized.startswith("select payload, created_at from calibraxi_evaluation_artifacts"):
+            self._result = self.connection.evaluation_artifacts.get((params[0], params[1]))
+        elif normalized.startswith("insert into calibraxi_evaluation_artifacts"):
+            key = (params[0], params[1])
+            if key in self.connection.evaluation_artifacts:
+                return
+            self.connection.evaluation_artifacts[key] = (json.loads(params[2]), params[3])
+            self.rowcount = 1
         elif normalized.startswith("insert into calibraxi_model_artifacts"):
             key = ("model", params[0])
             if key in self.connection.artifacts:
@@ -102,6 +110,20 @@ class _Cursor:
             self.rowcount = 1
         elif normalized.startswith("select family, version, method, training_start_at"):
             self._result = self.connection.artifacts.get(("calibration", params[0]))
+        elif normalized.startswith("select fixture_id, kickoff_at, team_id, rating_before"):
+            self._result = self.connection.ratings.get((params[0], params[1], params[2]))
+        elif normalized.startswith("insert into calibraxi_power_rating_history"):
+            key = (params[0], params[2], params[5])
+            if key not in self.connection.ratings:
+                self.connection.ratings[key] = tuple(params)
+                self.rowcount = 1
+        elif normalized.startswith("select source, capability, fixture_id, observed_at"):
+            self._result = self.connection.prospective.get(params[0])
+        elif normalized.startswith("insert into calibraxi_prospective_observations"):
+            key = params[0]
+            if key not in self.connection.prospective:
+                self.connection.prospective[key] = tuple(params)
+                self.rowcount = 1
         elif normalized.startswith("insert into calibraxi_calibration_artifacts"):
             key = ("calibration", params[0])
             if key in self.connection.artifacts:
@@ -145,6 +167,9 @@ class _Connection:
         self.snapshots = {}
         self.runs = {}
         self.artifacts = {}
+        self.evaluation_artifacts = {}
+        self.ratings = {}
+        self.prospective = {}
         self.fixture_rows = []
         self.commits = 0
         self.rollbacks = 0
@@ -177,7 +202,7 @@ def test_postgres_counts_returns_distinct_team_union():
     assert counts["team_memberships"] == 3
 
 
-def _snapshot(*, snapshot_id: str = "snap-1", evidence: tuple[str, ...] = ("e-1",)) -> FeatureSnapshot:
+def _snapshot(*, snapshot_id: str = "snap-1", evidence: tuple[str, ...] = ("e-1",), eligibility_basis=None) -> FeatureSnapshot:
     return FeatureSnapshot(
         snapshot_id=snapshot_id,
         fixture_id="f1",
@@ -192,6 +217,7 @@ def _snapshot(*, snapshot_id: str = "snap-1", evidence: tuple[str, ...] = ("e-1"
         home_team="A",
         away_team="B",
         evidence_lineage={"home_matches_seen": evidence},
+        eligibility_basis=eligibility_basis or {},
     )
 
 
@@ -225,6 +251,30 @@ def test_postgres_snapshot_replay_compares_all_immutable_metadata():
 
     with pytest.raises(ValueError, match="feature snapshot is immutable"):
         store.save_feature_snapshot(_snapshot(evidence=("e-2",)))
+
+
+def test_postgres_snapshot_replay_compares_eligibility_basis():
+    connection = _Connection()
+    store = _store(connection)
+    snapshot = _snapshot(eligibility_basis={"home_matches_seen": "event_derived_reconstruction"})
+
+    store.save_feature_snapshot(snapshot)
+    store.save_feature_snapshot(snapshot)
+
+
+def test_postgres_batch_snapshot_persistence_replays_all_rows():
+    connection = _Connection()
+    store = _store(connection)
+    first = _snapshot(snapshot_id="snap-1")
+    second = FeatureSnapshot.from_dict({
+        **_snapshot(snapshot_id="snap-2").to_dict(),
+        "fixture_id": "f2",
+        "cutoff_at": dt(11).isoformat(),
+    })
+
+    assert store.save_feature_snapshots((first, second)) == 2
+    assert store.save_feature_snapshots((first, second)) == 2
+    assert set(connection.snapshots) == {"snap-1", "snap-2"}
 
 
 def test_postgres_snapshot_supersession_allows_same_cutoff_and_requires_matching_parent():
@@ -349,3 +399,65 @@ def test_postgres_model_and_calibration_artifacts_reject_conflicting_replays():
             metrics={"ece": 0.1},
             created_at=created,
         )
+
+
+def test_postgres_evaluation_artifact_accepts_json_arrays_and_replays_immutably():
+    connection = _Connection()
+    store = _store(connection)
+    payload = [{"fixture_id": "f1", "score": [1, 0]}]
+
+    store.save_evaluation_artifact(
+        evaluation_id="eval-1",
+        artifact_type="power-ratings.json",
+        payload=payload,
+        created_at=dt(10, 16),
+    )
+    store.save_evaluation_artifact(
+        evaluation_id="eval-1",
+        artifact_type="power-ratings.json",
+        payload=payload,
+        created_at=dt(10, 16),
+    )
+
+    assert connection.evaluation_artifacts[("eval-1", "power-ratings.json")][0] == payload
+
+
+def test_postgres_power_rating_history_replay_rejects_conflicting_values():
+    connection = _Connection()
+    store = _store(connection)
+    point = {
+        "fixture_id": "f1",
+        "kickoff_at": dt(10),
+        "team_id": "team-a",
+        "rating_before": 1500.0,
+        "rating_after": 1510.0,
+        "methodology_version": "elo-v1",
+        "update_reason": "completed_result",
+    }
+
+    assert store.save_power_rating_history((point,)) == 1
+    assert store.save_power_rating_history((point,)) == 1
+    with pytest.raises(ValueError, match="power rating history is immutable"):
+        store.save_power_rating_history(({**point, "rating_after": 1520.0},))
+
+
+def test_postgres_prospective_observation_replay_rejects_conflicting_values():
+    connection = _Connection()
+    store = _store(connection)
+    observation = {
+        "observation_id": "obs-1",
+        "source": "espn",
+        "capability": "fixture_schedule",
+        "fixture_id": "f1",
+        "observed_at": dt(10),
+        "available_at": None,
+        "knowledge_at": dt(10),
+        "payload": {"status": "pre"},
+        "schema_version": "prospective-v1",
+        "created_at": dt(10, 16),
+    }
+
+    store.save_prospective_observation(observation)
+    store.save_prospective_observation(observation)
+    with pytest.raises(ValueError, match="prospective observation is immutable"):
+        store.save_prospective_observation({**observation, "payload": {"status": "post"}})

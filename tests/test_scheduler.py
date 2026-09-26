@@ -5,7 +5,13 @@ from calibraxi_data.espn_vertical import VerticalIngestionReport
 from calibraxi_data.thesportsdb import TheSportsDbObservationParser
 from calibraxi_data.contracts import IngestionRunStatus
 from calibraxi_data.recovery import RecoveryWorker
-from calibraxi_data.scheduler import EspnIngestionScheduler, SourceRateLimiter, SourceRatePolicy
+from calibraxi_data.scheduler import (
+    EspnIngestionScheduler,
+    FileProspectiveObservationStore,
+    ProspectiveObservationCollector,
+    SourceRateLimiter,
+    SourceRatePolicy,
+)
 
 
 class CrashOnceIngestor:
@@ -119,3 +125,22 @@ def test_scheduler_releases_rate_slot_when_worker_lease_is_unavailable(tmp_path)
     assert result.skipped is True
     assert limiter.try_acquire("espn") is True
     limiter.release("espn")
+
+
+def test_prospective_observations_are_knowledge_time_bound_and_immutable(tmp_path):
+    store = FileProspectiveObservationStore(tmp_path / "observations")
+    collector = ProspectiveObservationCollector(store)
+    knowledge = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
+    first = collector.collect(
+        source="espn",
+        capability="fixture_detail",
+        fixture_id="fixture-1",
+        payload={"status": "pre"},
+        knowledge_at=knowledge,
+        schema_version="prospective-v1",
+    )
+    replay = store.get(first.observation_id)
+
+    assert replay is not None
+    assert replay.knowledge_at == knowledge
+    assert len(store.list()) == 1

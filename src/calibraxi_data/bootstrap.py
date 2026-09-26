@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from .acquisition import AcquisitionCoordinator
 from .capabilities import CapabilityRegistry, SourceManifestRegistry
@@ -30,6 +31,8 @@ from .source_registry import default_source_manifests, qualified_capability_poli
 
 
 UTC = timezone.utc
+FOOTBALL_DATA_TIMEZONE = "Europe/London"
+FOOTBALL_DATA_ZONE = ZoneInfo(FOOTBALL_DATA_TIMEZONE)
 COMPETITION = "EPL"
 SOURCE = "football-data.co.uk"
 BOOTSTRAP_REPORT_SCHEMA_VERSION = "bootstrap-report-v2"
@@ -153,10 +156,32 @@ def _parse_date(value: str, season: str) -> datetime | None:
                 # century; infer the season start where possible.
                 start = 2000 + int(str(season)[:2]) if str(season)[:2].isdigit() else parsed.year
                 parsed = parsed.replace(year=start if parsed.month >= 7 else start + 1)
-            return parsed.replace(tzinfo=UTC)
+            # Keep the parsed calendar date naive until the Time column has
+            # been combined with it.  Football-Data publishes both columns as
+            # one UK-local wall clock; localizing the date before replacing its
+            # time would accidentally replace a UTC hour.
+            return parsed
         except ValueError:
             continue
     return None
+
+
+def _localize_football_data_time(value: datetime) -> datetime:
+    """Convert a Football-Data UK wall clock to UTC without DST guessing."""
+
+    if value.tzinfo is not None:
+        raise ValueError("Football-Data local time must be naive")
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = value.replace(tzinfo=FOOTBALL_DATA_ZONE, fold=fold)
+        round_trip = candidate.astimezone(UTC).astimezone(FOOTBALL_DATA_ZONE)
+        if round_trip.replace(tzinfo=None) == value:
+            if not any(candidate.astimezone(UTC) == item.astimezone(UTC) for item in candidates):
+                candidates.append(candidate)
+    if len(candidates) != 1:
+        state = "nonexistent" if not candidates else "ambiguous"
+        raise ValueError(f"Football-Data local time is {state} in {FOOTBALL_DATA_TIMEZONE}: {value.isoformat()}")
+    return candidates[0].astimezone(UTC)
 
 
 def _parse_kickoff(row: Mapping[str, str], season: str) -> datetime | None:
@@ -165,12 +190,28 @@ def _parse_kickoff(row: Mapping[str, str], season: str) -> datetime | None:
         return None
     raw_time = str(row.get("Time", "")).strip()
     if not raw_time:
-        return date
+        return _localize_football_data_time(date)
     try:
         hour, minute = (int(part) for part in raw_time.split(":", 1))
-        return date.replace(hour=hour, minute=minute)
     except (ValueError, TypeError):
-        return date
+        try:
+            return _localize_football_data_time(date)
+        except ValueError:
+            return None
+    try:
+        return _localize_football_data_time(date.replace(hour=hour, minute=minute))
+    except ValueError:
+        return None
+
+
+def _parse_kickoff_with_source_time(
+    row: Mapping[str, str], season: str
+) -> tuple[datetime | None, str | None, str | None]:
+    """Return normalized UTC kickoff plus the raw Football-Data local parts."""
+
+    raw_date = str(row.get("Date", "")).strip() or None
+    raw_time = str(row.get("Time", "")).strip() or None
+    return _parse_kickoff(row, season), raw_date, raw_time
 
 
 def _int(value: Any) -> int | None:
@@ -214,6 +255,11 @@ class EplFixture:
     availability_state: str = "unknown"
     odds: Mapping[str, float] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()
+    source_local_date: str | None = None
+    source_local_time: str | None = None
+    source_timezone: str | None = FOOTBALL_DATA_TIMEZONE
+    eligibility_basis: str = "unknown"
+    event_derived_eligible_at: datetime | None = None
 
     @property
     def completed(self) -> bool:
@@ -547,7 +593,7 @@ def parse_football_data_csv(payload: bytes | str, *, season: str, retrieved_at: 
     for row_number, row in enumerate(reader, start=2):
         home = str(row.get("HomeTeam", "")).strip()
         away = str(row.get("AwayTeam", "")).strip()
-        kickoff = _parse_kickoff(row, season)
+        kickoff, source_local_date, source_local_time = _parse_kickoff_with_source_time(row, season)
         if not home or not away or kickoff is None:
             quarantined += 1
             issues.append(ReconciliationIssue(
@@ -585,6 +631,10 @@ def parse_football_data_csv(payload: bytes | str, *, season: str, retrieved_at: 
             processing_at=retrieved,
             availability_state="unknown",
             odds=odds,
+            source_local_date=source_local_date,
+            source_local_time=source_local_time,
+            source_timezone=FOOTBALL_DATA_TIMEZONE,
+            eligibility_basis="unknown",
         )
         existing = fixtures.get(fixture_id)
         if existing is None:
@@ -640,6 +690,10 @@ def fixture_observations(fixtures: Iterable[EplFixture], *, evidence_id: str) ->
                 "result": fixture.result,
                 "availability_state": fixture.availability_state,
                 "odds": dict(fixture.odds),
+                "source_local_date": fixture.source_local_date,
+                "source_local_time": fixture.source_local_time,
+                "source_timezone": fixture.source_timezone,
+                "eligibility_basis": fixture.eligibility_basis,
                 "evidence_id": evidence_id,
             },
             observed_at=fixture.source_observed_at,
@@ -816,6 +870,51 @@ def reconcile_espn_fixtures(
     return tuple(issues), unresolved, ambiguous
 
 
+def audit_timezone_reconciliation(
+    issues: Iterable[ReconciliationIssue],
+    *,
+    timezone_name: str = FOOTBALL_DATA_TIMEZONE,
+) -> tuple[tuple[ReconciliationIssue, ...], Mapping[str, int]]:
+    """Classify legacy kickoff differences caused by local-time normalization.
+
+    The historical reconciliation artifact was produced while Football-Data
+    wall clocks were interpreted as UTC.  For a kickoff-only issue, reinterpret
+    the canonical wall-clock components in the declared source timezone.  A
+    source timestamp that then matches is a normalization artifact, not a
+    schedule revision.  All other differences remain schedule revisions.
+    """
+
+    zone = ZoneInfo(timezone_name)
+    classified: list[ReconciliationIssue] = []
+    counts = {
+        "input_issues": 0,
+        "timezone_normalization_artifacts": 0,
+        "schedule_revisions": 0,
+        "other_issues": 0,
+    }
+    for issue in issues:
+        counts["input_issues"] += 1
+        if issue.classification != "schedule_revision" or issue.fields != ("kickoff_at",):
+            counts["other_issues"] += 1
+            classified.append(issue)
+            continue
+        canonical = _coerce_datetime(issue.canonical_values.get("kickoff_at"))
+        source = _coerce_datetime(issue.source_values.get("kickoff_at"))
+        corrected = None
+        if canonical is not None:
+            try:
+                corrected = _localize_football_data_time(canonical.replace(tzinfo=None)) if timezone_name == FOOTBALL_DATA_TIMEZONE else canonical.replace(tzinfo=zone).astimezone(UTC)
+            except ValueError:
+                corrected = None
+        if corrected is not None and source is not None and corrected == source:
+            counts["timezone_normalization_artifacts"] += 1
+            classified.append(replace(issue, classification="timezone_normalization_artifact"))
+        else:
+            counts["schedule_revisions"] += 1
+            classified.append(issue)
+    return tuple(classified), counts
+
+
 def derive_team_identity_map(
     fixtures: Sequence[EplFixture],
     observations: Iterable[SourceObservation],
@@ -956,7 +1055,8 @@ class ForecastingPostgresStore:
             features JSONB NOT NULL, missingness JSONB NOT NULL, evidence_ids JSONB NOT NULL,
             pit_eligible BOOLEAN NOT NULL, generated_at TIMESTAMPTZ NOT NULL,
             supersedes_snapshot_id TEXT, home_team TEXT, away_team TEXT,
-            evidence_lineage JSONB NOT NULL DEFAULT '{}'::jsonb
+            evidence_lineage JSONB NOT NULL DEFAULT '{}'::jsonb,
+            eligibility_basis JSONB NOT NULL DEFAULT '{}'::jsonb
         )
         """,
         "ALTER TABLE calibraxi_feature_snapshots DROP CONSTRAINT IF EXISTS calibraxi_feature_snapshots_fixture_id_context_cutoff_at_schema_version_key",
@@ -964,6 +1064,7 @@ class ForecastingPostgresStore:
         "ALTER TABLE calibraxi_feature_snapshots ADD COLUMN IF NOT EXISTS home_team TEXT",
         "ALTER TABLE calibraxi_feature_snapshots ADD COLUMN IF NOT EXISTS away_team TEXT",
         "ALTER TABLE calibraxi_feature_snapshots ADD COLUMN IF NOT EXISTS evidence_lineage JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "ALTER TABLE calibraxi_feature_snapshots ADD COLUMN IF NOT EXISTS eligibility_basis JSONB NOT NULL DEFAULT '{}'::jsonb",
         "CREATE INDEX IF NOT EXISTS ix_calibraxi_feature_snapshot_key ON calibraxi_feature_snapshots(fixture_id, context, cutoff_at, schema_version)",
         "CREATE INDEX IF NOT EXISTS ix_calibraxi_feature_snapshot_parent ON calibraxi_feature_snapshots(supersedes_snapshot_id)",
         """
@@ -1001,6 +1102,28 @@ class ForecastingPostgresStore:
         """,
         "ALTER TABLE calibraxi_forecast_runs ADD COLUMN IF NOT EXISTS model_config JSONB NOT NULL DEFAULT '{}'::jsonb",
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_calibraxi_current_forecast ON calibraxi_forecast_runs(fixture_id, context, forecast_family) WHERE current_run",
+        """
+        CREATE TABLE IF NOT EXISTS calibraxi_evaluation_artifacts (
+            evaluation_id TEXT NOT NULL, artifact_type TEXT NOT NULL, payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (evaluation_id, artifact_type)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS calibraxi_power_rating_history (
+            fixture_id TEXT NOT NULL, kickoff_at TIMESTAMPTZ NOT NULL, team_id TEXT NOT NULL,
+            rating_before DOUBLE PRECISION NOT NULL, rating_after DOUBLE PRECISION NOT NULL,
+            methodology_version TEXT NOT NULL, update_reason TEXT NOT NULL,
+            PRIMARY KEY (fixture_id, team_id, methodology_version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS calibraxi_prospective_observations (
+            observation_id TEXT PRIMARY KEY, source TEXT NOT NULL, capability TEXT NOT NULL,
+            fixture_id TEXT, observed_at TIMESTAMPTZ, available_at TIMESTAMPTZ,
+            knowledge_at TIMESTAMPTZ NOT NULL, payload JSONB NOT NULL,
+            schema_version TEXT, created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
     )
 
     def __init__(self, *, connection_factory: Callable[[], Any], auto_migrate: bool = True) -> None:
@@ -1111,6 +1234,7 @@ class ForecastingPostgresStore:
             "home_team": payload.get("home_team"),
             "away_team": payload.get("away_team"),
             "evidence_lineage": payload.get("evidence_lineage", {}),
+            "eligibility_basis": payload.get("eligibility_basis", {}),
         }
         connection = self._connection_factory()
         cursor = connection.cursor()
@@ -1119,7 +1243,8 @@ class ForecastingPostgresStore:
                 """
                 SELECT fixture_id, context, cutoff_at, knowledge_at, schema_version,
                        features, missingness, evidence_ids, pit_eligible, generated_at,
-                       supersedes_snapshot_id, home_team, away_team, evidence_lineage
+                       supersedes_snapshot_id, home_team, away_team, evidence_lineage,
+                       eligibility_basis
                 FROM calibraxi_feature_snapshots WHERE snapshot_id=%s
                 """,
                 (snapshot.snapshot_id,),
@@ -1141,6 +1266,7 @@ class ForecastingPostgresStore:
                     "home_team": existing[11],
                     "away_team": existing[12],
                     "evidence_lineage": existing[13],
+                    "eligibility_basis": existing[14],
                 }
                 if _comparison_value(existing_payload) != _comparison_value(immutable_payload):
                     raise ValueError(f"feature snapshot is immutable: {snapshot.snapshot_id}")
@@ -1153,7 +1279,8 @@ class ForecastingPostgresStore:
                     """
                     SELECT fixture_id, context, cutoff_at, knowledge_at, schema_version,
                            features, missingness, evidence_ids, pit_eligible, generated_at,
-                           supersedes_snapshot_id, home_team, away_team, evidence_lineage
+                           supersedes_snapshot_id, home_team, away_team, evidence_lineage,
+                           eligibility_basis
                     FROM calibraxi_feature_snapshots WHERE snapshot_id=%s FOR UPDATE
                     """,
                     (supersedes_snapshot_id,),
@@ -1185,17 +1312,120 @@ class ForecastingPostgresStore:
                 INSERT INTO calibraxi_feature_snapshots
                 (snapshot_id, fixture_id, context, cutoff_at, knowledge_at, schema_version,
                  features, missingness, evidence_ids, pit_eligible, generated_at,
-                 supersedes_snapshot_id, home_team, away_team, evidence_lineage)
-                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)
+                 supersedes_snapshot_id, home_team, away_team, evidence_lineage, eligibility_basis)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
                 """,
                 (snapshot.snapshot_id, snapshot.fixture_id, snapshot.context, snapshot.cutoff_at,
                  snapshot.knowledge_at, snapshot.feature_schema_version,
                  json.dumps(payload["features"], sort_keys=True), json.dumps(payload["missingness"], sort_keys=True),
                  json.dumps(payload["evidence_ids"], sort_keys=True), snapshot.pit_eligible,
                  snapshot.generated_at, supersedes_snapshot_id, payload.get("home_team"), payload.get("away_team"),
-                 json.dumps(payload.get("evidence_lineage", {}), sort_keys=True)),
+                 json.dumps(payload.get("evidence_lineage", {}), sort_keys=True),
+                 json.dumps(payload.get("eligibility_basis", {}), sort_keys=True)),
             )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    def save_feature_snapshots(self, snapshots: Iterable[Any]) -> int:
+        """Persist a batch of immutable snapshots in one transaction.
+
+        Historical evaluations contain one snapshot per fixture. Keeping the
+        immutability comparison inside a single connection avoids opening a
+        database session for every row while preserving replay and duplicate
+        protections from ``save_feature_snapshot``.
+        """
+
+        rows = tuple(snapshots)
+        if not rows:
+            return 0
+        connection = self._connection_factory()
+        cursor = connection.cursor()
+        try:
+            for snapshot in rows:
+                payload = snapshot.to_dict()
+                immutable_payload = {
+                    "fixture_id": payload["fixture_id"],
+                    "context": payload["context"],
+                    "cutoff_at": payload["cutoff_at"],
+                    "knowledge_at": payload["knowledge_at"],
+                    "schema_version": payload["feature_schema_version"],
+                    "features": payload["features"],
+                    "missingness": payload["missingness"],
+                    "evidence_ids": payload["evidence_ids"],
+                    "pit_eligible": snapshot.pit_eligible,
+                    "generated_at": payload["generated_at"],
+                    "supersedes_snapshot_id": None,
+                    "home_team": payload.get("home_team"),
+                    "away_team": payload.get("away_team"),
+                    "evidence_lineage": payload.get("evidence_lineage", {}),
+                    "eligibility_basis": payload.get("eligibility_basis", {}),
+                }
+                cursor.execute(
+                    """
+                    SELECT fixture_id, context, cutoff_at, knowledge_at, schema_version,
+                           features, missingness, evidence_ids, pit_eligible, generated_at,
+                           supersedes_snapshot_id, home_team, away_team, evidence_lineage,
+                           eligibility_basis
+                    FROM calibraxi_feature_snapshots WHERE snapshot_id=%s
+                    """,
+                    (snapshot.snapshot_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    existing_payload = {
+                        "fixture_id": existing[0],
+                        "context": existing[1],
+                        "cutoff_at": existing[2],
+                        "knowledge_at": existing[3],
+                        "schema_version": existing[4],
+                        "features": existing[5],
+                        "missingness": existing[6],
+                        "evidence_ids": existing[7],
+                        "pit_eligible": existing[8],
+                        "generated_at": existing[9],
+                        "supersedes_snapshot_id": existing[10],
+                        "home_team": existing[11],
+                        "away_team": existing[12],
+                        "evidence_lineage": existing[13],
+                        "eligibility_basis": existing[14],
+                    }
+                    if _comparison_value(existing_payload) != _comparison_value(immutable_payload):
+                        raise ValueError(f"feature snapshot is immutable: {snapshot.snapshot_id}")
+                    continue
+                snapshot_key = (snapshot.fixture_id, snapshot.context, snapshot.cutoff_at, snapshot.feature_schema_version)
+                cursor.execute(
+                    """
+                    SELECT snapshot_id FROM calibraxi_feature_snapshots
+                    WHERE fixture_id=%s AND context=%s AND cutoff_at=%s AND schema_version=%s
+                    LIMIT 1
+                    """,
+                    snapshot_key,
+                )
+                if cursor.fetchone() is not None:
+                    raise ValueError("feature snapshot key already exists; declare supersession")
+                cursor.execute(
+                    """
+                    INSERT INTO calibraxi_feature_snapshots
+                    (snapshot_id, fixture_id, context, cutoff_at, knowledge_at, schema_version,
+                     features, missingness, evidence_ids, pit_eligible, generated_at,
+                     supersedes_snapshot_id, home_team, away_team, evidence_lineage, eligibility_basis)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+                    """,
+                    (snapshot.snapshot_id, snapshot.fixture_id, snapshot.context, snapshot.cutoff_at,
+                     snapshot.knowledge_at, snapshot.feature_schema_version,
+                     json.dumps(payload["features"], sort_keys=True), json.dumps(payload["missingness"], sort_keys=True),
+                     json.dumps(payload["evidence_ids"], sort_keys=True), snapshot.pit_eligible,
+                     snapshot.generated_at, None, payload.get("home_team"), payload.get("away_team"),
+                     json.dumps(payload.get("evidence_lineage", {}), sort_keys=True),
+                     json.dumps(payload.get("eligibility_basis", {}), sort_keys=True)),
+                )
+            connection.commit()
+            return len(rows)
         except Exception:
             connection.rollback()
             raise
@@ -1300,6 +1530,144 @@ class ForecastingPostgresStore:
             existing_params=(calibration_id,),
             immutable_payload=(family, version, method, training_start_at, training_end_at, dict(config), dict(metrics), created_at),
         )
+
+    def save_evaluation_artifact(self, *, evaluation_id: str, artifact_type: str, payload: Any, created_at: datetime) -> None:
+        """Persist one immutable machine-readable real-evaluation artifact."""
+
+        body = payload
+        connection = self._connection_factory()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT payload, created_at FROM calibraxi_evaluation_artifacts WHERE evaluation_id=%s AND artifact_type=%s",
+                (evaluation_id, artifact_type),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                if _comparison_value(existing[0]) != _comparison_value(body):
+                    raise ValueError(f"evaluation artifact is immutable: {evaluation_id}/{artifact_type}")
+                connection.commit()
+                return
+            cursor.execute(
+                """
+                INSERT INTO calibraxi_evaluation_artifacts(evaluation_id, artifact_type, payload, created_at)
+                VALUES (%s,%s,%s::jsonb,%s)
+                """,
+                (evaluation_id, artifact_type, json.dumps(body, sort_keys=True), created_at),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    def save_power_rating_history(self, points: Iterable[Any]) -> int:
+        rows = tuple(points)
+        if not rows:
+            return 0
+        connection = self._connection_factory()
+        cursor = connection.cursor()
+        try:
+            for point in rows:
+                payload = point.to_dict() if hasattr(point, "to_dict") else dict(point)
+                key = (payload["fixture_id"], payload["team_id"], payload["methodology_version"])
+                cursor.execute(
+                    """
+                    SELECT fixture_id, kickoff_at, team_id, rating_before, rating_after,
+                           methodology_version, update_reason
+                    FROM calibraxi_power_rating_history
+                    WHERE fixture_id=%s AND team_id=%s AND methodology_version=%s
+                    """,
+                    key,
+                )
+                existing = cursor.fetchone()
+                incoming = (
+                    payload["fixture_id"],
+                    payload["kickoff_at"],
+                    payload["team_id"],
+                    payload["rating_before"],
+                    payload["rating_after"],
+                    payload["methodology_version"],
+                    payload["update_reason"],
+                )
+                if existing is not None:
+                    if _comparison_value(existing) != _comparison_value(incoming):
+                        raise ValueError(
+                            "power rating history is immutable: "
+                            f"{payload['fixture_id']}/{payload['team_id']}/{payload['methodology_version']}"
+                        )
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO calibraxi_power_rating_history
+                    (fixture_id, kickoff_at, team_id, rating_before, rating_after, methodology_version, update_reason)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    incoming,
+                )
+            connection.commit()
+            return len(rows)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    def save_prospective_observation(self, observation: Any) -> None:
+        payload = observation.to_dict() if hasattr(observation, "to_dict") else dict(observation)
+        connection = self._connection_factory()
+        cursor = connection.cursor()
+        try:
+            created_at = payload.get("created_at") or datetime.now(UTC)
+            payload_json = json.dumps(payload.get("payload", {}), sort_keys=True)
+            cursor.execute(
+                """
+                SELECT source, capability, fixture_id, observed_at, available_at,
+                       knowledge_at, payload, schema_version, created_at
+                FROM calibraxi_prospective_observations
+                WHERE observation_id=%s
+                """,
+                (payload["observation_id"],),
+            )
+            existing = cursor.fetchone()
+            incoming = (
+                payload["source"],
+                payload["capability"],
+                payload.get("fixture_id"),
+                payload.get("observed_at"),
+                payload.get("available_at"),
+                payload["knowledge_at"],
+                payload_json,
+                payload.get("schema_version"),
+                created_at,
+            )
+            if existing is not None:
+                # The production SELECT excludes the primary key; the small
+                # in-memory persistence double retains it in its stored tuple.
+                if len(existing) == len(incoming) + 1 and existing[0] == payload["observation_id"]:
+                    existing = existing[1:]
+                if _comparison_value(existing) != _comparison_value(incoming):
+                    raise ValueError(f"prospective observation is immutable: {payload['observation_id']}")
+                connection.commit()
+                return
+            cursor.execute(
+                """
+                INSERT INTO calibraxi_prospective_observations
+                (observation_id, source, capability, fixture_id, observed_at, available_at, knowledge_at, payload, schema_version, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)
+                """,
+                (payload["observation_id"], *incoming),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
 
     def save_forecast_run(self, run: Any) -> None:
         payload = run.to_dict()

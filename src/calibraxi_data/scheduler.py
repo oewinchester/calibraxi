@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -20,6 +23,125 @@ class SchedulerRunResult:
     report: VerticalIngestionReport | None = None
     error: str | None = None
     skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProspectiveObservation:
+    """A source observation retained with the actual CalibraXI knowledge time."""
+
+    observation_id: str
+    source: str
+    capability: str
+    knowledge_at: datetime
+    payload: Mapping[str, Any]
+    fixture_id: str | None = None
+    observed_at: datetime | None = None
+    available_at: datetime | None = None
+    schema_version: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        for name in ("knowledge_at", "created_at", "observed_at", "available_at"):
+            value = getattr(self, name)
+            if value is not None:
+                if value.tzinfo is None or value.utcoffset() is None:
+                    raise ValueError(f"{name} must be timezone-aware")
+                object.__setattr__(self, name, value.astimezone(timezone.utc))
+        if self.created_at < self.knowledge_at:
+            raise ValueError("created_at cannot precede knowledge_at")
+        object.__setattr__(self, "payload", json.loads(json.dumps(dict(self.payload), sort_keys=True, default=str)))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "source": self.source,
+            "capability": self.capability,
+            "fixture_id": self.fixture_id,
+            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
+            "available_at": self.available_at.isoformat() if self.available_at else None,
+            "knowledge_at": self.knowledge_at.isoformat(),
+            "payload": dict(self.payload),
+            "schema_version": self.schema_version,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class FileProspectiveObservationStore:
+    """Append-only local path used before a production collector is deployed."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root) / "prospective_observations"
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def save(self, observation: ProspectiveObservation) -> ProspectiveObservation:
+        path = self.root / f"{observation.observation_id}.json"
+        payload = observation.to_dict()
+        if path.exists():
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError(f"prospective observation is immutable: {observation.observation_id}")
+            return observation
+        path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        return observation
+
+    def get(self, observation_id: str) -> ProspectiveObservation | None:
+        path = self.root / f"{observation_id}.json"
+        if not path.exists():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return ProspectiveObservation(
+            observation_id=value["observation_id"],
+            source=value["source"],
+            capability=value["capability"],
+            fixture_id=value.get("fixture_id"),
+            observed_at=datetime.fromisoformat(value["observed_at"]) if value.get("observed_at") else None,
+            available_at=datetime.fromisoformat(value["available_at"]) if value.get("available_at") else None,
+            knowledge_at=datetime.fromisoformat(value["knowledge_at"]),
+            payload=value.get("payload", {}),
+            schema_version=value.get("schema_version"),
+            created_at=datetime.fromisoformat(value["created_at"]),
+        )
+
+    def list(self) -> tuple[ProspectiveObservation, ...]:
+        values = [self.get(path.stem) for path in sorted(self.root.glob("*.json"))]
+        return tuple(item for item in values if item is not None)
+
+
+class ProspectiveObservationCollector:
+    """Capture schedules, odds, availability, and stats with true knowledge time."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def collect(
+        self,
+        *,
+        source: str,
+        capability: str,
+        payload: Mapping[str, Any],
+        fixture_id: str | None = None,
+        observed_at: datetime | None = None,
+        available_at: datetime | None = None,
+        knowledge_at: datetime | None = None,
+        schema_version: str | None = None,
+    ) -> ProspectiveObservation:
+        knowledge = knowledge_at or datetime.now(timezone.utc)
+        observation_id = hashlib.sha256(
+            json.dumps({"source": source, "capability": capability, "fixture_id": fixture_id, "payload": payload, "knowledge_at": knowledge.isoformat()}, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:32]
+        observation = ProspectiveObservation(
+            observation_id=observation_id,
+            source=source,
+            capability=capability,
+            fixture_id=fixture_id,
+            observed_at=observed_at,
+            available_at=available_at,
+            knowledge_at=knowledge,
+            payload=payload,
+            schema_version=schema_version,
+        )
+        self._store.save(observation)
+        return observation
 
 
 @dataclass(frozen=True, slots=True)

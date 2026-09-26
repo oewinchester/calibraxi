@@ -12726,13 +12726,23 @@ Detailed engineering specification: **MOVED / CONSOLIDATED** into `docs/CalibraX
 - Coverage is reported by source and capability. The bootstrap preserves 697 quarantined rows and 9,120 historical odds observations whose publication chronology is unknown; those odds are not pre-match features for an earlier cutoff.
 - Forecast outputs are consumed through immutable, versioned Feature Snapshots and Prediction Runs. A historical view is always an as-known-at-time artifact with cutoff, knowledge time, feature schema, model, calibration, and evidence lineage.
 - Forecast Probability, Reliability, Signal, Recommendation, and Curation remain separate product concepts. This phase establishes forecasting only; it does not publish Recommendations, Signals, portfolios, or betting decisions.
-- Historical Football-Data rows remain canonical evidence but are withheld from production PIT training until source availability chronology is proven. Synthetic PIT backtests are labeled synthetic-only and cannot establish production model performance.
+- Historical Football-Data rows remain canonical evidence. They are withheld from actual-knowledge PIT training because source availability chronology is unknown; the separate event-derived reconstruction population is explicitly labeled reconstructed and is the basis for this phase's real historical walk-forward evidence. Synthetic PIT backtests remain synthetic-only and cannot establish production model performance.
 
 ### 13.16 2026-09-25 - EPL 2025/26 ESPN reconciliation
 
 - The production acquisition path collected 114 known EPL 2025/26 match dates and retained 380 ESPN fixtures plus 20 teams in raw evidence.
-- Explicit provider-to-canonical aliases confirmed 380/380 ESPN fixture mappings; unresolved and ambiguous populations are both zero. Reconciliation retains 158 one-hour kickoff schedule revisions as evidence.
+- Explicit provider-to-canonical aliases confirmed 380/380 ESPN fixture mappings; unresolved and ambiguous populations are both zero. The raw reconciliation report retains 158 kickoff-only differences, of which the corrected timezone audit classifies 156 as normalization artifacts and two as residual schedule-revision candidates.
 - ESPN retrieval knowledge time is preserved, but provider publication/availability chronology is unknown. The enriched rows remain outside historical production PIT training until that chronology is proven.
+
+### 13.17 2026-09-25 - Real historical PIT evaluation
+
+- Football-Data `Date` + `Time` is a Europe/London source-local wall clock. The parser now preserves the raw local values and normalizes through the IANA timezone database; DST gaps/folds are quarantined rather than guessed.
+- The existing 380-fixture reconciliation artifact was reclassified with the corrected timezone model: 156 of the 158 one-hour differences are timezone-normalization artifacts. Two residual kickoff differences (`+10` and `+15` minutes) remain genuine schedule-revision candidates pending independent source adjudication. The corrected count is therefore 2.
+- Actual knowledge PIT and reconstructed event PIT are separate. The real historical result population uses only `event_derived_reconstruction`: a completed result becomes eligible after a conservative three-hour post-kickoff boundary, or thirty hours when the source-local kickoff time is unavailable. Unknown chronology remains ineligible.
+- The real archive contains 12,704 completed fixtures across 33 seasons. `features-v2-real-pit-r2` and `real-pit-dataset-v4` produce 12,704 immutable snapshots, 12,585 PIT-valid training examples, and 119 explicit warm-up skips for insufficient home/away history. The `-r2`/`-v4` namespaces preserve earlier immutable partial runs whose wall-clock generated metadata cannot be rewritten; rating replay is versioned `elo-replay-v1-r2`. Only prior results, goals, form, venue splits, rest, season phase, and replayed Elo are used; odds, xG/xA, shots, lineups, injuries, and player data remain excluded.
+- The expanding-window evaluation uses 12,203 predictions after a 380-example warm-up. Frequency, Poisson, Elo, and Dixon-Coles-style coherent score distributions are compared on the same snapshots. Elo is the offline candidate on pooled log loss `1.0246082506`, Brier `0.6143879424`, RPS `0.2127924749`, with a cross-season stability check; this is a candidate decision, not runtime model shopping.
+- Temporal temperature calibration is measured on a pre-period and evaluated on a later holdout. It is retained for frequency, Poisson, and Dixon-Coles holdouts where it improves the measured holdout, but not for Elo; Elo's raw holdout remains the governed output. No calibration is promoted globally without later prospective confirmation.
+- Replayed power ratings persist before/after values, methodology version, and update reason. Prospective observations now have an append-only storage path with actual CalibraXI knowledge time. Signals, Recommendations, portfolios, and frontend publication remain outside this phase.
 
 ---
 

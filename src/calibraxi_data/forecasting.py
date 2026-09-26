@@ -36,6 +36,47 @@ class MissingState(str, Enum):
     SOURCE_FAILED = "source_failed"
     QUARANTINED = "quarantined"
     PIT_INELIGIBLE = "pit_ineligible"
+    UNKNOWN = "unknown"
+
+
+class EligibilityBasis(str, Enum):
+    """Why a historical fact is allowed to participate in a PIT snapshot."""
+
+    ACTUAL_SOURCE_TIMESTAMP = "actual_source_timestamp"
+    CALIBRAXI_KNOWLEDGE_TIMESTAMP = "calibraxi_knowledge_timestamp"
+    REVISION_TIMESTAMP = "revision_timestamp"
+    EVENT_DERIVED_RECONSTRUCTION = "event_derived_reconstruction"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class EventDerivedEligibilityPolicy:
+    """Conservative eligibility boundary for immutable prior-match facts."""
+
+    post_match_safety: timedelta = timedelta(hours=3)
+    unknown_time_safety: timedelta = timedelta(hours=30)
+
+    def eligible_at(self, record: "MatchRecord") -> datetime | None:
+        basis = EligibilityBasis(record.eligibility_basis)
+        if basis is EligibilityBasis.ACTUAL_SOURCE_TIMESTAMP:
+            timestamps = [value for value in (record.source_available_at, record.knowledge_at) if value is not None]
+            return max(timestamps) if timestamps else None
+        if basis is EligibilityBasis.CALIBRAXI_KNOWLEDGE_TIMESTAMP:
+            return record.knowledge_at
+        if basis is EligibilityBasis.REVISION_TIMESTAMP:
+            timestamps = [value for value in (record.source_available_at, record.knowledge_at) if value is not None]
+            return max(timestamps) if timestamps else None
+        if basis is EligibilityBasis.EVENT_DERIVED_RECONSTRUCTION:
+            if record.event_derived_eligible_at is not None:
+                return _utc(record.event_derived_eligible_at, "event_derived_eligible_at")
+            if record.source_local_time is None:
+                return record.kickoff_at + self.unknown_time_safety
+            return record.kickoff_at + self.post_match_safety
+        return None
+
+    def is_eligible(self, record: "MatchRecord", cutoff_at: datetime) -> bool:
+        boundary = self.eligible_at(record)
+        return boundary is not None and boundary <= _utc(cutoff_at, "cutoff_at")
 
 
 def _utc(value: datetime, field_name: str) -> datetime:
@@ -117,6 +158,11 @@ class MatchRecord:
     away_xg: float | None = None
     home_shots: float | None = None
     away_shots: float | None = None
+    source_local_date: str | None = None
+    source_local_time: str | None = None
+    source_timezone: str | None = None
+    eligibility_basis: EligibilityBasis | str = EligibilityBasis.UNKNOWN
+    event_derived_eligible_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.fixture_id:
@@ -130,6 +176,16 @@ class MatchRecord:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _utc(value, name))
+        if self.event_derived_eligible_at is not None:
+            object.__setattr__(self, "event_derived_eligible_at", _utc(self.event_derived_eligible_at, "event_derived_eligible_at"))
+        try:
+            basis = EligibilityBasis(self.eligibility_basis)
+        except ValueError as exc:
+            raise DataQualityError(f"unknown eligibility basis: {self.eligibility_basis}") from exc
+        if basis is EligibilityBasis.UNKNOWN:
+            if self.source_available_at is not None:
+                basis = EligibilityBasis.ACTUAL_SOURCE_TIMESTAMP
+        object.__setattr__(self, "eligibility_basis", basis)
         if self.source_observed_at and self.source_available_at and self.source_available_at < self.source_observed_at:
             raise DataQualityError("source availability cannot precede source observation")
         if self.source_available_at and self.knowledge_at and self.knowledge_at < self.source_available_at:
@@ -193,7 +249,39 @@ class MatchRecord:
             away_xg=first("away_xg"),
             home_shots=first("home_shots"),
             away_shots=first("away_shots"),
+            source_local_date=first("source_local_date"),
+            source_local_time=first("source_local_time"),
+            source_timezone=first("source_timezone"),
+            eligibility_basis=first("eligibility_basis", default=EligibilityBasis.UNKNOWN.value),
+            event_derived_eligible_at=_parse_dt(first("event_derived_eligible_at"), "event_derived_eligible_at"),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fixture_id": self.fixture_id,
+            "kickoff_at": _iso(self.kickoff_at),
+            "home_team": self.home_team,
+            "away_team": self.away_team,
+            "home_goals": self.home_goals,
+            "away_goals": self.away_goals,
+            "competition": self.competition,
+            "season": self.season,
+            "status": self.status,
+            "source_observed_at": _iso(self.source_observed_at),
+            "source_available_at": _iso(self.source_available_at),
+            "knowledge_at": _iso(self.knowledge_at),
+            "processing_at": _iso(self.processing_at),
+            "evidence_ids": list(self.evidence_ids),
+            "home_xg": self.home_xg,
+            "away_xg": self.away_xg,
+            "home_shots": self.home_shots,
+            "away_shots": self.away_shots,
+            "source_local_date": self.source_local_date,
+            "source_local_time": self.source_local_time,
+            "source_timezone": self.source_timezone,
+            "eligibility_basis": self.eligibility_basis.value,
+            "event_derived_eligible_at": _iso(self.event_derived_eligible_at),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +301,7 @@ class FeatureSnapshot:
     home_team: str | None = None
     away_team: str | None = None
     evidence_lineage: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    eligibility_basis: Mapping[str, EligibilityBasis | str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cutoff_at", _utc(self.cutoff_at, "cutoff_at"))
@@ -228,6 +317,13 @@ class FeatureSnapshot:
         object.__setattr__(self, "evidence_ids", tuple(sorted(set(self.evidence_ids))))
         lineage = {str(key): tuple(sorted(set(values))) for key, values in self.evidence_lineage.items()}
         object.__setattr__(self, "evidence_lineage", _freeze_mapping(lineage))
+        bases: dict[str, str] = {}
+        for key, value in self.eligibility_basis.items():
+            try:
+                bases[str(key)] = EligibilityBasis(value).value
+            except ValueError as exc:
+                raise DataQualityError(f"unknown feature eligibility basis: {value}") from exc
+        object.__setattr__(self, "eligibility_basis", _freeze_mapping(bases))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -244,6 +340,7 @@ class FeatureSnapshot:
             "home_team": self.home_team,
             "away_team": self.away_team,
             "evidence_lineage": _jsonable({key: list(values) for key, values in self.evidence_lineage.items()}),
+            "eligibility_basis": dict(self.eligibility_basis),
         }
 
     @property
@@ -268,6 +365,7 @@ class FeatureSnapshot:
             home_team=value.get("home_team"),
             away_team=value.get("away_team"),
             evidence_lineage={key: tuple(items) for key, items in value.get("evidence_lineage", {}).items()},
+            eligibility_basis=value.get("eligibility_basis", {}),
         )
 
 
@@ -308,9 +406,16 @@ class FileFeatureSnapshotStore:
 class FeatureSnapshotBuilder:
     """Build a modest interpretable feature set from PIT-eligible match history."""
 
-    def __init__(self, *, feature_schema_version: str = "features-v1", history_window: int = 5) -> None:
+    def __init__(
+        self,
+        *,
+        feature_schema_version: str = "features-v1",
+        history_window: int = 5,
+        eligibility_policy: EventDerivedEligibilityPolicy | None = None,
+    ) -> None:
         self.feature_schema_version = feature_schema_version
         self.history_window = max(1, int(history_window))
+        self.eligibility_policy = eligibility_policy or EventDerivedEligibilityPolicy()
 
     def build(
         self,
@@ -327,9 +432,10 @@ class FeatureSnapshotBuilder:
             raise DataQualityError("pre-match cutoff cannot be after kickoff")
         if not target.is_completed and target.knowledge_at is not None and target.knowledge_at > cutoff:
             raise DataQualityError("target knowledge time is after prediction cutoff")
-        target_pit_blocked = not target.is_completed and (target.source_available_at is None or target.knowledge_at is None)
-        if not target.is_completed and target.source_available_at is not None and target.source_available_at > cutoff:
-            target_pit_blocked = True
+        # The target's own result is never a feature. A scheduled target with
+        # no publication timestamp is therefore fine; only an explicit future
+        # timestamp is a chronology violation.
+        target_pit_blocked = False
         all_records = [_coerce_match(record) for record in records]
         seen_ids: set[str] = set()
         for record in all_records:
@@ -350,12 +456,7 @@ class FeatureSnapshotBuilder:
             # source availability time and CalibraXI knowledge time are known
             # and no later than the prediction cutoff.  An unknown source
             # availability time is not evidence of timely availability.
-            if record.kickoff_at >= cutoff or (
-                record.source_available_at is None
-                or record.knowledge_at is None
-                or record.knowledge_at > cutoff
-                or record.source_available_at > cutoff
-            ):
+            if record.kickoff_at >= cutoff or not self.eligibility_policy.is_eligible(record, cutoff):
                 pit_blocked.append(record)
             else:
                 eligible.append(record)
@@ -364,6 +465,32 @@ class FeatureSnapshotBuilder:
         feature_values: dict[str, Any] = {}
         missingness: dict[str, str] = {}
         lineage: dict[str, tuple[str, ...]] = {}
+        eligibility_basis: dict[str, str] = {}
+
+        provider_chronology_blocked = any(
+            EligibilityBasis(record.eligibility_basis) in {
+                EligibilityBasis.EVENT_DERIVED_RECONSTRUCTION,
+                EligibilityBasis.UNKNOWN,
+            }
+            for record in all_records
+            if record.fixture_id != target.fixture_id and record.kickoff_at < cutoff
+        )
+
+        def source_basis(source_records: Sequence[MatchRecord], *, provider: bool = False) -> str:
+            if provider and provider_chronology_blocked:
+                return EligibilityBasis.UNKNOWN.value
+            if not source_records:
+                return EligibilityBasis.UNKNOWN.value
+            bases = {EligibilityBasis(record.eligibility_basis) for record in source_records}
+            if len(bases) == 1:
+                return next(iter(bases)).value
+            # Mixed source bases are conservatively represented by the least
+            # historically strong basis rather than pretending they are equal.
+            if EligibilityBasis.UNKNOWN in bases:
+                return EligibilityBasis.UNKNOWN.value
+            if EligibilityBasis.EVENT_DERIVED_RECONSTRUCTION in bases:
+                return EligibilityBasis.EVENT_DERIVED_RECONSTRUCTION.value
+            return EligibilityBasis.REVISION_TIMESTAMP.value
 
         def team_history(team: str, *, home_only: bool | None = None) -> list[MatchRecord]:
             rows: list[MatchRecord] = []
@@ -395,25 +522,41 @@ class FeatureSnapshotBuilder:
                     xg, xga, shots, shots_against = record.home_xg, record.away_xg, record.home_shots, record.away_shots
                 else:
                     xg, xga, shots, shots_against = record.away_xg, record.home_xg, record.away_shots, record.home_shots
-                if xg is not None:
+                provider_allowed = EligibilityBasis(record.eligibility_basis) in {
+                    EligibilityBasis.ACTUAL_SOURCE_TIMESTAMP,
+                    EligibilityBasis.CALIBRAXI_KNOWLEDGE_TIMESTAMP,
+                    EligibilityBasis.REVISION_TIMESTAMP,
+                }
+                if xg is not None and provider_allowed:
                     values["xg"].append(float(xg))
-                if xga is not None:
+                if xga is not None and provider_allowed:
                     values["xga"].append(float(xga))
-                if shots is not None:
+                if shots is not None and provider_allowed:
                     values["shots"].append(float(shots))
-                if shots_against is not None:
+                if shots_against is not None and provider_allowed:
                     values["shots_against"].append(float(shots_against))
             return values
 
-        def add(name: str, value: Any, *, team: str | None = None, source_records: Sequence[MatchRecord] = (), allow_pit: bool = True) -> None:
+        def add(
+            name: str,
+            value: Any,
+            *,
+            team: str | None = None,
+            source_records: Sequence[MatchRecord] = (),
+            allow_pit: bool = True,
+            provider: bool = False,
+        ) -> None:
             feature_values[name] = value
             if allow_pit and team is not None and pit_has_team(team) and (value is None or (name.endswith("matches_seen") and value == 0.0)):
                 missingness[name] = MissingState.PIT_INELIGIBLE.value
             elif value is not None:
                 missingness[name] = MissingState.OBSERVED.value
+            elif provider and provider_chronology_blocked:
+                missingness[name] = MissingState.UNKNOWN.value
             else:
                 missingness[name] = MissingState.MISSING.value
             lineage[name] = tuple(sorted({evidence for record in source_records for evidence in record.evidence_ids}))
+            eligibility_basis[name] = source_basis(source_records, provider=provider)
 
         add(
             "target_fixture_knowledge",
@@ -436,7 +579,20 @@ class FeatureSnapshotBuilder:
         ):
             add(f"{prefix}_matches_seen", float(len(team_records)), team=team, source_records=team_records)
             for key, label in (("points", "points_avg_5"), ("gf", "goals_for_avg_5"), ("ga", "goals_against_avg_5"), ("xg", "xg_avg_5"), ("xga", "xga_avg_5"), ("shots", "shots_avg_5"), ("shots_against", "shots_against_avg_5")):
-                add(f"{prefix}_{label}", _mean(team_stats[key]), team=team, source_records=team_records)
+                add(
+                    f"{prefix}_{label}",
+                    _mean(team_stats[key]),
+                    team=team,
+                    source_records=team_records if key in {"points", "gf", "ga"} else [
+                        record for record in team_records
+                        if EligibilityBasis(record.eligibility_basis) in {
+                            EligibilityBasis.ACTUAL_SOURCE_TIMESTAMP,
+                            EligibilityBasis.CALIBRAXI_KNOWLEDGE_TIMESTAMP,
+                            EligibilityBasis.REVISION_TIMESTAMP,
+                        }
+                    ],
+                    provider=key in {"xg", "xga", "shots", "shots_against"},
+                )
 
             venue_records = team_history(team, home_only=(prefix == "home"))
             venue_stats = stats(team, venue_records)
@@ -467,6 +623,7 @@ class FeatureSnapshotBuilder:
             "home_team": target.home_team,
             "away_team": target.away_team,
             "evidence_lineage": lineage,
+            "eligibility_basis": eligibility_basis,
         }
         snapshot_id = f"fs-{_digest(stable_payload)}"
         return FeatureSnapshot(
@@ -483,6 +640,7 @@ class FeatureSnapshotBuilder:
             home_team=target.home_team,
             away_team=target.away_team,
             evidence_lineage=lineage,
+            eligibility_basis=eligibility_basis,
         )
 
 
@@ -638,6 +796,44 @@ class ScoreDistribution:
         over = sum(self.probabilities[h][a] for h in range(self.max_goals + 1) for a in range(self.max_goals + 1) if h + a > line)
         return over, max(0.0, 1.0 - over)
 
+    def total_goals_probabilities(self) -> tuple[float, ...]:
+        """Return the exact-total-goals marginal implied by this score matrix."""
+
+        totals = [0.0 for _ in range((self.max_goals * 2) + 1)]
+        for home in range(self.max_goals + 1):
+            for away in range(self.max_goals + 1):
+                totals[home + away] += self.probabilities[home][away]
+        return tuple(totals)
+
+    def derived_markets(
+        self,
+        *,
+        total_lines: Sequence[float] = (0.5, 1.5, 2.5, 3.5, 4.5),
+    ) -> dict[str, Any]:
+        """Derive coherent outcome, totals, BTTS, and O/U markets.
+
+        Every value is a marginal of the primary joint score distribution.  A
+        caller may persist this object separately from the matrix without
+        creating independently trained or contradictory market probabilities.
+        """
+
+        home, draw, away = self.outcome_probabilities()
+        exact_totals = self.total_goals_probabilities()
+        lines = tuple(float(line) for line in total_lines)
+        if any(not math.isfinite(line) for line in lines):
+            raise ValueError("total-goal lines must be finite")
+        btts = self.btts_probability()
+        return {
+            "one_x_two": {"home": home, "draw": draw, "away": away},
+            "total_goals": {str(index): probability for index, probability in enumerate(exact_totals)},
+            "over_under": {
+                str(line): {"over": over, "under": under}
+                for line in lines
+                for over, under in (self.over_under(line),)
+            },
+            "btts": {"yes": btts, "no": max(0.0, 1.0 - btts)},
+        }
+
     def score_probability(self, home_goals: int, away_goals: int) -> float:
         if home_goals < 0 or away_goals < 0:
             return 0.0
@@ -734,6 +930,49 @@ class PoissonBaseline:
         if away_xg is not None:
             away_rate = (away_rate + away_xg) / 2.0
         return ScoreDistribution.independent_poisson(max(0.05, home_rate), max(0.05, away_rate), max_goals=self.max_goals)
+
+
+class DixonColesBaseline(PoissonBaseline):
+    """Small coherent Dixon-Coles-style low-score correction challenger.
+
+    The model keeps the existing PIT goal-rate features and applies the
+    published low-score interaction correction to the four cells most affected
+    by score dependence.  It is intentionally a transparent offline challenger
+    rather than a runtime model-selection mechanism.
+    """
+
+    model_family = "dixon_coles"
+    model_version = "dixon-coles-v1"
+
+    def __init__(self, *, max_goals: int = 10, shrinkage: float = 0.5, rho: float = -0.10) -> None:
+        super().__init__(max_goals=max_goals, shrinkage=shrinkage)
+        if not math.isfinite(float(rho)) or not -1.0 < float(rho) < 1.0:
+            raise ValueError("rho must be finite and between -1 and 1")
+        self.rho = float(rho)
+
+    @property
+    def model_config(self) -> ModelConfig:
+        return ModelConfig(
+            self.model_family,
+            self.model_version,
+            {"max_goals": self.max_goals, "shrinkage": self.shrinkage, "rho": self.rho},
+        )
+
+    def predict(self, snapshot: FeatureSnapshot) -> ScoreDistribution:
+        base = super().predict(snapshot)
+        home_rate = _feature_number(snapshot.features, "home_goals_for_avg_5", self.home_rate) or self.home_rate
+        away_rate = _feature_number(snapshot.features, "away_goals_for_avg_5", self.away_rate) or self.away_rate
+        matrix = [list(row) for row in base.probabilities]
+        # tau(x,y) from Dixon-Coles, applied only where x,y <= 1.
+        tau = {
+            (0, 0): 1.0 - home_rate * away_rate * self.rho,
+            (0, 1): 1.0 + home_rate * self.rho,
+            (1, 0): 1.0 + away_rate * self.rho,
+            (1, 1): 1.0 - self.rho,
+        }
+        for (home, away), factor in tau.items():
+            matrix[home][away] = max(0.0, matrix[home][away] * factor)
+        return ScoreDistribution(tuple(tuple(row) for row in matrix))
 
 
 class EloBaseline:
@@ -840,10 +1079,12 @@ class ForecastPrediction:
             "fixture_id": self.fixture_id,
             "cutoff_at": _iso(self.cutoff_at),
             "distribution": self.distribution.to_dict(),
+            "derived_markets": self.distribution.derived_markets(),
             "actual_home_goals": self.actual_home_goals,
             "actual_away_goals": self.actual_away_goals,
             "model_family": self.model_family,
             "calibrated_distribution": self.calibrated_distribution.to_dict() if self.calibrated_distribution else None,
+            "calibrated_derived_markets": self.calibrated_distribution.derived_markets() if self.calibrated_distribution else None,
             "feature_snapshot_id": self.feature_snapshot_id,
             "training_start_at": _iso(self.training_start_at),
             "training_end_at": _iso(self.training_end_at),
@@ -1289,6 +1530,8 @@ class FileForecastRunStore:
 __all__ = [
     "BacktestResult",
     "DataQualityError",
+    "EligibilityBasis",
+    "EventDerivedEligibilityPolicy",
     "EvaluationMetrics",
     "FeatureSnapshot",
     "FeatureSnapshotBuilder",
