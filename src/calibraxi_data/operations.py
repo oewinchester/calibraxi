@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 from .acquisition import AcquisitionAttempt, AcquisitionResult
 from .capabilities import CapabilityRegistry
 from .contracts import CapabilityState, HealthState, IngestionRunStatus, QuarantineDecision, SourceHealthSignal
+from .http_json import sanitize_endpoint
 from .persistence import CanonicalStore
 from .quality import ValidationResult
 
@@ -24,6 +25,56 @@ class OperationalRecorder:
 
         self._registry.record_health(signal.capability, signal.source, signal.health)
         return self._store.record_health_signal(signal)
+
+    def record_preflight(self, report: Any, *, attempted_at: datetime | None = None):
+        """Persist transport diagnostics as operational health only."""
+
+        values = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        source = str(values["source"])
+        capability = str(values["capability"])
+        state = str(values.get("operational_state", "UNREACHABLE"))
+        failure_class = values.get("failure_class")
+        exception_type = values.get("exception_type")
+        http_status = values.get("http_status")
+        failed = state in {"DEGRADED", "UNREACHABLE", "SCHEMA_DRIFT", "MAPPING_INCOMPLETE"}
+        if state == "SCHEMA_DRIFT":
+            health = HealthState.PARSER_SCHEMA_DRIFT
+        elif failed and (
+            state == "UNREACHABLE"
+            or (isinstance(http_status, int) and http_status >= 400)
+        ):
+            health = HealthState.SOURCE_FAILED
+        elif failed:
+            health = HealthState.SOURCE_FAILED if values.get("http") == "UNREACHABLE" or state == "UNREACHABLE" else HealthState.DEGRADED
+        else:
+            health = HealthState.HEALTHY
+        endpoint = values.get("endpoint") or values.get("url")
+        if endpoint is not None:
+            endpoint = sanitize_endpoint(str(endpoint))
+        retryable = failure_class in {"DNS_FAILURE", "TCP_CONNECT_FAILURE", "TIMEOUT", "HTTP_429", "HTTP_5XX"}
+        signal = SourceHealthSignal(
+            capability=capability,
+            source=source,
+            health=health,
+            attempted_at=attempted_at or datetime.now(timezone.utc),
+            success=not failure_class or failure_class == "PROVIDER_MAPPING_MISSING",
+            failure=failed,
+            schema_drift=state == "SCHEMA_DRIFT",
+            empty_population=failure_class == "EMPTY_RESPONSE",
+            mapping_failure=failure_class == "PROVIDER_MAPPING_MISSING",
+            retryable=retryable,
+            retryable_failure=retryable,
+            latency_ms=values.get("latency_ms"),
+            error=failure_class,
+            failure_class=failure_class,
+            exception_type=exception_type,
+            http_status=http_status,
+            endpoint=endpoint,
+            attempt_count=1,
+            first_failure_at=(attempted_at or datetime.now(timezone.utc)) if failed else None,
+            transport_implementation=values.get("transport_implementation", "UrllibTransport"),
+        )
+        return self.record_health(signal)
 
     def record_acquisition(
         self,

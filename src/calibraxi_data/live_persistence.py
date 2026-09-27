@@ -1338,6 +1338,15 @@ class LiveReadService:
             "freshness_seconds",
             "last_error",
             "updated_at",
+            "failure_class_counts",
+            "last_failure_class",
+            "last_exception_type",
+            "last_http_status",
+            "last_endpoint",
+            "last_attempt_count",
+            "first_failure_at",
+            "last_retryable",
+            "last_transport_implementation",
         )
         result: dict[str, Any] = {}
         for field in fields:

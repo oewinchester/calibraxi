@@ -69,6 +69,7 @@ class CanonicalStore(Protocol):
     def persist_batch(self, batches: Iterable[tuple[Iterable[SourceObservation], str]], *, run_id: str | None = None) -> PersistenceResult: ...
     def count(self, entity_type: EntityType) -> int: ...
     def canonical_id_for(self, identity: SourceIdentity) -> str | None: ...
+    def identity_mapping_readiness(self) -> Mapping[str, Mapping[str, Mapping[str, int | str | None]]]: ...
     def start_run(self, source: str, *, run_id: str | None = None, replay_of: str | None = None) -> IngestionRun: ...
     def update_run(self, run_id: str, status: IngestionRunStatus, **kwargs: Any) -> IngestionRun: ...
     def get_run(self, run_id: str) -> IngestionRun | None: ...
@@ -108,6 +109,50 @@ def _freshness_seconds(attempted_at: datetime, source_observed_at: datetime | No
     attempted = attempted_at.astimezone(timezone.utc)
     observed = source_observed_at.astimezone(timezone.utc)
     return max(0.0, (attempted - observed).total_seconds())
+
+
+def _identity_mapping_readiness(
+    rows: Iterable[tuple[str, str, str]],
+) -> Mapping[str, Mapping[str, Mapping[str, int | str | None]]]:
+    """Return measured identity coverage without inferring names as matches."""
+
+    grouped: dict[tuple[str, str], list[str]] = {}
+    canonical_sources: dict[tuple[str, str], set[str]] = {}
+    for source, entity_type, canonical_id in rows:
+        key = (str(source), str(entity_type))
+        grouped.setdefault(key, []).append(str(canonical_id))
+        canonical_sources.setdefault((str(entity_type), str(canonical_id)), set()).add(str(source))
+
+    sources = {source for source, _ in grouped}
+    entities = {entity_type for _, entity_type in grouped}
+    result: dict[str, dict[str, dict[str, int | str | None]]] = {}
+    for source in sorted(sources | {"espn", "sofascore", "understat", "football-data.co.uk"}):
+        result[source] = {}
+        for entity_type in sorted(entities | {"team", "player"}):
+            ids = grouped.get((source, entity_type), [])
+            if not ids:
+                result[source][entity_type] = {
+                    "confirmed": 0,
+                    "unresolved": 0,
+                    "ambiguous": None,
+                    "population": 0,
+                    "measurement": "NOT_MEASURED",
+                    "ambiguity_measurement": "NOT_TRACKED",
+                }
+                continue
+            confirmed = sum(
+                len(canonical_sources.get((entity_type, canonical_id), set())) >= 2
+                for canonical_id in ids
+            )
+            result[source][entity_type] = {
+                "confirmed": confirmed,
+                "unresolved": len(ids) - confirmed,
+                "ambiguous": None,
+                "population": len(ids),
+                "measurement": "PARTIAL",
+                "ambiguity_measurement": "NOT_TRACKED",
+            }
+    return result
 
 
 class FileSystemCanonicalStore:
@@ -197,6 +242,21 @@ class FileSystemCanonicalStore:
 
     def canonical_id_for(self, identity: SourceIdentity) -> str | None:
         return self._identities.get(identity)
+
+    def identity_mapping_readiness(self) -> Mapping[str, Mapping[str, Mapping[str, int | str | None]]]:
+        """Measure explicit provider-to-canonical identity coverage.
+
+        A source identity is confirmed only when its canonical ID is shared by
+        another source identity. Provider-local IDs are unresolved. Candidate
+        ambiguity is not persisted by this store, so it remains explicitly
+        unmeasured rather than being reported as zero.
+        """
+
+        rows = tuple(
+            (identity.source, identity.entity_type.value, canonical_id)
+            for identity, canonical_id in self._identities.items()
+        )
+        return _identity_mapping_readiness(rows)
 
     def observation_count(self) -> int:
         return len(self._observations)
@@ -977,6 +1037,18 @@ class PostgresCanonicalStore:
                 cursor.close()
             connection.close()
 
+    def identity_mapping_readiness(self) -> Mapping[str, Mapping[str, Mapping[str, int | str | None]]]:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT source, entity_type, canonical_id FROM source_identities")
+            return _identity_mapping_readiness(tuple(cursor.fetchall()))
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
     def observation_count(self) -> int:
         return self._count("source_observations")
 
@@ -1456,11 +1528,14 @@ class PostgresCanonicalStore:
 
     @staticmethod
     def _health_snapshot(row: Any) -> SourceCapabilityHealthSnapshot:
-        failure_counts = row[22] if len(row) > 22 else {}
+        # The SELECT/RETURNING column order places JSONB failure counts after
+        # ``updated_at`` at index 21. Keep the extended operational fields
+        # aligned with that stable SQL projection.
+        failure_counts = row[21] if len(row) > 21 else {}
         if isinstance(failure_counts, str):
             failure_counts = json.loads(failure_counts or "{}")
         return SourceCapabilityHealthSnapshot(
-            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], timeout_count=row[10], rate_limit_count=row[11], mapping_failure_count=row[12], last_attempt_at=row[13], last_success_at=row[14], last_failure_at=row[15], last_latency_ms=row[16], last_source_observed_at=row[17], freshness_seconds=row[18], last_error=row[19], updated_at=row[20], failure_class_counts=failure_counts or {}, last_failure_class=row[23] if len(row) > 23 else None, last_exception_type=row[24] if len(row) > 24 else None, last_http_status=row[25] if len(row) > 25 else None, last_endpoint=row[26] if len(row) > 26 else None, last_attempt_count=row[27] if len(row) > 27 else 1, first_failure_at=row[28] if len(row) > 28 else None, last_retryable=bool(row[29]) if len(row) > 29 else False, last_transport_implementation=row[30] if len(row) > 30 else None
+            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], timeout_count=row[10], rate_limit_count=row[11], mapping_failure_count=row[12], last_attempt_at=row[13], last_success_at=row[14], last_failure_at=row[15], last_latency_ms=row[16], last_source_observed_at=row[17], freshness_seconds=row[18], last_error=row[19], updated_at=row[20], failure_class_counts=failure_counts or {}, last_failure_class=row[22] if len(row) > 22 else None, last_exception_type=row[23] if len(row) > 23 else None, last_http_status=row[24] if len(row) > 24 else None, last_endpoint=row[25] if len(row) > 25 else None, last_attempt_count=row[26] if len(row) > 26 else 1, first_failure_at=row[27] if len(row) > 27 else None, last_retryable=bool(row[28]) if len(row) > 28 else False, last_transport_implementation=row[29] if len(row) > 29 else None
         )
 
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool:

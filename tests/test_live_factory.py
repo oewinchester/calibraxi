@@ -35,6 +35,9 @@ class _PolicyStore:
             return
         versions.append(policy)
 
+    def identity_mapping_readiness(self):
+        return {}
+
 
 def test_live_capability_registry_activates_selected_production_sources():
     registry = build_live_capability_registry(allow_review_required_sources=False)

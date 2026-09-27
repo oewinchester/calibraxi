@@ -108,7 +108,10 @@ def _compose_runner(
         reliability_store=stores.reliability,
         monitoring_store=stores.monitoring,
         worker_lease_store=canonical_store,
-        preflight_fn=build_live_preflight(league="eng.1"),
+        preflight_fn=build_live_preflight(
+            league="eng.1",
+            identity_ready=canonical_store.identity_mapping_readiness if canonical_store is not None else None,
+        ),
         historical_records=population.records,
         training_examples=population.examples,
         parsers={

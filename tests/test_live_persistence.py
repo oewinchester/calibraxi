@@ -761,6 +761,15 @@ def test_live_read_service_operational_summary_exposes_source_health():
                     last_latency_ms=125,
                     last_error=None,
                     updated_at=BASE,
+                    failure_class_counts={"HTTP_429": 1, "HTTP_5XX": 2},
+                    last_failure_class="HTTP_429",
+                    last_exception_type="HTTPError",
+                    last_http_status=429,
+                    last_endpoint="https://example.test/scoreboard",
+                    last_attempt_count=3,
+                    first_failure_at=BASE - timedelta(minutes=2),
+                    last_retryable=True,
+                    last_transport_implementation="UrllibTransport",
                 ),
             )
 
@@ -798,6 +807,15 @@ def test_live_read_service_operational_summary_exposes_source_health():
             "freshness_seconds": None,
             "last_error": None,
             "updated_at": BASE.isoformat(),
+            "failure_class_counts": {"HTTP_429": 1, "HTTP_5XX": 2},
+            "last_failure_class": "HTTP_429",
+            "last_exception_type": "HTTPError",
+            "last_http_status": 429,
+            "last_endpoint": "https://example.test/scoreboard",
+            "last_attempt_count": 3,
+            "first_failure_at": (BASE - timedelta(minutes=2)).isoformat(),
+            "last_retryable": True,
+            "last_transport_implementation": "UrllibTransport",
         }
     ]
 

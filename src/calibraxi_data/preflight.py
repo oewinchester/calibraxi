@@ -25,7 +25,7 @@ class PreflightResult:
     tls: str
     http: str
     parser: str
-    identity_readiness: Mapping[str, int]
+    identity_readiness: Mapping[str, int | None]
     latency_ms: int | None = None
     operational_state: str = "UNREACHABLE"
     failure_class: str | None = None
@@ -64,7 +64,7 @@ def run_preflight(
     tls_probe: Callable[[Any, float], Any] | None = None,
     http_probe: Callable[[str, float], Any] | None = None,
     parser_probe: Callable[[bytes], Any] | None = None,
-    identity_ready: Callable[[], Any] | None = None,
+    identity_ready: Callable[..., Any] | None = None,
 ) -> PreflightResult:
     """Run DNS, TCP, TLS, HTTP, parser, and identity checks without persistence."""
 
@@ -72,7 +72,12 @@ def run_preflight(
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     addresses: list[Any] = []
-    details: dict[str, Any] = {"host": host, "port": port}
+    details: dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "identity_measurement": "NOT_MEASURED",
+        "ambiguity_measurement": "NOT_TRACKED",
+    }
     failure_class: str | None = None
     exception_type: str | None = None
     try:
@@ -90,7 +95,7 @@ def run_preflight(
         dns = "HEALTHY"
     except Exception as exc:
         dns, failure_class, exception_type = _status_from_exception(exc)
-        return PreflightResult(source, capability, url, dns, "SKIPPED", "SKIPPED", "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": 0}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
+        return PreflightResult(source, capability, url, dns, "SKIPPED", "SKIPPED", "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": None}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
 
     address = addresses[0][4] if isinstance(addresses[0], tuple) and len(addresses[0]) >= 5 else addresses[0]
     connect = connector or (lambda target, value: socket.create_connection(target, timeout=value))
@@ -102,7 +107,7 @@ def run_preflight(
         connection = "HEALTHY"
     except Exception as exc:
         connection, failure_class, exception_type = _status_from_exception(exc)
-        return PreflightResult(source, capability, url, dns, connection, "SKIPPED", "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": 0}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
+        return PreflightResult(source, capability, url, dns, connection, "SKIPPED", "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": None}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
 
     tls = "HEALTHY"
     if parsed.scheme == "https":
@@ -111,7 +116,7 @@ def run_preflight(
             probe(address, timeout)
         except Exception as exc:
             tls, failure_class, exception_type = _status_from_exception(exc)
-            return PreflightResult(source, capability, url, dns, connection, tls, "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": 0}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
+            return PreflightResult(source, capability, url, dns, connection, tls, "SKIPPED", "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": None}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, details=details)
 
     status: int | None = None
     body = b""
@@ -126,10 +131,14 @@ def run_preflight(
         http = "HEALTHY" if 200 <= status < 300 else "DEGRADED"
     except Exception as exc:
         http, failure_class, exception_type = _status_from_exception(exc)
-        return PreflightResult(source, capability, url, dns, connection, tls, http, "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": 0}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, latency_ms=None, details=details)
+        return PreflightResult(source, capability, url, dns, connection, tls, http, "SKIPPED", {"confirmed": 0, "unresolved": 0, "ambiguous": None}, operational_state="UNREACHABLE", failure_class=failure_class, exception_type=exception_type, latency_ms=None, details=details)
 
     parser = "SKIPPED"
-    if parser_probe is not None:
+    empty_success_response = 200 <= (status or 0) < 300 and not body
+    if empty_success_response:
+        parser = "EMPTY_RESPONSE"
+        failure_class = "EMPTY_RESPONSE"
+    elif parser_probe is not None:
         try:
             parser_probe(body)
             parser = "HEALTHY"
@@ -143,18 +152,50 @@ def run_preflight(
     elif status is not None and status >= 200 and status < 300:
         parser = "NOT_TESTED"
 
-    counts = {"confirmed": 0, "unresolved": 0, "ambiguous": 0}
+    counts: dict[str, int | None] = {"confirmed": 0, "unresolved": 0, "ambiguous": None}
+    identity_measurement = "NOT_MEASURED"
+    ambiguity_measurement = "NOT_TRACKED"
     if identity_ready is not None:
         raw = identity_ready()
+        if isinstance(raw, Mapping) and not any(key in raw for key in counts):
+            source_readiness = raw.get(source)
+            if isinstance(source_readiness, Mapping):
+                entity_family = "team" if capability in {"fixtures", "team_match_stats"} else "player"
+                details["identity_entity"] = entity_family
+                details["identity_readiness_by_entity"] = dict(source_readiness)
+                raw = source_readiness.get(entity_family)
+            else:
+                raw = None
         if isinstance(raw, Mapping):
-            counts.update({key: int(raw.get(key, 0)) for key in counts})
-        else:
+            counts.update(
+                {
+                    key: (None if raw.get(key) is None else int(raw[key]))
+                    for key in counts
+                    if key in raw
+                }
+            )
+            identity_measurement = str(raw.get("measurement", "MEASURED"))
+            ambiguity_measurement = str(
+                raw.get(
+                    "ambiguity_measurement",
+                    "MEASURED" if counts["ambiguous"] is not None else "NOT_TRACKED",
+                )
+            )
+        elif raw is not None:
             confirmed, unresolved, ambiguous = tuple(raw)
             counts = {"confirmed": int(confirmed), "unresolved": int(unresolved), "ambiguous": int(ambiguous)}
+            identity_measurement = "MEASURED"
+            ambiguity_measurement = "MEASURED"
+    details["identity_measurement"] = identity_measurement
+    details["ambiguity_measurement"] = ambiguity_measurement
 
     if parser == "SCHEMA_DRIFT":
         state = "SCHEMA_DRIFT"
-    elif counts["unresolved"] or counts["ambiguous"]:
+    elif http != "HEALTHY" or tls != "HEALTHY":
+        state = "DEGRADED"
+    elif identity_measurement != "MEASURED" or ambiguity_measurement != "MEASURED":
+        state = "MAPPING_INCOMPLETE"
+    elif counts["unresolved"] or (counts["ambiguous"] or 0):
         state = "MAPPING_INCOMPLETE"
     elif http == "HEALTHY" and tls == "HEALTHY":
         state = "HEALTHY"
@@ -163,6 +204,11 @@ def run_preflight(
     if status is not None and status >= 400:
         classified = classify_failure(http_status=status)
         failure_class = failure_class or classified.failure_class.value
+    elif empty_success_response:
+        failure_class = "EMPTY_RESPONSE"
+        state = "DEGRADED"
+    elif state == "MAPPING_INCOMPLETE":
+        failure_class = "PROVIDER_MAPPING_MISSING"
     return PreflightResult(source, capability, url, dns, connection, tls, http, parser, counts, latency_ms=latency_ms, operational_state=state, failure_class=failure_class, exception_type=exception_type, http_status=status, details=details)
 
 
@@ -175,7 +221,7 @@ def build_live_preflight(
     now: datetime | None = None,
     league: str = "eng.1",
     season_year: int | None = None,
-    identity_ready: Callable[[], Any] | None = None,
+    identity_ready: Callable[..., Any] | None = None,
 ) -> Callable[[], tuple[PreflightResult, ...]]:
     """Build a read-only startup probe for every active source family.
 
@@ -191,25 +237,26 @@ def build_live_preflight(
         year = season_year or (current.year if current.month >= 7 else current.year - 1)
         checks: dict[tuple[str, str], Mapping[str, Any]] = {}
         json_parser = lambda body: __import__("json").loads(body.decode("utf-8"))
+        identity_for = identity_ready
         checks[("espn", "fixtures")] = {
             "url": f"https://site.web.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard?dates={date_compact}",
             "parser_probe": json_parser,
-            "identity_ready": identity_ready,
+            "identity_ready": identity_for,
         }
         checks[("sofascore", "fixtures")] = {
             "url": f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date_iso}",
             "parser_probe": json_parser,
-            "identity_ready": identity_ready,
+            "identity_ready": identity_for,
         }
         checks[("thesportsdb", "fixtures")] = {
             "url": f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={date_iso}&l=4328",
             "parser_probe": json_parser,
-            "identity_ready": identity_ready,
+            "identity_ready": identity_for,
         }
         checks[("understat", "xg")] = {
             "url": f"https://understat.com/league/EPL/{year}",
             "parser_probe": validate_understat_payload,
-            "identity_ready": identity_ready,
+            "identity_ready": identity_for,
         }
         return run_preflight_matrix(checks)
 

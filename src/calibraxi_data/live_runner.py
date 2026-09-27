@@ -427,9 +427,13 @@ class LiveShadowRunner:
         self.clock = clock or (lambda: datetime.now(UTC))
 
     def preflight(self) -> Any:
-        """Run the configured read-only startup diagnostics, if any."""
+        """Run startup diagnostics and persist their operational health."""
 
-        return self._preflight_fn() if self._preflight_fn is not None else ()
+        reports = self._preflight_fn() if self._preflight_fn is not None else ()
+        if self.operations is not None:
+            for report in reports:
+                self.operations.record_preflight(report, attempted_at=self.clock())
+        return reports
 
     def discover_upcoming(self, dates: Iterable[str], *, now: datetime | None = None) -> DiscoveryResult:
         """Acquire qualified fixture schedules and create immutable first-seen evidence."""

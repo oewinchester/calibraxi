@@ -164,6 +164,157 @@ def test_preflight_reports_each_boundary_without_mutating_canonical_state():
     assert result.identity_readiness == {"confirmed": 2, "unresolved": 0, "ambiguous": 0}
 
 
+def test_preflight_does_not_report_healthy_when_identity_readiness_is_unmeasured():
+    from calibraxi_data.preflight import run_preflight
+
+    result = run_preflight(
+        source="understat",
+        capability="xg",
+        url="https://example.test/league/EPL/2026",
+        resolver=lambda host: [(2, 1, 6, "", ("127.0.0.1", 443))],
+        connector=lambda address, timeout: None,
+        tls_probe=lambda address, timeout: True,
+        http_probe=lambda url, timeout: (200, b"{}"),
+        parser_probe=lambda body: None,
+    )
+
+    assert result.operational_state == "MAPPING_INCOMPLETE"
+    assert result.details["identity_measurement"] == "NOT_MEASURED"
+
+
+def test_preflight_does_not_treat_missing_source_mapping_as_measured():
+    from calibraxi_data.preflight import run_preflight
+
+    result = run_preflight(
+        source="understat",
+        capability="xg",
+        url="https://example.test/league/EPL/2026",
+        resolver=lambda host: [(2, 1, 6, "", ("127.0.0.1", 443))],
+        connector=lambda address, timeout: None,
+        tls_probe=lambda address, timeout: True,
+        http_probe=lambda url, timeout: (200, b"{}"),
+        parser_probe=lambda body: None,
+        identity_ready=lambda: {},
+    )
+
+    assert result.operational_state == "MAPPING_INCOMPLETE"
+    assert result.details["identity_measurement"] == "NOT_MEASURED"
+
+
+def test_preflight_reports_empty_response_separately_from_schema_drift():
+    from calibraxi_data.preflight import run_preflight
+
+    result = run_preflight(
+        source="espn",
+        capability="fixtures",
+        url="https://example.test/scoreboard",
+        resolver=lambda host: [(2, 1, 6, "", ("127.0.0.1", 443))],
+        connector=lambda address, timeout: None,
+        tls_probe=lambda address, timeout: True,
+        http_probe=lambda url, timeout: (204, b""),
+        parser_probe=lambda body: None,
+        identity_ready=lambda: {"confirmed": 1, "unresolved": 0, "ambiguous": 0, "population": 1},
+    )
+
+    assert result.failure_class == "EMPTY_RESPONSE"
+    assert result.operational_state == "DEGRADED"
+
+
+def test_startup_preflight_is_persisted_as_source_health_without_canonical_writes(tmp_path):
+    from calibraxi_data.capabilities import CapabilityRegistry
+    from calibraxi_data.contracts import HealthState
+    from calibraxi_data.live_runner import LiveShadowRunner
+    from calibraxi_data.operations import OperationalRecorder
+    from calibraxi_data.persistence import FileSystemCanonicalStore
+
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    registry = CapabilityRegistry()
+    registry.register(__import__("calibraxi_data").SourceCapability("fixtures", "espn", ("sofascore",)))
+    recorder = OperationalRecorder(registry=registry, store=store)
+    reports = (
+        {
+            "source": "espn",
+            "capability": "fixtures",
+            "endpoint": "https://example.test/scoreboard?dates=20260927",
+            "dns": "HEALTHY",
+            "connection": "HEALTHY",
+            "tls": "HEALTHY",
+            "http": "HEALTHY",
+            "parser": "HEALTHY",
+            "http_status": 200,
+            "latency_ms": 81,
+            "operational_state": "HEALTHY",
+            "failure_class": None,
+            "exception_type": None,
+        },
+        {
+            "source": "sofascore",
+            "capability": "fixtures",
+            "endpoint": "https://example.test/schedule",
+            "dns": "HEALTHY",
+            "connection": "HEALTHY",
+            "tls": "HEALTHY",
+            "http": "DEGRADED",
+            "parser": "SKIPPED",
+            "http_status": 403,
+            "latency_ms": 32,
+            "operational_state": "DEGRADED",
+            "failure_class": "HTTP_4XX",
+            "exception_type": None,
+        },
+    )
+    runner = LiveShadowRunner(
+        coordinator=object(),
+        operations=recorder,
+        preflight_fn=lambda: reports,
+        clock=lambda: NOW,
+    )
+
+    assert runner.preflight() == reports
+
+    espn = store.health_for("fixtures", "espn")
+    sofascore = store.health_for("fixtures", "sofascore")
+    assert espn is not None and espn.health is HealthState.HEALTHY
+    assert espn.success_count == 1 and espn.last_latency_ms == 81
+    assert sofascore is not None and sofascore.health is HealthState.SOURCE_FAILED
+    assert sofascore.failure_class_counts == {"HTTP_4XX": 1}
+    assert sofascore.last_http_status == 403
+    assert sofascore.last_endpoint == "https://example.test/schedule"
+    assert store.count(__import__("calibraxi_data").EntityType.FIXTURE) == 0
+
+
+def test_filesystem_identity_readiness_counts_only_explicit_cross_source_links(tmp_path):
+    from calibraxi_data.contracts import EntityType, SourceIdentity
+    from calibraxi_data.espn import SourceObservation
+
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    observations = (
+        SourceObservation(EntityType.TEAM, SourceIdentity("espn", EntityType.TEAM, "359"), canonical_id="team:epl:arsenal"),
+        SourceObservation(EntityType.TEAM, SourceIdentity("football-data.co.uk", EntityType.TEAM, "arsenal"), canonical_id="team:epl:arsenal"),
+        SourceObservation(EntityType.TEAM, SourceIdentity("sofascore", EntityType.TEAM, "42"), canonical_id="team:provider-only:42"),
+        SourceObservation(EntityType.PLAYER, SourceIdentity("espn", EntityType.PLAYER, "p-1"), canonical_id="player:epl:p-1"),
+    )
+    store.persist(observations, evidence_id="identity-readiness")
+
+    readiness = store.identity_mapping_readiness()
+
+    assert readiness["espn"]["team"]["measurement"] == "PARTIAL"
+    assert readiness["espn"]["team"]["ambiguous"] is None
+    assert readiness["espn"]["team"]["ambiguity_measurement"] == "NOT_TRACKED"
+    assert readiness["espn"]["team"] == {
+        "confirmed": 1,
+        "unresolved": 0,
+        "ambiguous": None,
+        "population": 1,
+        "measurement": "PARTIAL",
+        "ambiguity_measurement": "NOT_TRACKED",
+    }
+    assert readiness["sofascore"]["team"]["unresolved"] == 1
+    assert readiness["sofascore"]["team"]["confirmed"] == 0
+    assert readiness["espn"]["player"]["unresolved"] == 1
+    assert readiness["understat"]["player"]["measurement"] == "NOT_MEASURED"
+
+
 def test_preflight_preserves_understat_challenge_metadata():
     from calibraxi_data.preflight import run_preflight
     from calibraxi_data.understat import validate_understat_payload
