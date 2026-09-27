@@ -29,6 +29,8 @@ def test_task_definition_is_singleton_safe_and_does_not_embed_credentials():
     assert "run_live_shadow.py" in wrapper
     assert "--stop-file" in wrapper
     assert "Resolve-LiveShadowStopFile" in wrapper
+    assert "& $python @pythonArguments" in wrapper
+    assert "System.Diagnostics.ProcessStartInfo" not in wrapper
     assert wrapper.index("$mutex.WaitOne") < wrapper.index("Remove-Item -LiteralPath $stopFile")
     assert "CALIBRAXI_POSTGRES_DSN" not in setup
     assert "CALIBRAXI_MINIO_ENDPOINT_URL" not in setup

@@ -71,46 +71,30 @@ try {
         $arguments += @('--runner-factory', $RunnerFactory)
     }
 
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $python
-    $startInfo.WorkingDirectory = $repository
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    # Windows PowerShell 5.1 runs on .NET Framework, whose
-    # ProcessStartInfo has no ArgumentList property.  Keep the wrapper
-    # compatible with both Windows PowerShell and PowerShell 7 by constructing
-    # one quoted command line from the already controlled argument values.
-    $startInfo.Arguments = ($arguments | ForEach-Object {
-        ConvertTo-LiveShadowArgument -Value ([string]$_)
-    }) -join ' '
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    $process.EnableRaisingEvents = $true
-    $process.add_OutputDataReceived({
-        param($sender, $event)
-        if ($null -ne $event.Data) {
-            Write-LiveShadowLog -Level INFO -Event 'worker_output' -Message $event.Data -Fields @{ stream = 'stdout' }
-        }
-    })
-    $process.add_ErrorDataReceived({
-        param($sender, $event)
-        if ($null -ne $event.Data) {
-            Write-LiveShadowLog -Level ERROR -Event 'worker_output' -Message $event.Data -Fields @{ stream = 'stderr' }
-        }
-    })
-
     Write-LiveShadowLog -Level INFO -Event 'worker_start' -Message 'Starting live-shadow worker.' -Fields @{ python = $python; repository = $repository }
-    if (-not $process.Start()) {
-        throw 'Python worker process did not start.'
+    # Invoke Python synchronously through PowerShell so Task Scheduler retains
+    # ownership of the real worker process.  The prior ProcessStartInfo/event
+    # implementation could leave an orphaned Python child while the task was
+    # already reported Ready.  Unbuffered output keeps cycle diagnostics
+    # available while the long-lived worker is running.
+    $pythonArguments = @('-u') + $arguments
+    $exitCode = 1
+    & $python @pythonArguments 2>&1 | ForEach-Object {
+        $isError = $_ -is [System.Management.Automation.ErrorRecord]
+        $line = [string]$_
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            $level = 'INFO'
+            $stream = 'stdout'
+            if ($isError) {
+                $level = 'ERROR'
+                $stream = 'stderr'
+            }
+            Write-LiveShadowLog -Level $level -Event 'worker_output' -Message $line -Fields @{ stream = $stream }
+        }
     }
-    $process.BeginOutputReadLine()
-    $process.BeginErrorReadLine()
-    $process.WaitForExit()
-    Start-Sleep -Milliseconds 100
-    $exitCode = $process.ExitCode
+    if ($null -ne $LASTEXITCODE) {
+        $exitCode = [int]$LASTEXITCODE
+    }
     Write-LiveShadowLog -Level INFO -Event 'worker_exit' -Message 'Live-shadow worker exited.' -Fields @{ exit_code = $exitCode }
     exit $exitCode
 }
