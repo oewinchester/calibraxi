@@ -111,6 +111,7 @@ def _compose_runner(
         preflight_fn=build_live_preflight(
             league="eng.1",
             identity_ready=canonical_store.identity_mapping_readiness if canonical_store is not None else None,
+            adapters=configured_adapters,
         ),
         historical_records=population.records,
         training_examples=population.examples,

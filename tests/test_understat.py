@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calibraxi_data import CapabilityState, EntityType
 from calibraxi_data.http_json import HttpResponse, RetryPolicy
-from calibraxi_data.understat import UnderstatObservationParser, UnderstatSourceAdapter, validate_understat_payload
+from calibraxi_data.understat import UnderstatBrowserTransport, UnderstatObservationParser, UnderstatSourceAdapter, validate_understat_payload
 
 
 class _Transport:
@@ -97,6 +97,37 @@ def test_understat_challenge_is_explicit_access_control_schema_boundary():
     assert "raw_html" not in result.metadata
 
 
+def test_understat_public_match_html_can_contain_cloudflare_text_without_being_a_challenge():
+    result = UnderstatSourceAdapter(transport=_Transport([_response(MATCH_HTML + "<!-- cloudflare analytics -->")])).fetch("xg", event_id="u-1")
+
+    assert result.state is CapabilityState.SUPPORTED
+
+
+def test_understat_parser_accepts_current_flat_match_info_xg_shape():
+    payload = {
+        "embedded": {
+            "match_info": {
+                "id": "u-2",
+                "h": "10",
+                "a": "20",
+                "team_h": "Home",
+                "team_a": "Away",
+                "h_xg": "1.25",
+                "a_xg": "0.45",
+                "h_shot": "13",
+                "a_shot": "5",
+            }
+        }
+    }
+
+    observations = UnderstatObservationParser().parse("xg", payload, event_id="u-2")
+
+    assert len(observations) == 2
+    assert observations[0].attributes["xga"] == "0.45"
+    assert observations[0].attributes["shots"] == "13"
+    assert observations[1].attributes["xga"] == "1.25"
+
+
 def test_understat_preflight_validator_rejects_challenge_without_page_content():
     try:
         validate_understat_payload(b"<html>cloudflare challenge</html>")
@@ -115,3 +146,32 @@ def test_understat_fixture_page_uses_epl_slug_and_parses_dates_data():
     assert result.state is CapabilityState.SUPPORTED
     assert transport.urls == ["https://understat.com/league/EPL/2025"]
     assert observations[0].source_identity.source_id == "u-2"
+
+
+def test_understat_browser_fallback_recovers_match_data_and_nested_rosters():
+    direct = _Transport([_response("", status=404)])
+    browser = _Transport([_response('{"rosters":{"h":{"p1":{"id":"r1","player_id":"p1","player":"Player One","xA":"0.10","xG":"0.20"}},"a":{}},"shots":{"h":[{"id":"s1","xG":"0.20"}],"a":[]}}')])
+    adapter = UnderstatSourceAdapter(
+        transport=direct,
+        browser_transport=browser,
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+
+    result = adapter.fetch("xg_a", event_id="u-1")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.integration == "browser-selenium-json"
+    assert result.metadata["browser_fallback_used"] is True
+    observations = UnderstatObservationParser().parse("xg_a", result.payload, event_id="u-1")
+    assert observations[0].attributes["xA"] == "0.10"
+    assert browser.urls == ["https://understat.com/getMatchData/u-1"]
+
+
+def test_understat_browser_transport_rejects_non_understat_hosts():
+    transport = UnderstatBrowserTransport()
+    try:
+        transport.request("https://example.com/", headers={}, timeout=1)
+    except ValueError as exc:
+        assert "Understat HTTPS endpoints" in str(exc)
+    else:
+        raise AssertionError("browser transport must enforce its provider host")

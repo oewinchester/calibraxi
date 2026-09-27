@@ -164,6 +164,42 @@ def test_preflight_reports_each_boundary_without_mutating_canonical_state():
     assert result.identity_readiness == {"confirmed": 2, "unresolved": 0, "ambiguous": 0}
 
 
+def test_live_preflight_uses_configured_adapter_path_for_sofascore(monkeypatch):
+    from calibraxi_data import preflight
+
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def fetch(self, capability, **params):
+            self.calls.append((capability, params))
+            return SourceResult(
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                capability,
+                payload={"events": []},
+                http_status=200,
+            )
+
+    adapter = Adapter()
+    captured = {}
+
+    def fake_matrix(checks):
+        captured.update(checks)
+        response = checks[("sofascore", "fixtures")]["http_probe"]("ignored", 1)
+        assert response.status == 200
+        assert response.body == b'{"events": []}'
+        return ("preflight",)
+
+    monkeypatch.setattr(preflight, "run_preflight_matrix", fake_matrix)
+
+    result = preflight.build_live_preflight(adapters={"sofascore": adapter})()
+
+    assert result == ("preflight",)
+    assert adapter.calls[0][0] == "fixtures"
+    assert adapter.calls[0][1]["date"].isdigit()
+
+
 def test_preflight_does_not_report_healthy_when_identity_readiness_is_unmeasured():
     from calibraxi_data.preflight import run_preflight
 

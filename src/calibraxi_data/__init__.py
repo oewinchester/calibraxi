@@ -24,8 +24,8 @@ from .evidence import FileSystemRawEvidenceStore, MinioRawEvidenceStore, RawEvid
 from .entity_resolution import EntityResolutionIndex, resolve_observations
 from .fixture_identity import FixtureIdentityIndex
 from .http_json import HttpJsonSourceAdapter, RetryPolicy, UrllibTransport
-from .sofascore import SofascoreObservationParser, SofascoreSourceAdapter
-from .understat import UnderstatObservationParser, UnderstatSourceAdapter
+from .sofascore import SofascoreBrowserTransport, SofascoreObservationParser, SofascoreSourceAdapter
+from .understat import UnderstatBrowserTransport, UnderstatObservationParser, UnderstatSourceAdapter
 from .openfootball import OpenFootballAdapter, OpenFootballObservationParser, OpenFootballSourceAdapter
 from .soccerdata import (
     SOCCERDATA_PROVIDER_SPECS,
@@ -208,8 +208,10 @@ __all__ = [
     "EspnObservationParser",
     "EspnSourceAdapter",
     "SofascoreSourceAdapter",
+    "SofascoreBrowserTransport",
     "SofascoreObservationParser",
     "UnderstatObservationParser",
+    "UnderstatBrowserTransport",
     "UnderstatSourceAdapter",
     "OpenFootballObservationParser",
     "OpenFootballSourceAdapter",

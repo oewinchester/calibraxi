@@ -12,12 +12,17 @@ from __future__ import annotations
 import ast
 import codecs
 import json
+import os
 import re
+import shutil
+import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
-from .contracts import CapabilityState, EntityType, SourceIdentity, SourceResult
+from .connectivity import classify_failure
+from .contracts import CapabilityState, EntityType, FailureClass, SourceIdentity, SourceResult
 from .espn import SourceObservation
 from .http_json import HttpResponse, HttpTransport, RetryPolicy, UrllibTransport, failure_metadata, request_metadata, request_with_retry, sanitize_endpoint
 
@@ -57,12 +62,152 @@ class UnderstatProviderChallenge(ValueError):
             self.details["response_bytes"] = response_bytes
 
 
+class UnderstatBrowserTransport:
+    """Lazy Selenium transport for Understat's ordinary browser-facing pages."""
+
+    _allowed_hosts = frozenset({"understat.com", "www.understat.com"})
+
+    def __init__(self, *, browser_path: str | None = None, launch_timeout: float = 15.0) -> None:
+        self._browser_path = browser_path
+        self._launch_timeout = launch_timeout
+        self._lock = threading.RLock()
+        self._driver: Any = None
+        self._origin_ready = False
+
+    def request(self, url: str, *, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in self._allowed_hosts:
+            raise ValueError(f"browser transport only supports Understat HTTPS endpoints: {url!r}")
+        with self._lock:
+            try:
+                self._ensure_session(timeout=max(timeout, self._launch_timeout))
+                self._ensure_origin()
+                return self._fetch(url, headers=headers, timeout=timeout)
+            except Exception:
+                self.close()
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            driver = self._driver
+            self._driver = None
+            self._origin_ready = False
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter teardown
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _ensure_session(self, *, timeout: float) -> None:
+        if self._driver is not None:
+            return
+        browser = self._browser_path or _find_browser_binary()
+        if browser is None:
+            raise RuntimeError("Chrome or Edge is required for Understat browser fallback")
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options as ChromeOptions
+            from selenium.webdriver.chrome.service import Service as ChromeService
+        except Exception as exc:
+            raise RuntimeError("Selenium is required for Understat browser fallback") from exc
+        options = ChromeOptions()
+        options.binary_location = browser
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--window-size=1280,900")
+        driver_path = _find_webdriver_binary()
+        service = ChromeService(executable_path=driver_path) if driver_path else None
+        try:
+            self._driver = webdriver.Chrome(service=service, options=options)
+            self._driver.set_page_load_timeout(max(1.0, timeout))
+            self._driver.set_script_timeout(max(1.0, timeout))
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(f"Selenium could not start the Understat browser: {exc}") from exc
+
+    def _ensure_origin(self) -> None:
+        if self._origin_ready:
+            return
+        self._driver.get("https://understat.com/")
+        self._origin_ready = True
+
+    def _fetch(self, url: str, *, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+        if self._driver is None:
+            raise RuntimeError("Understat browser session is not running")
+        if "/getMatchData/" not in url:
+            self._driver.get(url)
+            body = str(self._driver.page_source or "").encode("utf-8")
+            return HttpResponse(200, body, {"content-type": "text/html; charset=UTF-8"})
+        script = """
+            const done = arguments[arguments.length - 1];
+            fetch(arguments[0], {headers: arguments[1], credentials: 'include', cache: 'no-store'})
+              .then(async response => done({
+                status: response.status,
+                headers: Object.fromEntries(response.headers.entries()),
+                body: await response.text()
+              }))
+              .catch(error => done({error: String(error)}));
+        """
+        value = self._driver.execute_async_script(script, url, {str(key): str(item) for key, item in headers.items()})
+        if isinstance(value, Mapping) and value.get("error"):
+            raise RuntimeError(f"Understat browser fetch failed: {value['error']}")
+        if not isinstance(value, Mapping) or "status" not in value:
+            raise RuntimeError(f"Understat browser fetch returned no response: {value!r}")
+        body = str(value.get("body") or "").encode("utf-8")
+        raw_headers = value.get("headers") if isinstance(value.get("headers"), Mapping) else {}
+        return HttpResponse(int(value["status"]), body, {str(key): str(item) for key, item in raw_headers.items()})
+
+
+def _find_browser_binary() -> str | None:
+    configured = os.environ.get("CALIBRAXI_UNDERSTAT_BROWSER_PATH")
+    candidates = [configured] if configured else []
+    candidates.extend(
+        [
+            shutil.which("chrome"),
+            shutil.which("google-chrome"),
+            shutil.which("msedge"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/microsoft-edge",
+        ]
+    )
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
+
+
+def _find_webdriver_binary() -> str | None:
+    configured = os.environ.get("CALIBRAXI_UNDERSTAT_WEBDRIVER_PATH")
+    candidates = [configured, shutil.which("chromedriver")]
+    cache_root = Path(os.environ.get("SE_CACHE_PATH", Path.home() / ".cache" / "selenium"))
+    if cache_root.exists():
+        candidates.extend(str(path) for path in cache_root.rglob("chromedriver.exe"))
+        candidates.extend(str(path) for path in cache_root.rglob("chromedriver"))
+    existing = [path for path in candidates if path and os.path.isfile(path)]
+    return max(existing, key=lambda path: os.path.getmtime(path)) if existing else None
+
+
 def detect_provider_challenge(body: bytes | str) -> tuple[str, ...]:
     """Return generic access-control markers without retaining page contents."""
 
     text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
     lowered = text.casefold()
-    return tuple(marker for marker in _CHALLENGE_MARKERS if marker in lowered)
+    page_content_markers = tuple(name.casefold() for name in _EMBEDDED_NAMES) + ("calendar-game", "match-info")
+    return tuple(
+        marker
+        for marker in _CHALLENGE_MARKERS
+        if marker in lowered and not (marker == "cloudflare" and any(content in lowered for content in page_content_markers))
+    )
 
 
 def validate_understat_payload(body: bytes) -> Mapping[str, Any]:
@@ -81,11 +226,17 @@ def validate_understat_payload(body: bytes) -> Mapping[str, Any]:
     return payload
 
 
+def _default_browser_transport() -> HttpTransport | None:
+    value = os.environ.get("CALIBRAXI_UNDERSTAT_BROWSER_FALLBACK", "1").strip().lower()
+    return None if value in {"0", "false", "no", "off"} else UnderstatBrowserTransport()
+
+
 class UnderstatSourceAdapter:
     """Fetch provider-specific Understat data from ordinary public pages."""
 
     source_name = "understat"
     integration_name = "direct-http-html"
+    browser_integration_name = "browser-selenium-json"
     adapter_version = "understat-http-html-v1"
     _base = "https://understat.com"
 
@@ -93,12 +244,14 @@ class UnderstatSourceAdapter:
         self,
         *,
         transport: HttpTransport | None = None,
+        browser_transport: HttpTransport | None = None,
         timeout: float = 20.0,
         retry_policy: RetryPolicy | None = None,
         sleep: Callable[[float], None] | None = None,
         base_url: str | None = None,
     ) -> None:
         self._transport = transport or UrllibTransport()
+        self._browser_transport = browser_transport if browser_transport is not None else _default_browser_transport()
         self._timeout = timeout
         self._retry_policy = retry_policy or RetryPolicy(jitter_ratio=0.2)
         self._sleep = sleep or time.sleep
@@ -124,6 +277,7 @@ class UnderstatSourceAdapter:
             "public_surface": "ordinary_html",
             "transport_implementation": type(self._transport).__name__,
         }
+        integration_name = self.integration_name
         try:
             request = request_with_retry(
                 self._transport,
@@ -149,94 +303,168 @@ class UnderstatSourceAdapter:
                 metadata=metadata,
             )
         metadata.update(request_metadata(request, transport=self._transport, endpoint=endpoint))
+        direct_response = request.response
+        direct_failure_class = str(metadata.get("failure_class") or "")
+        if request.error is not None:
+            direct_failure_class = classify_failure(request.error).failure_class.value
+        metadata["direct_failure_class"] = direct_failure_class or None
+        browser_fallback_attempted = False
+        browser_fallback_used = False
+
+        def try_browser_fallback() -> bool:
+            nonlocal request, browser_fallback_attempted, browser_fallback_used, integration_name
+            if self._browser_transport is None:
+                return False
+            browser_fallback_attempted = True
+            try:
+                browser_request = request_with_retry(
+                    self._browser_transport,
+                    endpoint,
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/json",
+                        "Referer": "https://understat.com/",
+                        "User-Agent": "Mozilla/5.0",
+                        "X-Requested-With": "XMLHttpRequest" if "/getMatchData/" in endpoint else "",
+                    },
+                    timeout=self._timeout,
+                    retry_policy=self._retry_policy,
+                    sleep=self._sleep,
+                )
+            except Exception as exc:
+                metadata.update({"browser_fallback_error": str(exc), "browser_transport_implementation": type(self._browser_transport).__name__})
+                return False
+            browser_response = browser_request.response
+            if browser_request.error is None and browser_response is not None and 200 <= browser_response.status < 300 and browser_response.body:
+                request = browser_request
+                browser_fallback_used = True
+                integration_name = self.browser_integration_name
+                metadata.update(request_metadata(browser_request, transport=self._browser_transport, endpoint=endpoint))
+                metadata.update(
+                    {
+                        "browser_fallback_used": True,
+                        "browser_transport_implementation": type(self._browser_transport).__name__,
+                        "browser_request_attempts": browser_request.attempts,
+                    }
+                )
+                return True
+            browser_failure = classify_failure(
+                browser_request.error,
+                http_status=browser_response.status if browser_response is not None and browser_request.error is None else None,
+                body=browser_response.body if browser_response is not None and browser_request.error is None else None,
+            )
+            metadata.update(
+                {
+                    "browser_fallback_used": False,
+                    "browser_transport_implementation": type(self._browser_transport).__name__,
+                    "browser_request_error": str(browser_request.error) if browser_request.error is not None else None,
+                    "browser_failure_class": browser_failure.failure_class.value,
+                    "browser_request_attempts": browser_request.attempts,
+                }
+            )
+            return False
+
+        if self._browser_transport is not None and (
+            direct_failure_class == FailureClass.LOCAL_SOCKET_DENIED.value
+            or (direct_response is not None and direct_response.status in {401, 403, 404})
+        ):
+            try_browser_fallback()
+        metadata["browser_fallback_attempted"] = browser_fallback_attempted
+        metadata.setdefault("browser_fallback_used", browser_fallback_used)
         if request.error is not None:
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
                 capability,
                 error=str(request.error),
-                integration=self.integration_name,
+                integration=integration_name,
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
         response = request.response
         if response is None:
-            metadata.update(failure_metadata(error=RuntimeError("transport returned no response"), endpoint=endpoint, transport=self._transport, attempts=request.attempts))
+            metadata.update(failure_metadata(error=RuntimeError("transport returned no response"), endpoint=endpoint, transport=self._browser_transport if browser_fallback_used else self._transport, attempts=request.attempts))
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
                 capability,
                 error="transport returned no response",
-                integration=self.integration_name,
+                integration=integration_name,
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
         if response.status < 200 or response.status >= 300:
-            metadata.update(failure_metadata(http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts))
+            metadata.update(failure_metadata(http_status=response.status, endpoint=endpoint, transport=self._browser_transport if browser_fallback_used else self._transport, attempts=request.attempts))
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
                 capability,
                 http_status=response.status,
                 error=f"HTTP {response.status}",
-                integration=self.integration_name,
+                integration=integration_name,
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
         metadata["response_bytes"] = len(response.body)
         challenge_markers = detect_provider_challenge(response.body)
         if challenge_markers:
-            error = UnderstatProviderChallenge(
-                "Understat provider access-control challenge",
-                markers=challenge_markers,
-                response_bytes=len(response.body),
-            )
-            metadata.update(error.details)
-            metadata.update(
-                failure_metadata(
-                    error=error,
-                    http_status=response.status,
-                    endpoint=endpoint,
-                    transport=self._transport,
-                    attempts=request.attempts,
-                    parser_error=True,
+            if try_browser_fallback():
+                metadata["browser_fallback_attempted"] = browser_fallback_attempted
+                response = request.response
+                if response is not None:
+                    challenge_markers = detect_provider_challenge(response.body)
+                    metadata["response_bytes"] = len(response.body)
+            if challenge_markers:
+                error = UnderstatProviderChallenge(
+                    "Understat provider access-control challenge",
+                    markers=challenge_markers,
+                    response_bytes=len(response.body),
                 )
-            )
-            return SourceResult(
-                CapabilityState.PARSER_SCHEMA_DRIFT,
-                self.source_name,
-                capability,
-                http_status=response.status,
-                error=str(error),
-                integration=self.integration_name,
-                adapter_version=self.adapter_version,
-                metadata=metadata,
-            )
+                metadata.update(error.details)
+                metadata.update(
+                    failure_metadata(
+                        error=error,
+                        http_status=response.status,
+                        endpoint=endpoint,
+                        transport=self._browser_transport if browser_fallback_used else self._transport,
+                        attempts=request.attempts,
+                        parser_error=True,
+                    )
+                )
+                return SourceResult(
+                    CapabilityState.PARSER_SCHEMA_DRIFT,
+                    self.source_name,
+                    capability,
+                    http_status=response.status,
+                    error=str(error),
+                    integration=integration_name,
+                    adapter_version=self.adapter_version,
+                    metadata=metadata,
+                )
         try:
             body = response.body.decode("utf-8")
         except UnicodeDecodeError as exc:
-            metadata.update(failure_metadata(error=exc, http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts, parser_error=True))
+            metadata.update(failure_metadata(error=exc, http_status=response.status, endpoint=endpoint, transport=self._browser_transport if browser_fallback_used else self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(
                 CapabilityState.PARSER_SCHEMA_DRIFT,
                 self.source_name,
                 capability,
                 http_status=response.status,
                 error=f"malformed UTF-8: {exc}",
-                integration=self.integration_name,
+                integration=integration_name,
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
 
         embedded = _decode_payload(body)
         if embedded is None:
-            metadata.update(failure_metadata(error=ValueError("recognized Understat payload missing"), http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts, parser_error=True))
+            metadata.update(failure_metadata(error=ValueError("recognized Understat payload missing"), http_status=response.status, endpoint=endpoint, transport=self._browser_transport if browser_fallback_used else self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(
                 CapabilityState.PARSER_SCHEMA_DRIFT,
                 self.source_name,
                 capability,
                 http_status=response.status,
                 error="Understat page did not contain a recognized JSON payload",
-                integration=self.integration_name,
+                integration=integration_name,
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
@@ -254,17 +482,21 @@ class UnderstatSourceAdapter:
             capability,
             payload=payload,
             http_status=response.status,
-            integration=self.integration_name,
+            integration=integration_name,
             adapter_version=self.adapter_version,
             metadata=metadata,
         )
 
     def _endpoint(self, capability: str, params: Mapping[str, Any]) -> tuple[str | None, str | None]:
         event_id = params.get("event_id") or params.get("fixture_id")
-        if capability in {"xg", "xg_a", "shots", "player_stats", "team_stats", "match_stats"}:
+        if capability in {"xg", "team_stats", "match_stats"}:
             if event_id in (None, ""):
                 return None, None
             return f"{self._base_url}/match/{quote(str(event_id), safe='')}", str(event_id)
+        if capability in {"xg_a", "shots", "player_stats"}:
+            if event_id in (None, ""):
+                return None, None
+            return f"{self._base_url}/getMatchData/{quote(str(event_id), safe='')}", str(event_id)
         if capability in {"fixtures", "historical_results"}:
             league = _league_slug(params.get("league", "EPL"))
             season = params.get("season") or params.get("season_year")
@@ -301,56 +533,69 @@ class UnderstatObservationParser:
         if not info:
             return ()
         xg = _first_mapping(info, "xG", "xg", "expected_goals")
-        if not xg:
+        flat_xg = {"home": info.get("h_xg"), "away": info.get("a_xg")}
+        if not xg and not any(value not in (None, "") for value in flat_xg.values()):
             return ()
-        home = _first_mapping(info, "h", "home")
-        away = _first_mapping(info, "a", "away")
+        home = _first_mapping(info, "h", "home") or {"id": info.get("h"), "title": info.get("team_h")}
+        away = _first_mapping(info, "a", "away") or {"id": info.get("a"), "title": info.get("team_a")}
         fixture_id = str(event_id or info.get("id") or "") or None
         observations: list[SourceObservation] = []
         for side, team in (("home", home), ("away", away)):
-            value = _value_for_side(xg, side)
+            value = _value_for_side(xg, side) if xg else flat_xg[side]
             if value is None:
                 continue
             team_id = str(team.get("id") or side)
+            other_side = "away" if side == "home" else "home"
+            shot_key = "h_shot" if side == "home" else "a_shot"
+            shot_target_key = "h_shotOnTarget" if side == "home" else "a_shotOnTarget"
+            deep_key = "h_deep" if side == "home" else "a_deep"
+            ppda_key = "h_ppda" if side == "home" else "a_ppda"
+            attributes = {
+                "fixture_source_id": fixture_id,
+                "team_source_id": team_id,
+                "side": side,
+                "xg": value,
+                "xga": flat_xg[other_side] if flat_xg[other_side] not in (None, "") else _value_for_side(xg, other_side),
+                "xg_model": "understat",
+                "provider": self.source_name,
+            }
+            for name, key in (("shots", shot_key), ("shots_on_target", shot_target_key), ("deep", deep_key), ("ppda", ppda_key)):
+                if info.get(key) not in (None, ""):
+                    attributes[name] = info[key]
             observations.append(
                 SourceObservation(
                     EntityType.TEAM_STAT,
                     SourceIdentity(self.source_name, EntityType.TEAM_STAT, f"{fixture_id}:{side}"),
                     team.get("title") or team.get("name") or side,
-                    {
-                        "fixture_source_id": fixture_id,
-                        "team_source_id": team_id,
-                        "side": side,
-                        "xg": value,
-                        "xg_model": "understat",
-                        "provider": self.source_name,
-                    },
+                    attributes,
                 )
             )
         return tuple(observations)
 
     def _players(self, embedded: Mapping[str, Any], event_id: str | None) -> tuple[SourceObservation, ...]:
-        players = embedded.get("playersData") or embedded.get("players") or embedded.get("rostersData")
+        players = embedded.get("playersData") or embedded.get("players") or embedded.get("rostersData") or embedded.get("rosters")
         if not isinstance(players, Mapping):
             return ()
         out: list[SourceObservation] = []
-        for key, raw in players.items():
-            if not isinstance(raw, Mapping):
-                continue
-            player = raw.get("player") if isinstance(raw.get("player"), Mapping) else raw
-            player_id = str(player.get("id") or raw.get("player_id") or key)
-            if not player_id or player_id == "None":
-                continue
-            attrs = {str(name): value for name, value in raw.items() if name not in {"player", "id"}}
-            attrs.update({"fixture_source_id": event_id, "player_source_id": player_id, "provider": self.source_name, "xg_model": "understat"})
-            out.append(
-                SourceObservation(
-                    EntityType.PLAYER_STAT,
-                    SourceIdentity(self.source_name, EntityType.PLAYER_STAT, f"{event_id}:{player_id}"),
-                    player.get("title") or player.get("name"),
-                    attrs,
+        for group_key, group in players.items():
+            nested = group.items() if isinstance(group, Mapping) and group_key in {"h", "a", "home", "away"} else ((group_key, group),)
+            for key, raw in nested:
+                if not isinstance(raw, Mapping):
+                    continue
+                player = raw.get("player") if isinstance(raw.get("player"), Mapping) else raw
+                player_id = str(player.get("id") or raw.get("player_id") or key)
+                if not player_id or player_id == "None":
+                    continue
+                attrs = {str(name): value for name, value in raw.items() if name not in {"player", "id"}}
+                attrs.update({"fixture_source_id": event_id, "player_source_id": player_id, "provider": self.source_name, "xg_model": "understat"})
+                out.append(
+                    SourceObservation(
+                        EntityType.PLAYER_STAT,
+                        SourceIdentity(self.source_name, EntityType.PLAYER_STAT, f"{event_id}:{player_id}"),
+                        player.get("title") or player.get("name"),
+                        attrs,
+                    )
                 )
-            )
         return tuple(out)
 
     def _shots(self, embedded: Mapping[str, Any], event_id: str | None) -> tuple[SourceObservation, ...]:

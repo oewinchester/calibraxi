@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 import ssl
 import time
+import json
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping
@@ -222,6 +223,7 @@ def build_live_preflight(
     league: str = "eng.1",
     season_year: int | None = None,
     identity_ready: Callable[..., Any] | None = None,
+    adapters: Mapping[str, Any] | None = None,
 ) -> Callable[[], tuple[PreflightResult, ...]]:
     """Build a read-only startup probe for every active source family.
 
@@ -238,6 +240,23 @@ def build_live_preflight(
         checks: dict[tuple[str, str], Mapping[str, Any]] = {}
         json_parser = lambda body: __import__("json").loads(body.decode("utf-8"))
         identity_for = identity_ready
+        configured_adapters = dict(adapters or {})
+
+        def adapter_probe(source: str, capability: str, **params: Any) -> Callable[[str, float], HttpResponse] | None:
+            adapter = configured_adapters.get(source)
+            if adapter is None or not callable(getattr(adapter, "fetch", None)):
+                return None
+
+            def probe(_url: str, _timeout: float) -> HttpResponse:
+                result = adapter.fetch(capability, **params)
+                payload = result.payload if result.payload is not None else {}
+                body = json.dumps(payload, default=str).encode("utf-8")
+                status = int(result.http_status or (200 if result.state.value == "supported" else 0))
+                if status <= 0:
+                    raise RuntimeError(result.error or f"{source}:{capability}:{result.state.value}")
+                return HttpResponse(status, body, {})
+
+            return probe
         checks[("espn", "fixtures")] = {
             "url": f"https://site.web.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard?dates={date_compact}",
             "parser_probe": json_parser,
@@ -245,6 +264,7 @@ def build_live_preflight(
         }
         checks[("sofascore", "fixtures")] = {
             "url": f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{date_iso}",
+            "http_probe": adapter_probe("sofascore", "fixtures", league=league, date=date_compact) or _default_http_probe,
             "parser_probe": json_parser,
             "identity_ready": identity_for,
         }

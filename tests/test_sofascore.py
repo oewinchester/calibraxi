@@ -14,6 +14,8 @@ class MappingTransport:
         self.urls.append(url)
         for marker, payload in self.payloads.items():
             if url.endswith(marker):
+                if isinstance(payload, HttpResponse):
+                    return payload
                 return HttpResponse(200, json.dumps(payload).encode("utf-8"), {"content-type": "application/json"})
         return HttpResponse(404, b"{}", {})
 
@@ -25,7 +27,10 @@ class SequenceTransport:
 
     def request(self, url, *, headers, timeout):
         self.calls += 1
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def _event():
@@ -327,3 +332,70 @@ def test_sofascore_team_stats_preserve_side_specific_values():
     assert away.attributes["statistics"][0]["value"] == "1.70"
     assert home.attributes["statistics"][1]["value"] == "61%"
     assert away.attributes["statistics"][1]["value"] == "39%"
+
+
+def test_sofascore_uses_browser_transport_after_direct_provider_denial():
+    direct = SequenceTransport([HttpResponse(403, b"blocked", {})])
+    browser = MappingTransport({"/event/14025013": _event()})
+
+    result = SofascoreSourceAdapter(
+        transport=direct,
+        browser_transport=browser,
+        retry_policy=RetryPolicy(max_attempts=1),
+    ).fetch("fixtures", event_id=14025013)
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.payload["event"]["id"] == 14025013
+    assert result.metadata["browser_fallback_used"] is True
+    assert result.metadata["direct_http_status"] == 403
+    assert result.metadata["transport_implementation"] == "MappingTransport"
+    assert len(browser.urls) == 1
+
+
+def test_sofascore_uses_browser_transport_after_local_socket_denial():
+    direct = SequenceTransport([PermissionError(13, "socket denied", None, 10013)])
+    browser = MappingTransport({"/event/14025013": _event()})
+
+    result = SofascoreSourceAdapter(
+        transport=direct,
+        browser_transport=browser,
+        retry_policy=RetryPolicy(max_attempts=1),
+    ).fetch("fixtures", event_id=14025013)
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.metadata["browser_fallback_used"] is True
+    assert result.metadata["direct_failure_class"] == "LOCAL_SOCKET_DENIED"
+
+
+def test_sofascore_resolves_dynamic_season_schedule_after_date_endpoint_denial():
+    event = _event()
+    event["event"].update(
+        {
+            "id": 16363633,
+            "startTimestamp": 1790899200,
+            "season": {"id": 96668, "name": "Premier League 26/27", "year": "26/27"},
+        }
+    )
+    direct = SequenceTransport([HttpResponse(403, b"blocked", {})])
+    browser = MappingTransport(
+        {
+            "/scheduled-events/2026-10-02": HttpResponse(403, b"blocked", {}),
+            "/unique-tournament/17/seasons": {
+                "seasons": [{"id": 96668, "name": "Premier League 26/27", "year": "26/27"}]
+            },
+            "/unique-tournament/17/season/96668/events/next/0": {"events": [event["event"]]},
+        }
+    )
+
+    result = SofascoreSourceAdapter(
+        transport=direct,
+        browser_transport=browser,
+        retry_policy=RetryPolicy(max_attempts=1),
+    ).fetch("fixtures", league="eng.1", date="20261002")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.integration == "browser-selenium-json"
+    assert result.payload["events"][0]["id"] == 16363633
+    assert result.metadata["schedule_route"] == "tournament-next"
+    assert result.metadata["season_id"] == "96668"
+    assert result.metadata["tournament_id"] == "17"
