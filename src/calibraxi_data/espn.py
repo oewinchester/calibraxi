@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from .contracts import CapabilityState, EntityType, SourceResult, SourceIdentity
-from .http_json import HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
+from .http_json import HttpTransport, RetryPolicy, UrllibTransport, failure_metadata, request_metadata, request_with_retry, sanitize_endpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +47,7 @@ class EspnSourceAdapter:
     ) -> None:
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
-        self._retry_policy = retry_policy or RetryPolicy()
+        self._retry_policy = retry_policy or RetryPolicy(jitter_ratio=0.2)
         self._sleep = sleep or time.sleep
 
     def fetch(self, capability: str, **params: Any) -> SourceResult:
@@ -56,7 +56,7 @@ class EspnSourceAdapter:
         if endpoint is None:
             return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, adapter_version=self.adapter_version)
         url = f"{endpoint}?{urlencode(query)}" if query else endpoint
-        metadata: dict[str, Any] = {"url": url}
+        metadata: dict[str, Any] = {"url": sanitize_endpoint(url), "endpoint": sanitize_endpoint(url), "transport_implementation": type(self._transport).__name__}
         try:
             request = request_with_retry(
                 self._transport,
@@ -67,18 +67,22 @@ class EspnSourceAdapter:
                 sleep=self._sleep,
             )
         except Exception as exc:
+            metadata.update(failure_metadata(error=exc, endpoint=url, transport=self._transport))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), adapter_version=self.adapter_version, metadata=metadata)
-        metadata.update(request_metadata(request))
+        metadata.update(request_metadata(request, transport=self._transport, endpoint=url))
         if request.error is not None:
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(request.error), adapter_version=self.adapter_version, metadata=metadata)
         response = request.response
         if response is None:
+            metadata.update(failure_metadata(error=RuntimeError("transport returned no response"), endpoint=url, transport=self._transport, attempts=request.attempts))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error="transport returned no response", adapter_version=self.adapter_version, metadata=metadata)
         if response.status < 200 or response.status >= 300:
+            metadata.update(failure_metadata(http_status=response.status, endpoint=url, transport=self._transport, attempts=request.attempts))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", adapter_version=self.adapter_version, metadata=metadata)
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            metadata.update(failure_metadata(error=exc, http_status=response.status, endpoint=url, transport=self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", adapter_version=self.adapter_version, metadata=metadata)
         source_observed_at = _payload_timestamp(payload, "lastUpdatedAt", "lastUpdated", "updatedAt")
         if source_observed_at is not None:

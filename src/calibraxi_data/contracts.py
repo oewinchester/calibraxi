@@ -25,6 +25,24 @@ class HealthState(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class FailureClass(StrEnum):
+    DNS_FAILURE = "DNS_FAILURE"
+    TCP_CONNECT_FAILURE = "TCP_CONNECT_FAILURE"
+    LOCAL_SOCKET_DENIED = "LOCAL_SOCKET_DENIED"
+    TLS_FAILURE = "TLS_FAILURE"
+    PROXY_FAILURE = "PROXY_FAILURE"
+    HTTP_4XX = "HTTP_4XX"
+    HTTP_429 = "HTTP_429"
+    HTTP_5XX = "HTTP_5XX"
+    EMPTY_RESPONSE = "EMPTY_RESPONSE"
+    TRANSPORT_LIBRARY_FAILURE = "TRANSPORT_LIBRARY_FAILURE"
+    PARSER_SCHEMA_DRIFT = "PARSER_SCHEMA_DRIFT"
+    PROVIDER_MAPPING_MISSING = "PROVIDER_MAPPING_MISSING"
+    TIMEOUT = "TIMEOUT"
+    CIRCUIT_OPEN = "CIRCUIT_OPEN"
+    UNKNOWN = "UNKNOWN"
+
+
 class IngestionRunStatus(StrEnum):
     STARTED = "started"
     EVIDENCE_STORED = "evidence_stored"
@@ -147,6 +165,14 @@ class SourceHealthSignal:
     latency_ms: int | None = None
     source_observed_at: datetime | None = None
     error: str | None = None
+    failure_class: str | None = None
+    exception_type: str | None = None
+    http_status: int | None = None
+    endpoint: str | None = None
+    attempt_count: int = 1
+    first_failure_at: datetime | None = None
+    retryable: bool = False
+    transport_implementation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +198,15 @@ class SourceCapabilityHealthSnapshot:
     mapping_failure_count: int = 0
     last_source_observed_at: datetime | None = None
     freshness_seconds: float | None = None
+    failure_class_counts: Mapping[str, int] = field(default_factory=dict)
+    last_failure_class: str | None = None
+    last_exception_type: str | None = None
+    last_http_status: int | None = None
+    last_endpoint: str | None = None
+    last_attempt_count: int = 1
+    first_failure_at: datetime | None = None
+    last_retryable: bool = False
+    last_transport_implementation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

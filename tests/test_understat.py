@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calibraxi_data import CapabilityState, EntityType
 from calibraxi_data.http_json import HttpResponse, RetryPolicy
-from calibraxi_data.understat import UnderstatObservationParser, UnderstatSourceAdapter
+from calibraxi_data.understat import UnderstatObservationParser, UnderstatSourceAdapter, validate_understat_payload
 
 
 class _Transport:
@@ -83,6 +83,27 @@ def test_understat_retries_rate_limit_and_classifies_schema_drift():
 
     malformed = UnderstatSourceAdapter(transport=_Transport([_response("<html>no data</html>")])).fetch("xg", event_id="u-1")
     assert malformed.state is CapabilityState.PARSER_SCHEMA_DRIFT
+
+
+def test_understat_challenge_is_explicit_access_control_schema_boundary():
+    challenge = "<html><title>Just a moment...</title><script>cloudflare</script></html>"
+    result = UnderstatSourceAdapter(transport=_Transport([_response(challenge)])).fetch("xg", event_id="u-1")
+
+    assert result.state is CapabilityState.PARSER_SCHEMA_DRIFT
+    assert result.http_status == 200
+    assert result.metadata["provider_challenge"] is True
+    assert result.metadata["access_control_state"] == "CHALLENGE"
+    assert result.metadata["response_bytes"] == len(challenge.encode("utf-8"))
+    assert "raw_html" not in result.metadata
+
+
+def test_understat_preflight_validator_rejects_challenge_without_page_content():
+    try:
+        validate_understat_payload(b"<html>cloudflare challenge</html>")
+    except ValueError as exc:
+        assert getattr(exc, "details")["provider_challenge"] is True
+    else:
+        raise AssertionError("challenge page must not be accepted as a payload")
 
 
 def test_understat_fixture_page_uses_epl_slug_and_parses_dates_data():

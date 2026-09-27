@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Protocol
 
 from .capabilities import CapabilityRegistry
-from .contracts import CapabilityState, RawEvidence, SourceResult
+from .connectivity import CircuitOpenError, SourceCircuit, classify_failure
+from .contracts import CapabilityState, FailureClass, RawEvidence, SourceResult
 from .evidence import RawEvidenceStore
 from .fixture_identity import FixtureIdentityIndex
 
@@ -57,12 +58,30 @@ class AcquisitionCoordinator:
         evidence_store: RawEvidenceStore,
         validation_handoff: Callable[[AcquisitionResult], None] | None = None,
         fixture_identity_index: FixtureIdentityIndex | None = None,
+        circuits: Mapping[tuple[str, str], SourceCircuit] | None = None,
+        circuit_failure_threshold: int = 3,
+        circuit_cooldown: timedelta = timedelta(minutes=2),
     ) -> None:
         self._registry = registry
         self._adapters = dict(adapters)
         self._evidence_store = evidence_store
         self._validation_handoff = validation_handoff
         self._fixture_identity_index = fixture_identity_index
+        self._circuits = dict(circuits or {})
+        self._circuit_failure_threshold = circuit_failure_threshold
+        self._circuit_cooldown = circuit_cooldown
+
+    def circuit_for(self, capability: str, source: str) -> SourceCircuit:
+        key = (capability, source)
+        circuit = self._circuits.get(key)
+        if circuit is None:
+            circuit = SourceCircuit(
+                f"{source}:{capability}",
+                failure_threshold=self._circuit_failure_threshold,
+                cooldown=self._circuit_cooldown,
+            )
+            self._circuits[key] = circuit
+        return circuit
 
     def acquire(
         self,
@@ -83,11 +102,56 @@ class AcquisitionCoordinator:
                 capability=capability,
                 params=request_params,
             )
-            result = (
-                SourceResult(CapabilityState.SOURCE_FAILED, source, capability, error=translation_error)
-                if translation_error is not None
-                else self._fetch(source, capability, source_params)
-            )
+            circuit = self.circuit_for(capability, source)
+            try:
+                circuit.before_request()
+            except CircuitOpenError as exc:
+                result = SourceResult(
+                    CapabilityState.SOURCE_FAILED,
+                    source,
+                    capability,
+                    error=str(exc),
+                    metadata={
+                        "failure_class": FailureClass.CIRCUIT_OPEN.value,
+                        "exception_type": type(exc).__name__,
+                        "attempt_count": 0,
+                        "retryable": False,
+                        "circuit_state": circuit.state.value,
+                    },
+                )
+            else:
+                result = (
+                    SourceResult(
+                        CapabilityState.SOURCE_FAILED,
+                        source,
+                        capability,
+                        error=translation_error,
+                        metadata={
+                            "failure_class": FailureClass.PROVIDER_MAPPING_MISSING.value,
+                            "exception_type": "ProviderMappingError",
+                            "attempt_count": 0,
+                            "retryable": False,
+                            "endpoint": None,
+                            "transport_implementation": None,
+                        },
+                    )
+                    if translation_error is not None
+                    else self._fetch(source, capability, source_params)
+                )
+                if result.state is not CapabilityState.SUPPORTED or result.metadata:
+                    result = self._with_circuit_metadata(result, circuit)
+                classification = classify_failure(
+                    result.error and RuntimeError(result.error),
+                    http_status=result.http_status,
+                    parser_error=result.state is CapabilityState.PARSER_SCHEMA_DRIFT,
+                    mapping_error=bool(result.metadata.get("failure_class") == FailureClass.PROVIDER_MAPPING_MISSING.value),
+                )
+                if result.state is CapabilityState.SUPPORTED:
+                    circuit.record_success()
+                elif result.state is CapabilityState.SOURCE_FAILED:
+                    circuit.record_failure(retryable=bool(result.metadata.get("retryable", classification.retryable)))
+                if result.state is not CapabilityState.SUPPORTED or result.metadata:
+                    result = self._with_circuit_metadata(result, circuit)
             # Preserve the exact target-provider identifier selected by the
             # governed translation layer on the attempt.  Downstream parsers
             # must use this ID when a fallback source is selected; the
@@ -107,7 +171,13 @@ class AcquisitionCoordinator:
                         error=f"acceptance validation failed: {exc}",
                         integration=result.integration,
                         adapter_version=result.adapter_version,
-                        metadata=result.metadata,
+                        metadata={
+                            **dict(result.metadata),
+                            "failure_class": FailureClass.PARSER_SCHEMA_DRIFT.value,
+                            "exception_type": type(exc).__name__,
+                            "attempt_count": int(result.metadata.get("attempt_count", 1) or 1),
+                            "retryable": False,
+                        },
                     )
                 if not accepted and result.state is CapabilityState.SUPPORTED:
                     result = SourceResult(
@@ -227,6 +297,12 @@ class AcquisitionCoordinator:
                 source=source,
                 capability=capability,
                 error="adapter is not configured",
+                metadata={
+                    "failure_class": FailureClass.TRANSPORT_LIBRARY_FAILURE.value,
+                    "exception_type": "AdapterNotConfigured",
+                    "attempt_count": 0,
+                    "retryable": False,
+                },
             )
         try:
             result = adapter.fetch(capability, **params)
@@ -236,6 +312,12 @@ class AcquisitionCoordinator:
                 source=source,
                 capability=capability,
                 error=str(exc),
+                metadata={
+                    "failure_class": classify_failure(exc).failure_class.value,
+                    "exception_type": type(exc).__name__,
+                    "attempt_count": 1,
+                    "retryable": classify_failure(exc).retryable,
+                },
             )
         if result.source != source:
             return SourceResult(
@@ -243,8 +325,23 @@ class AcquisitionCoordinator:
                 source=source,
                 capability=capability,
                 error=f"adapter source mismatch: result={result.source!r}",
+                metadata={
+                    **dict(result.metadata),
+                    "failure_class": FailureClass.TRANSPORT_LIBRARY_FAILURE.value,
+                    "exception_type": "AdapterSourceMismatch",
+                    "attempt_count": int(result.metadata.get("attempt_count", 1) or 1),
+                    "retryable": False,
+                },
             )
         return result
+
+    @staticmethod
+    def _with_circuit_metadata(result: SourceResult, circuit: SourceCircuit) -> SourceResult:
+        metadata = dict(result.metadata)
+        metadata.setdefault("circuit_key", circuit.key)
+        metadata["circuit_state"] = circuit.state.value
+        metadata.setdefault("circuit_failure_count", circuit.failure_count)
+        return replace(result, metadata=metadata)
 
     def _capture_evidence(
         self,

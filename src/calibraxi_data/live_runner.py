@@ -21,6 +21,7 @@ from uuid import uuid4
 from .acquisition import AcquisitionAttempt, AcquisitionResult
 from .bootstrap import canonical_fixture_id, canonical_team_id
 from .contracts import CapabilityState, EntityType, SourceResult
+from .connectivity import classify_freshness
 from .espn import EspnObservationParser, SourceObservation
 from .sofascore import SofascoreObservationParser
 from .operations import OperationalRecorder
@@ -146,6 +147,152 @@ class SettlementResult:
     skipped_count: int = 0
 
 
+class WorkerLeaseGuard:
+    """Renewable process lease for one unattended worker identity.
+
+    Durable stores own the compare-and-swap semantics.  This guard only
+    supplies a stable token, lease timestamps, and a small context-manager
+    boundary so a second process cannot start competing work accidentally.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        lease_key: str,
+        *,
+        token: str | None = None,
+        clock: Callable[[], datetime] | None = None,
+        lease_for: timedelta = timedelta(minutes=5),
+    ) -> None:
+        if lease_for <= timedelta(0):
+            raise ValueError("lease_for must be positive")
+        self.store = store
+        self.lease_key = str(lease_key)
+        self.token = token or f"worker-{uuid4()}"
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.lease_for = lease_for
+        self._lease_until: datetime | None = None
+        self._acquired = False
+
+    @property
+    def acquired(self) -> bool:
+        return self._acquired
+
+    @property
+    def lease_until(self) -> datetime | None:
+        return self._lease_until
+
+    def acquire(self) -> bool:
+        """Attempt to claim or reclaim the durable lease."""
+
+        now = _utc(self.clock(), "worker_lease_now")
+        lease_until = now + self.lease_for
+        claimed = bool(
+            self.store.claim_worker_lease(
+                self.lease_key,
+                token=self.token,
+                lease_until=lease_until,
+            )
+        )
+        self._acquired = claimed
+        self._lease_until = lease_until if claimed else None
+        return claimed
+
+    def renew(self) -> bool:
+        """Extend an owned lease, returning ``False`` if ownership was lost."""
+
+        if not self._acquired:
+            return False
+        return self.acquire()
+
+    def release(self) -> None:
+        """Release only this guard's token; other workers remain untouched."""
+
+        if self._acquired:
+            self.store.release_worker_lease(self.lease_key, token=self.token)
+        self._acquired = False
+        self._lease_until = None
+
+    def __enter__(self) -> "WorkerLeaseGuard":
+        if not self.acquire():
+            raise RuntimeError(f"worker lease is already held: {self.lease_key}")
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.release()
+
+
+def forecast_evolution_measurements(
+    forecasts: Iterable[ShadowForecast],
+) -> tuple[dict[str, Any], ...]:
+    """Return immutable-per-run movement measurements for shadow forecasts.
+
+    The rows are derived from each persisted forecast and are intentionally
+    separate from forecast storage, recommendation logic, and model selection.
+    They make horizon-to-horizon probability, entropy, and source coverage
+    movement queryable without rewriting an earlier run.
+    """
+
+    horizon_order = {
+        Horizon.FIXTURE_FIRST_OBSERVED: -1,
+        Horizon.T_72H: 0,
+        Horizon.T_24H: 1,
+        Horizon.T_6H: 2,
+        Horizon.T_1H: 3,
+        Horizon.T_15M: 4,
+        Horizon.EVENT: 5,
+    }
+    ordered = sorted(
+        tuple(forecasts),
+        key=lambda item: (
+            item.fixture_id,
+            item.model_family,
+            item.model_version,
+            item.created_at,
+            horizon_order.get(Horizon.parse(item.horizon), 99),
+            item.run_id,
+        ),
+    )
+    previous: dict[tuple[str, str, str], dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    for forecast in ordered:
+        distribution = forecast.evaluated_distribution
+        probability_home, probability_draw, probability_away = distribution.outcome_probabilities()
+        probabilities = (probability_home, probability_draw, probability_away)
+        entropy = -sum(
+            probability * math.log(max(probability, 1e-15))
+            for probability in probabilities
+            if probability > 0.0
+        )
+        lineage = dict(forecast.source_lineage)
+        coverage_value = lineage.get("source_coverage", {})
+        source_coverage = dict(coverage_value) if isinstance(coverage_value, Mapping) else {}
+        key = (forecast.fixture_id, forecast.model_family, forecast.model_version)
+        prior = previous.get(key)
+        row: dict[str, Any] = {
+            "fixture_id": forecast.fixture_id,
+            "run_id": forecast.run_id,
+            "model_family": forecast.model_family,
+            "model_version": forecast.model_version,
+            "horizon": Horizon.parse(forecast.horizon).value,
+            "created_at": forecast.created_at,
+            "probability_home": probability_home,
+            "probability_draw": probability_draw,
+            "probability_away": probability_away,
+            "entropy": entropy,
+            "source_coverage": source_coverage,
+            "evidence_count": len(forecast.evidence_ids),
+            "previous_run_id": prior["run_id"] if prior else None,
+            "probability_delta_home": probability_home - prior["probability_home"] if prior else None,
+            "probability_delta_draw": probability_draw - prior["probability_draw"] if prior else None,
+            "probability_delta_away": probability_away - prior["probability_away"] if prior else None,
+            "entropy_delta": entropy - prior["entropy"] if prior else None,
+        }
+        rows.append(row)
+        previous[key] = row
+    return tuple(rows)
+
+
 class LiveShadowRunner:
     """Coordinate true-PIT collection and immutable shadow artifacts."""
 
@@ -246,6 +393,8 @@ class LiveShadowRunner:
         feature_schema_version: str = "features-v3-prospective",
         historical_feature_schema_version: str = "features-v2-real-pit-r2",
         clock: Callable[[], datetime] | None = None,
+        worker_lease_store: Any | None = None,
+        preflight_fn: Callable[[], Any] | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.fixture_identity_index = fixture_identity_index
@@ -266,6 +415,8 @@ class LiveShadowRunner:
         self.reliability_store = reliability_store or FileReliabilityReportStore("temp/live-shadow")
         self.monitoring_store = monitoring_store or FileMonitoringReportStore("temp/live-shadow")
         self.operations = operations
+        self.worker_lease_store = worker_lease_store
+        self._preflight_fn = preflight_fn
         self.scheduler = ObservationHorizonScheduler(self.task_store)
         self.historical_records = tuple(historical_records)
         self.training_examples = tuple(training_examples)
@@ -274,6 +425,11 @@ class LiveShadowRunner:
         self.feature_builder = FeatureSnapshotBuilder(feature_schema_version=historical_feature_schema_version)
         self.prospective_builder = ProspectiveFeatureSnapshotBuilder(feature_schema_version=feature_schema_version)
         self.clock = clock or (lambda: datetime.now(UTC))
+
+    def preflight(self) -> Any:
+        """Run the configured read-only startup diagnostics, if any."""
+
+        return self._preflight_fn() if self._preflight_fn is not None else ()
 
     def discover_upcoming(self, dates: Iterable[str], *, now: datetime | None = None) -> DiscoveryResult:
         """Acquire qualified fixture schedules and create immutable first-seen evidence."""
@@ -546,7 +702,7 @@ class LiveShadowRunner:
                 key=lambda item: (item.knowledge_at, item.entry_id),
             )
             for entry in candidates:
-                known = self._fixture_as_known_at_entry(projection, entry)
+                known = self._fixture_as_known_at_entry(projection, entry, now=current)
                 if known is None or known.kickoff_at.strftime("%Y%m%d") != schedule_date:
                     continue
                 if known.kickoff_at < current or known.completed:
@@ -873,29 +1029,69 @@ class LiveShadowRunner:
         return CollectionResult(fixture.fixture_id, capability, ObservationState.SUCCESS, tuple(item.entry_id for item in entries), tuple(item.evidence_id for item in entries if item.evidence_id), max(item.knowledge_at for item in entries))
 
     def settle_completed(self, *, now: datetime | None = None) -> SettlementResult:
+        return self._settle_completed_for_population(
+            now=now,
+            population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT,
+            population=_prospective_track_record_population(),
+        )
+
+    def settle_operational_probe(self, *, now: datetime | None = None) -> SettlementResult:
+        """Exercise the production settlement path in the isolated smoke population."""
+
+        return self._settle_completed_for_population(
+            now=now,
+            population_kind=PopulationKind.TEST_SMOKE,
+            population=TrackRecordPopulation(
+                "operational-settlement-probe-v1",
+                PopulationKind.TEST_SMOKE,
+                "settlement-probe-v1",
+                "Isolated completed-fixture settlement readiness probe",
+            ),
+        )
+
+    def _settle_completed_for_population(
+        self,
+        *,
+        now: datetime | None,
+        population_kind: PopulationKind,
+        population: TrackRecordPopulation,
+    ) -> SettlementResult:
         current = _utc(now or self.clock(), "now")
-        completed = self._completed_results(as_of=current)
+        completed = self._completed_results(as_of=current, population_kind=population_kind)
         settled = 0
         corrections = 0
         skipped = 0
-        population = _prospective_track_record_population()
         tracked_settlements = {
             item.settlement_id
             for item in self.track_record_store.list(
-                population_id=PROSPECTIVE_TRUE_PIT_POPULATION_ID,
-                kind=PopulationKind.PROSPECTIVE_TRUE_PIT,
+                population_id=population.population_id,
+                kind=population_kind,
             )
         }
-        forecasts = self.forecast_store.list()
+        try:
+            forecasts = self.forecast_store.list(population_kind=population_kind)
+        except TypeError:
+            forecasts = self.forecast_store.list()
         for forecast in forecasts:
-            if not self._is_prospective_forecast_as_of(forecast, current):
+            if population_kind is PopulationKind.PROSPECTIVE_TRUE_PIT:
+                eligible = self._is_prospective_forecast_as_of(forecast, current)
+            else:
+                eligible = self._is_probe_forecast_as_of(forecast, current)
+            if not eligible:
                 skipped += 1
                 continue
             result = completed.get(forecast.fixture_id)
             if result is None or forecast.kickoff_at > current:
                 skipped += 1
                 continue
-            latest = self.settlement_store.latest(forecast.run_id)
+            try:
+                settlements = self.settlement_store.list(
+                    forecast_run_id=forecast.run_id,
+                    population_kind=population_kind,
+                )
+            except TypeError:
+                settlements = self.settlement_store.list(forecast_run_id=forecast.run_id)
+            latest = settlements[-1] if settlements else None
             if latest is not None and latest.final_home_goals == result[0] and latest.final_away_goals == result[1]:
                 settlement = latest
             else:
@@ -924,6 +1120,22 @@ class LiveShadowRunner:
             self.track_record_store.save(entry)
             tracked_settlements.add(settlement.settlement_id)
         return SettlementResult(settled, corrections, skipped)
+
+    @staticmethod
+    def _is_probe_forecast_as_of(forecast: ShadowForecast, cutoff: datetime) -> bool:
+        """Apply chronology checks without granting the probe TRUE-PIT status."""
+
+        return bool(
+            forecast.persisted_at is not None
+            and forecast.prediction_cutoff_at is not None
+            and forecast.prediction_cutoff_at < forecast.kickoff_at
+            and forecast.persisted_at < forecast.kickoff_at
+            and forecast.persisted_at <= forecast.prediction_cutoff_at
+            and forecast.created_at <= forecast.prediction_cutoff_at
+            and forecast.knowledge_at <= forecast.cutoff_at
+            and forecast.persisted_at <= cutoff
+            and forecast.prediction_cutoff_at <= cutoff
+        )
 
     def refresh_reliability(self, *, generated_at: datetime | None = None, minimum_sample: int = 30, provisional_sample: int = 100) -> int:
         """Persist reliability state, including explicit zero-sample groups."""
@@ -1769,6 +1981,15 @@ class LiveShadowRunner:
             knowledge_at=knowledge_at,
             source=observation.source_identity.source,
             updated_at=knowledge_at,
+            provenance="fresh_live_source",
+            freshness=classify_freshness(
+                kickoff=kickoff,
+                last_success_at=knowledge_at,
+                now=now,
+                live_success=True,
+            ),
+            live_source_success=True,
+            cached_fallback_used=False,
         )
 
     def _update_fixture_from_entries(self, fixture: LiveFixture, entries: Sequence[KnowledgeLedgerEntry], *, current: datetime) -> None:
@@ -1890,7 +2111,12 @@ class LiveShadowRunner:
         return count
 
     @staticmethod
-    def _fixture_as_known_at_entry(fixture: LiveFixture, entry: KnowledgeLedgerEntry) -> LiveFixture | None:
+    def _fixture_as_known_at_entry(
+        fixture: LiveFixture,
+        entry: KnowledgeLedgerEntry,
+        *,
+        now: datetime | None = None,
+    ) -> LiveFixture | None:
         payload = dict(entry.payload)
         kickoff = payload.get("kickoff_at")
         if isinstance(kickoff, str):
@@ -1916,6 +2142,15 @@ class LiveShadowRunner:
                 "knowledge_at": entry.knowledge_at,
                 "source": entry.source,
                 "updated_at": entry.knowledge_at,
+                "provenance": "cached_revisioned_fixture",
+                "freshness": classify_freshness(
+                    kickoff=kickoff,
+                    last_success_at=entry.knowledge_at,
+                    now=_utc(now or fixture.updated_at, "now"),
+                    live_success=False,
+                ),
+                "live_source_success": False,
+                "cached_fallback_used": True,
             }
         )
         return LiveFixture.from_dict(values)
@@ -2100,11 +2335,20 @@ class LiveShadowRunner:
             "update_reason": "historical_training_state_before_prospective_fixture",
         }
 
-    def _completed_results(self, *, as_of: datetime) -> dict[str, tuple[int, int, tuple[str, ...], datetime]]:
+    def _completed_results(
+        self,
+        *,
+        as_of: datetime,
+        population_kind: PopulationKind = PopulationKind.PROSPECTIVE_TRUE_PIT,
+    ) -> dict[str, tuple[int, int, tuple[str, ...], datetime]]:
         current = _utc(as_of, "as_of")
         results: dict[str, tuple[int, int, tuple[str, ...], datetime]] = {}
         result_times: dict[str, datetime] = {}
-        for fixture in self.fixture_store.list():
+        try:
+            fixtures = self.fixture_store.list(population_kind=population_kind)
+        except TypeError:
+            fixtures = self.fixture_store.list()
+        for fixture in fixtures:
             # An updated projection is not evidence that the final result was
             # known. Keep fixture-store results out unless their source
             # knowledge time is explicit; a ledger result can still qualify
@@ -2114,7 +2358,11 @@ class LiveShadowRunner:
                 if known_at <= current:
                     results[fixture.fixture_id] = (fixture.home_goals or 0, fixture.away_goals or 0, fixture.evidence_ids, known_at)
                     result_times[fixture.fixture_id] = known_at
-        for entry in self.ledger.list():
+        try:
+            ledger_entries = self.ledger.list(population_kind=population_kind)
+        except TypeError:
+            ledger_entries = self.ledger.list()
+        for entry in ledger_entries:
             if entry.state is not ObservationState.SUCCESS or entry.knowledge_at > current:
                 continue
             payload = dict(entry.payload)
@@ -2158,4 +2406,6 @@ __all__ = [
     "LiveShadowRunner",
     "SettlementResult",
     "ShadowCycleResult",
+    "WorkerLeaseGuard",
+    "forecast_evolution_measurements",
 ]

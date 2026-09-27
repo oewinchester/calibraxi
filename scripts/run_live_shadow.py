@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 
@@ -61,16 +62,110 @@ def run_forever(
     clock: Callable[[], datetime] | None = None,
     on_cycle: Callable[[Mapping[str, Any]], None] | None = None,
     on_error: Callable[[Exception], None] | None = None,
+    stop_file: str | os.PathLike[str] | None = None,
 ) -> int:
-    """Run restart-safe cycles until interrupted or ``once`` is requested."""
+    """Run the worker with startup diagnostics and an optional durable lease."""
+
+    lease_store = getattr(runner, "worker_lease_store", None)
+    guard = None
+    if lease_store is not None:
+        # Import lazily so the CLI remains usable with lightweight injected
+        # runners and so lease composition stays outside model code.
+        from calibraxi_data.live_runner import WorkerLeaseGuard
+
+        guard = WorkerLeaseGuard(
+            lease_store,
+            os.environ.get("CALIBRAXI_WORKER_LEASE_KEY", "live-shadow"),
+            clock=clock,
+        )
+        if not guard.acquire():
+            LOGGER.error("live shadow worker lease is already held", extra={"lease_key": guard.lease_key})
+            return 2
+
+    try:
+        startup_preflight = getattr(runner, "preflight", None)
+        if callable(startup_preflight):
+            try:
+                reports = startup_preflight()
+                LOGGER.info("live shadow startup preflight: %s", reports)
+            except Exception:
+                # Diagnostics are read-only and must not prevent the worker
+                # from retaining fallback resilience during a probe outage.
+                LOGGER.exception("live shadow startup preflight failed")
+
+        wrapped_on_cycle = on_cycle
+        if guard is not None:
+            def wrapped_on_cycle(result: Mapping[str, Any]) -> None:
+                if on_cycle is not None:
+                    on_cycle(result)
+                if not guard.renew():
+                    raise RuntimeError(f"worker lease lost: {guard.lease_key}")
+
+        return _run_forever(
+            runner,
+            dates_provider,
+            interval_seconds=interval_seconds,
+            discovery_interval_seconds=discovery_interval_seconds,
+            once=once,
+            sleep=sleep,
+            clock=clock,
+            on_cycle=wrapped_on_cycle,
+            on_error=on_error,
+            stop_file=stop_file,
+        )
+    finally:
+        if guard is not None:
+            guard.release()
+
+
+def _run_forever(
+    runner: Any,
+    dates_provider: Callable[[], Iterable[str]],
+    *,
+    interval_seconds: float = 60.0,
+    discovery_interval_seconds: float = 6 * 60 * 60,
+    once: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], datetime] | None = None,
+    on_cycle: Callable[[Mapping[str, Any]], None] | None = None,
+    on_error: Callable[[Exception], None] | None = None,
+    stop_file: str | os.PathLike[str] | None = None,
+) -> int:
+    """Run restart-safe cycles until interrupted, stopped, or ``once`` is requested.
+
+    ``stop_file`` is a small local-process control plane for unattended hosts
+    such as Windows Task Scheduler.  The worker checks it between cycles and
+    exits cleanly with status zero; it never changes persisted forecast state.
+    """
 
     if interval_seconds < 0:
         raise ValueError("interval_seconds cannot be negative")
     if discovery_interval_seconds <= 0:
         raise ValueError("discovery_interval_seconds must be positive")
     current_time = clock or (lambda: datetime.now(UTC))
+    stop_path = Path(stop_file) if stop_file else None
     next_discovery_at: datetime | None = None
+
+    def stop_requested() -> bool:
+        return stop_path is not None and stop_path.exists()
+
+    def wait_until_next_cycle() -> bool:
+        if stop_path is None:
+            sleep(interval_seconds)
+            return False
+        remaining = interval_seconds
+        while remaining > 0:
+            if stop_requested():
+                return True
+            portion = min(1.0, remaining)
+            sleep(portion)
+            remaining -= portion
+        return stop_requested()
+
     while True:
+        if stop_requested():
+            LOGGER.info("live shadow stop requested", extra={"stop_file": str(stop_path)})
+            return 0
         current = current_time().astimezone(UTC)
         discovery_due = next_discovery_at is None or current >= next_discovery_at
         try:
@@ -83,7 +178,9 @@ def run_forever(
                 return 1
             if discovery_due:
                 next_discovery_at = current + timedelta(seconds=min(discovery_interval_seconds, 300))
-            sleep(interval_seconds)
+            if wait_until_next_cycle():
+                LOGGER.info("live shadow stop requested", extra={"stop_file": str(stop_path)})
+                return 0
             continue
         if discovery_due:
             delay = min(discovery_interval_seconds, 300) if result["failed_dates"] else discovery_interval_seconds
@@ -94,7 +191,12 @@ def run_forever(
             LOGGER.info("live shadow cycle: %s", result)
         if once:
             return 1 if result["failed_dates"] else 0
-        sleep(interval_seconds)
+        if stop_requested():
+            LOGGER.info("live shadow stop requested", extra={"stop_file": str(stop_path)})
+            return 0
+        if wait_until_next_cycle():
+            LOGGER.info("live shadow stop requested", extra={"stop_file": str(stop_path)})
+            return 0
 
 
 def _load_factory(specification: str) -> Any:
@@ -128,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         help="configured runner factory; defaults to the built-in PostgreSQL/MinIO runner",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--stop-file", help="exit cleanly between cycles when this local file exists")
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     runner = _load_factory(args.runner_factory)
@@ -138,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         interval_seconds=args.interval_seconds,
         discovery_interval_seconds=args.discovery_interval_seconds,
         once=args.once,
+        stop_file=args.stop_file,
     )
 
 

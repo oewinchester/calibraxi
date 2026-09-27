@@ -693,15 +693,23 @@ class LivePostgresStore:
     def _ledger_from_row(row: Any) -> KnowledgeLedgerEntry:
         # The population column is persisted for SQL-level isolation but is
         # intentionally not part of the legacy value object.  Resolve its
-        # effective kind from the fixture marker when reconstructing it.
+        # effective kind from the fixture marker when reconstructing it. The
+        # operational-probe marker lives in the immutable payload and must be
+        # restored as well, otherwise a PostgreSQL round trip changes the
+        # artifact identity and can admit probe rows into production reads.
         payload_index = -2 if len(row) >= 20 else 17
         created_index = -1
+        payload = row[payload_index]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        operational_probe = bool(payload.get("operational_probe")) if isinstance(payload, Mapping) else False
         return KnowledgeLedgerEntry(
             entry_id=row[0], source=row[1], capability=row[2], fixture_id=row[3],
             canonical_entity_id=row[4], provider_entity_id=row[5], source_observed_at=row[6],
             source_updated_at=row[7], available_at=row[8], knowledge_at=row[9], processing_at=row[10],
             evidence_id=row[11], parser_version=row[12], schema_version=row[13], horizon=row[14],
-            state=row[15], correction_of=row[16], payload=row[payload_index], created_at=row[created_index],
+            state=row[15], correction_of=row[16], payload=payload, operational_probe=operational_probe,
+            created_at=row[created_index],
         )
 
     def save_task(self, task: ObservationTask) -> ObservationTask:

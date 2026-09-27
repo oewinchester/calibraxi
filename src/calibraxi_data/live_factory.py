@@ -21,6 +21,7 @@ from .source_registry import default_source_manifests, qualified_capability_poli
 from .understat import UnderstatObservationParser, UnderstatSourceAdapter
 from .openfootball import OpenFootballObservationParser, OpenFootballSourceAdapter
 from .thesportsdb import TheSportsDbObservationParser, TheSportsDbSourceAdapter
+from .preflight import build_live_preflight
 
 
 LIVE_CAPABILITIES = frozenset(
@@ -78,15 +79,16 @@ def _compose_runner(
     canonical_store: Any | None = None,
     adapters: Mapping[str, Any] | None = None,
 ) -> LiveShadowRunner:
+    configured_adapters = dict(adapters or {
+        "espn": EspnSourceAdapter(),
+        "sofascore": SofascoreSourceAdapter(),
+        "understat": UnderstatSourceAdapter(),
+        "openfootball": OpenFootballSourceAdapter(),
+        "thesportsdb": TheSportsDbSourceAdapter(),
+    })
     coordinator = AcquisitionCoordinator(
         registry=registry,
-        adapters=dict(adapters or {
-            "espn": EspnSourceAdapter(),
-            "sofascore": SofascoreSourceAdapter(),
-            "understat": UnderstatSourceAdapter(),
-            "openfootball": OpenFootballSourceAdapter(),
-            "thesportsdb": TheSportsDbSourceAdapter(),
-        }),
+        adapters=configured_adapters,
         evidence_store=evidence_store,
         fixture_identity_index=fixture_identity_index,
     )
@@ -105,6 +107,8 @@ def _compose_runner(
         track_record_store=stores.track_record,
         reliability_store=stores.reliability,
         monitoring_store=stores.monitoring,
+        worker_lease_store=canonical_store,
+        preflight_fn=build_live_preflight(league="eng.1"),
         historical_records=population.records,
         training_examples=population.examples,
         parsers={

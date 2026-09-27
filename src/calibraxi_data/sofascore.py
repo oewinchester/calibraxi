@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 from .contracts import CapabilityState, EntityType, SourceIdentity, SourceResult
 from .espn import SourceObservation
-from .http_json import HttpResponse, HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
+from .http_json import HttpResponse, HttpTransport, RetryPolicy, UrllibTransport, failure_metadata, request_metadata, request_with_retry, sanitize_endpoint
 
 
 class _TlsRequestsTransport:
@@ -26,10 +26,11 @@ class _TlsRequestsTransport:
 
 
 def _default_transport() -> HttpTransport:
-    try:
-        return _TlsRequestsTransport()
-    except RuntimeError:
-        return UrllibTransport()
+    # Use the same ordinary TLS stack as the other providers.  The optional
+    # tls_requests wrapper previously converted a real provider response into
+    # synthetic HTTP 0 failures on this host.  It remains available only when
+    # an explicit transport is injected for a controlled test or deployment.
+    return UrllibTransport()
 
 
 class SofascoreSourceAdapter:
@@ -59,7 +60,7 @@ class SofascoreSourceAdapter:
     ) -> None:
         self._transport = transport or _default_transport()
         self._timeout = timeout
-        self._retry_policy = retry_policy or RetryPolicy()
+        self._retry_policy = retry_policy or RetryPolicy(jitter_ratio=0.2)
         self._sleep = sleep or time.sleep
 
     def fetch(self, capability: str, **params: Any) -> SourceResult:
@@ -91,7 +92,7 @@ class SofascoreSourceAdapter:
             return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, integration=self.integration_name, adapter_version=self.adapter_version)
         format_params = {"event_id": event_id, "tournament_id": params.get("tournament_id"), "season_id": params.get("season_id"), "round": params.get("round"), "date": schedule_date}
         url = f"{self._base}/{path.format(**format_params)}"
-        metadata = {"url": url, "event_id": str(event_id) if event_id is not None else None}
+        metadata = {"url": sanitize_endpoint(url), "endpoint": sanitize_endpoint(url), "event_id": str(event_id) if event_id is not None else None, "transport_implementation": type(self._transport).__name__}
         if schedule_date is not None:
             metadata.update({"schedule_date": schedule_date, "schedule_date_input": str(schedule_date_input)})
         try:
@@ -104,18 +105,22 @@ class SofascoreSourceAdapter:
                 sleep=self._sleep,
             )
         except Exception as exc:
+            metadata.update(failure_metadata(error=exc, endpoint=url, transport=self._transport))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(exc), integration=self.integration_name, adapter_version=self.adapter_version, metadata=metadata)
-        metadata.update(request_metadata(request))
+        metadata.update(request_metadata(request, transport=self._transport, endpoint=url))
         if request.error is not None:
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error=str(request.error), integration=self.integration_name, adapter_version=self.adapter_version, metadata=metadata)
         response = request.response
         if response is None:
+            metadata.update(failure_metadata(error=RuntimeError("transport returned no response"), endpoint=url, transport=self._transport, attempts=request.attempts))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, error="transport returned no response", integration=self.integration_name, adapter_version=self.adapter_version, metadata=metadata)
         if response.status < 200 or response.status >= 300:
+            metadata.update(failure_metadata(http_status=response.status, endpoint=url, transport=self._transport, attempts=request.attempts))
             return SourceResult(CapabilityState.SOURCE_FAILED, self.source_name, capability, http_status=response.status, error=f"HTTP {response.status}", integration=self.integration_name, adapter_version=self.adapter_version, metadata=metadata)
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            metadata.update(failure_metadata(error=exc, http_status=response.status, endpoint=url, transport=self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(CapabilityState.PARSER_SCHEMA_DRIFT, self.source_name, capability, http_status=response.status, error=f"malformed JSON: {exc}", integration=self.integration_name, adapter_version=self.adapter_version, metadata=metadata)
         if schedule_request:
             metadata.update({"tournament_id": str(params["tournament_id"]), "season_id": str(params["season_id"]), "round": int(params["round"])})

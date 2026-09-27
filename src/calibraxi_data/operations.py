@@ -118,6 +118,15 @@ class OperationalRecorder:
         rate_limit = _is_rate_limit(result.http_status, error)
         mapping_failure = _is_mapping_failure(error)
         source_observed_at = _source_observed_at(attempt)
+        metadata = dict(result.metadata or {})
+        failure_class = metadata.get("failure_class")
+        exception_type = metadata.get("exception_type")
+        http_status = metadata.get("http_status", result.http_status)
+        endpoint = metadata.get("endpoint") or metadata.get("url")
+        attempt_count = int(metadata.get("attempt_count", 1) or 1)
+        first_failure_at = _optional_datetime(metadata.get("first_failure_at"))
+        structured_retryable = bool(metadata.get("retryable", retryable))
+        transport_implementation = metadata.get("transport_implementation")
 
         if validation is not None and not validation.accepted:
             health = _health_for_validation(validation.state)
@@ -137,6 +146,14 @@ class OperationalRecorder:
                 latency_ms=latency_ms,
                 source_observed_at=source_observed_at,
                 error="; ".join(issue.message for issue in validation.issues) or error,
+                failure_class=failure_class,
+                exception_type=exception_type,
+                http_status=http_status,
+                endpoint=endpoint,
+                attempt_count=attempt_count,
+                first_failure_at=first_failure_at,
+                retryable=structured_retryable,
+                transport_implementation=transport_implementation,
             )
 
         if state is CapabilityState.SUPPORTED:
@@ -148,6 +165,13 @@ class OperationalRecorder:
                 success=True,
                 latency_ms=latency_ms,
                 source_observed_at=source_observed_at,
+                failure_class=failure_class,
+                exception_type=exception_type,
+                http_status=http_status,
+                endpoint=endpoint,
+                attempt_count=attempt_count,
+                retryable=structured_retryable,
+                transport_implementation=transport_implementation,
             )
 
         if state is CapabilityState.PARSER_SCHEMA_DRIFT:
@@ -173,6 +197,14 @@ class OperationalRecorder:
             latency_ms=latency_ms,
             source_observed_at=source_observed_at,
             error=error,
+            failure_class=failure_class,
+            exception_type=exception_type,
+            http_status=http_status,
+            endpoint=endpoint,
+            attempt_count=attempt_count,
+            first_failure_at=first_failure_at,
+            retryable=structured_retryable,
+            transport_implementation=transport_implementation,
         )
 
 
@@ -220,6 +252,17 @@ def _source_observed_at(attempt: AcquisitionAttempt) -> datetime | None:
     value = attempt.result.metadata.get("source_observed_at") if attempt.result.metadata else None
     if value is None and attempt.evidence is not None:
         value = attempt.evidence.observed_at
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _optional_datetime(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc)
     if isinstance(value, str):

@@ -201,6 +201,29 @@ def test_run_forever_discovery_cadence_does_not_skip_collection_cycles():
     ]
 
 
+def test_run_forever_honors_stop_file_between_cycles(tmp_path):
+    runner = FakeRunner()
+    stop_file = tmp_path / "live-shadow.stop"
+    sleeps = []
+
+    def request_stop(interval):
+        sleeps.append(interval)
+        stop_file.write_text("stop", encoding="utf-8")
+
+    status = run_forever(
+        runner,
+        lambda: ("20260926",),
+        interval_seconds=7,
+        stop_file=stop_file,
+        sleep=request_stop,
+        clock=lambda: datetime(2026, 9, 26, 12, tzinfo=UTC),
+    )
+
+    assert status == 0
+    assert sleeps == [1]
+    assert [call[0] for call in runner.calls] == ["discover", "cycle"]
+
+
 def test_main_defaults_to_builtin_live_runner_factory(monkeypatch):
     monkeypatch.delenv("CALIBRAXI_LIVE_RUNNER_FACTORY", raising=False)
     requested = []

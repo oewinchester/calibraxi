@@ -269,11 +269,14 @@ class FileSystemCanonicalStore:
         key = (signal.capability, signal.source)
         previous = self._health.get(key)
         now = datetime.now(timezone.utc)
+        failure_class_counts = dict(previous.failure_class_counts) if previous else {}
+        if signal.failure_class:
+            failure_class_counts[signal.failure_class] = failure_class_counts.get(signal.failure_class, 0) + 1
         snapshot = SourceCapabilityHealthSnapshot(
             capability=signal.capability,
             source=signal.source,
             health=signal.health,
-            attempt_count=(previous.attempt_count if previous else 0) + 1,
+            attempt_count=(previous.attempt_count if previous else 0) + max(1, signal.attempt_count),
             success_count=(previous.success_count if previous else 0) + int(signal.success),
             failure_count=(previous.failure_count if previous else 0) + int(signal.failure),
             schema_drift_count=(previous.schema_drift_count if previous else 0) + int(signal.schema_drift),
@@ -291,6 +294,15 @@ class FileSystemCanonicalStore:
             freshness_seconds=_freshness_seconds(signal.attempted_at, signal.source_observed_at) if signal.source_observed_at is not None else (previous.freshness_seconds if previous else None),
             last_error=signal.error if signal.error is not None else (None if signal.success else (previous.last_error if previous else None)),
             updated_at=now,
+            failure_class_counts=failure_class_counts,
+            last_failure_class=signal.failure_class if signal.failure else (previous.last_failure_class if previous else None),
+            last_exception_type=signal.exception_type if signal.failure else (previous.last_exception_type if previous else None),
+            last_http_status=signal.http_status if signal.failure else (previous.last_http_status if previous else None),
+            last_endpoint=signal.endpoint if signal.failure else (previous.last_endpoint if previous else None),
+            last_attempt_count=max(1, signal.attempt_count),
+            first_failure_at=signal.first_failure_at or (previous.first_failure_at if previous else None),
+            last_retryable=signal.retryable,
+            last_transport_implementation=signal.transport_implementation or (previous.last_transport_implementation if previous else None),
         )
         self._health[key] = snapshot
         self._flush()
@@ -450,6 +462,10 @@ class FileSystemCanonicalStore:
                 for field in ("last_attempt_at", "last_success_at", "last_failure_at", "updated_at"):
                     if item.get(field):
                         item[field] = datetime.fromisoformat(item[field])
+                for field in ("first_failure_at", "last_source_observed_at"):
+                    if item.get(field):
+                        item[field] = datetime.fromisoformat(item[field])
+                item["failure_class_counts"] = dict(item.get("failure_class_counts") or {})
                 self._health[(item["capability"], item["source"])] = SourceCapabilityHealthSnapshot(**item)
         leases_path = self.root / "worker-leases.json"
         if leases_path.exists():
@@ -610,6 +626,15 @@ class PostgresCanonicalStore:
             last_source_observed_at TIMESTAMPTZ,
             freshness_seconds DOUBLE PRECISION,
             last_error TEXT,
+            failure_class_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            last_failure_class TEXT,
+            last_exception_type TEXT,
+            last_http_status INTEGER,
+            last_endpoint TEXT,
+            last_attempt_count INTEGER NOT NULL DEFAULT 1,
+            first_failure_at TIMESTAMPTZ,
+            last_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+            last_transport_implementation TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (capability, source)
         )
@@ -620,7 +645,16 @@ class PostgresCanonicalStore:
             ADD COLUMN IF NOT EXISTS rate_limit_count INTEGER NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS mapping_failure_count INTEGER NOT NULL DEFAULT 0,
             ADD COLUMN IF NOT EXISTS last_source_observed_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS freshness_seconds DOUBLE PRECISION
+            ADD COLUMN IF NOT EXISTS freshness_seconds DOUBLE PRECISION,
+            ADD COLUMN IF NOT EXISTS failure_class_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            ADD COLUMN IF NOT EXISTS last_failure_class TEXT,
+            ADD COLUMN IF NOT EXISTS last_exception_type TEXT,
+            ADD COLUMN IF NOT EXISTS last_http_status INTEGER,
+            ADD COLUMN IF NOT EXISTS last_endpoint TEXT,
+            ADD COLUMN IF NOT EXISTS last_attempt_count INTEGER NOT NULL DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS first_failure_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS last_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS last_transport_implementation TEXT
         """,
         """
         CREATE TABLE IF NOT EXISTS ingestion_worker_leases (
@@ -1194,11 +1228,14 @@ class PostgresCanonicalStore:
                      schema_drift_count, empty_population_count, quarantine_count,
                      retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count,
                      last_attempt_at, last_success_at, last_failure_at, last_latency_ms,
-                     last_source_observed_at, freshness_seconds, last_error, updated_at)
-                VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     last_source_observed_at, freshness_seconds, last_error,
+                     failure_class_counts, last_failure_class, last_exception_type,
+                     last_http_status, last_endpoint, last_attempt_count, first_failure_at,
+                     last_retryable, last_transport_implementation, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (capability, source) DO UPDATE SET
                     health = EXCLUDED.health,
-                    attempt_count = source_capability_health.attempt_count + 1,
+                    attempt_count = source_capability_health.attempt_count + EXCLUDED.attempt_count,
                     success_count = source_capability_health.success_count + EXCLUDED.success_count,
                     failure_count = source_capability_health.failure_count + EXCLUDED.failure_count,
                     schema_drift_count = source_capability_health.schema_drift_count + EXCLUDED.schema_drift_count,
@@ -1215,14 +1252,26 @@ class PostgresCanonicalStore:
                     last_source_observed_at = COALESCE(EXCLUDED.last_source_observed_at, source_capability_health.last_source_observed_at),
                     freshness_seconds = COALESCE(EXCLUDED.freshness_seconds, source_capability_health.freshness_seconds),
                     last_error = CASE WHEN EXCLUDED.success_count > 0 THEN NULL ELSE COALESCE(EXCLUDED.last_error, source_capability_health.last_error) END,
+                    failure_class_counts = source_capability_health.failure_class_counts || EXCLUDED.failure_class_counts,
+                    last_failure_class = COALESCE(EXCLUDED.last_failure_class, source_capability_health.last_failure_class),
+                    last_exception_type = COALESCE(EXCLUDED.last_exception_type, source_capability_health.last_exception_type),
+                    last_http_status = COALESCE(EXCLUDED.last_http_status, source_capability_health.last_http_status),
+                    last_endpoint = COALESCE(EXCLUDED.last_endpoint, source_capability_health.last_endpoint),
+                    last_attempt_count = EXCLUDED.last_attempt_count,
+                    first_failure_at = COALESCE(source_capability_health.first_failure_at, EXCLUDED.first_failure_at),
+                    last_retryable = EXCLUDED.last_retryable,
+                    last_transport_implementation = COALESCE(EXCLUDED.last_transport_implementation, source_capability_health.last_transport_implementation),
                     updated_at = EXCLUDED.updated_at
                 RETURNING capability, source, health, attempt_count, success_count, failure_count,
                           schema_drift_count, empty_population_count, quarantine_count,
                           retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count,
                           last_attempt_at, last_success_at, last_failure_at, last_latency_ms,
-                          last_source_observed_at, freshness_seconds, last_error, updated_at
+                          last_source_observed_at, freshness_seconds, last_error, updated_at,
+                          failure_class_counts, last_failure_class, last_exception_type,
+                          last_http_status, last_endpoint, last_attempt_count, first_failure_at,
+                          last_retryable, last_transport_implementation
                 """,
-                (signal.capability, signal.source, signal.health.value, int(signal.success), int(signal.failure), int(signal.schema_drift), int(signal.empty_population), int(signal.quarantine), int(signal.retryable_failure), int(signal.timeout), int(signal.rate_limit), int(signal.mapping_failure), signal.attempted_at, signal.attempted_at if signal.success else None, signal.attempted_at if signal.failure else None, signal.latency_ms, signal.source_observed_at, _freshness_seconds(signal.attempted_at, signal.source_observed_at), signal.error, now),
+                (signal.capability, signal.source, signal.health.value, max(1, signal.attempt_count), int(signal.success), int(signal.failure), int(signal.schema_drift), int(signal.empty_population), int(signal.quarantine), int(signal.retryable_failure), int(signal.timeout), int(signal.rate_limit), int(signal.mapping_failure), signal.attempted_at, signal.attempted_at if signal.success else None, signal.attempted_at if signal.failure else None, signal.latency_ms, signal.source_observed_at, _freshness_seconds(signal.attempted_at, signal.source_observed_at), signal.error, _json_value({signal.failure_class: 1} if signal.failure_class else {}), signal.failure_class if signal.failure else None, signal.exception_type if signal.failure else None, signal.http_status if signal.failure else None, signal.endpoint if signal.failure else None, max(1, signal.attempt_count), signal.first_failure_at, signal.retryable, signal.transport_implementation, now),
             )
             row = cursor.fetchone()
             connection.commit()
@@ -1241,7 +1290,7 @@ class PostgresCanonicalStore:
         try:
             cursor = connection.cursor()
             cursor.execute(
-                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at FROM source_capability_health WHERE capability = %s AND source = %s",
+                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at, failure_class_counts, last_failure_class, last_exception_type, last_http_status, last_endpoint, last_attempt_count, first_failure_at, last_retryable, last_transport_implementation FROM source_capability_health WHERE capability = %s AND source = %s",
                 (capability, source),
             )
             row = cursor.fetchone()
@@ -1257,7 +1306,7 @@ class PostgresCanonicalStore:
         try:
             cursor = connection.cursor()
             cursor.execute(
-                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at FROM source_capability_health ORDER BY capability, source"
+                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at, failure_class_counts, last_failure_class, last_exception_type, last_http_status, last_endpoint, last_attempt_count, first_failure_at, last_retryable, last_transport_implementation FROM source_capability_health ORDER BY capability, source"
             )
             return tuple(self._health_snapshot(row) for row in cursor.fetchall())
         finally:
@@ -1407,8 +1456,11 @@ class PostgresCanonicalStore:
 
     @staticmethod
     def _health_snapshot(row: Any) -> SourceCapabilityHealthSnapshot:
+        failure_counts = row[22] if len(row) > 22 else {}
+        if isinstance(failure_counts, str):
+            failure_counts = json.loads(failure_counts or "{}")
         return SourceCapabilityHealthSnapshot(
-            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], timeout_count=row[10], rate_limit_count=row[11], mapping_failure_count=row[12], last_attempt_at=row[13], last_success_at=row[14], last_failure_at=row[15], last_latency_ms=row[16], last_source_observed_at=row[17], freshness_seconds=row[18], last_error=row[19], updated_at=row[20]
+            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], timeout_count=row[10], rate_limit_count=row[11], mapping_failure_count=row[12], last_attempt_at=row[13], last_success_at=row[14], last_failure_at=row[15], last_latency_ms=row[16], last_source_observed_at=row[17], freshness_seconds=row[18], last_error=row[19], updated_at=row[20], failure_class_counts=failure_counts or {}, last_failure_class=row[23] if len(row) > 23 else None, last_exception_type=row[24] if len(row) > 24 else None, last_http_status=row[25] if len(row) > 25 else None, last_endpoint=row[26] if len(row) > 26 else None, last_attempt_count=row[27] if len(row) > 27 else 1, first_failure_at=row[28] if len(row) > 28 else None, last_retryable=bool(row[29]) if len(row) > 29 else False, last_transport_implementation=row[30] if len(row) > 30 else None
         )
 
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool:

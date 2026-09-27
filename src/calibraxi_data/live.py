@@ -219,6 +219,8 @@ def population_kind_for(value: Any, *, default: PopulationKind = PopulationKind.
     ):
         return PopulationKind.TEST_SMOKE
 
+    if bool(getattr(value, "operational_probe", False)):
+        return PopulationKind.TEST_SMOKE
     raw = getattr(value, "population_kind", None)
     if raw is None and isinstance(value, Mapping):
         raw = value.get("population_kind")
@@ -263,6 +265,7 @@ class KnowledgeLedgerEntry:
     horizon: Horizon | str | None = None
     state: ObservationState | str = ObservationState.SUCCESS
     correction_of: str | None = None
+    operational_probe: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
@@ -381,6 +384,7 @@ class KnowledgeLedgerEntry:
             "horizon": self.horizon.value if isinstance(self.horizon, Horizon) else self.horizon,
             "state": self.state.value,
             "correction_of": self.correction_of,
+            "operational_probe": self.operational_probe,
             "payload": _jsonable(dict(self.payload)),
             "created_at": _iso(self.created_at),
         }
@@ -1083,6 +1087,10 @@ class LiveFixture:
     knowledge_at: datetime | None = None
     source: str = "espn"
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    provenance: str = "fresh_live_source"
+    freshness: str = "UNKNOWN"
+    live_source_success: bool = False
+    cached_fallback_used: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kickoff_at", _utc(self.kickoff_at, "kickoff_at"))
@@ -1093,6 +1101,8 @@ class LiveFixture:
                 raise ValueError("fixture updated_at cannot precede knowledge_at")
         object.__setattr__(self, "provider_ids", _freeze_mapping(self.provider_ids))
         object.__setattr__(self, "evidence_ids", tuple(sorted(set(self.evidence_ids))))
+        if self.freshness not in {"FRESH", "ACCEPTABLE_CACHE", "STALE", "UNKNOWN"}:
+            raise ValueError(f"unknown fixture freshness: {self.freshness}")
         for name in ("home_goals", "away_goals"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
@@ -1118,6 +1128,10 @@ class LiveFixture:
             "knowledge_at": _iso(self.knowledge_at),
             "source": self.source,
             "updated_at": _iso(self.updated_at),
+            "provenance": self.provenance,
+            "freshness": self.freshness,
+            "live_source_success": self.live_source_success,
+            "cached_fallback_used": self.cached_fallback_used,
         }
 
     @classmethod
@@ -1137,6 +1151,10 @@ class LiveFixture:
             knowledge_at=_parse_dt(value.get("knowledge_at"), "knowledge_at"),
             source=str(value.get("source", "espn")),
             updated_at=_parse_dt(value.get("updated_at"), "updated_at") or datetime.now(UTC),
+            provenance=str(value.get("provenance", "fresh_live_source")),
+            freshness=str(value.get("freshness", "UNKNOWN")),
+            live_source_success=bool(value.get("live_source_success", False)),
+            cached_fallback_used=bool(value.get("cached_fallback_used", False)),
         )
 
 

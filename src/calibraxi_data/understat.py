@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from .contracts import CapabilityState, EntityType, SourceIdentity, SourceResult
 from .espn import SourceObservation
-from .http_json import HttpResponse, HttpTransport, RetryPolicy, UrllibTransport, request_metadata, request_with_retry
+from .http_json import HttpResponse, HttpTransport, RetryPolicy, UrllibTransport, failure_metadata, request_metadata, request_with_retry, sanitize_endpoint
 
 
 _EMBEDDED_NAMES = (
@@ -32,6 +32,53 @@ _EMBEDDED_NAMES = (
     "shotsData",
     "statistics",
 )
+
+_CHALLENGE_MARKERS = (
+    "cloudflare",
+    "cf-chl-",
+    "challenge-platform",
+    "just a moment",
+    "checking your browser",
+    "verify you are human",
+)
+
+
+class UnderstatProviderChallenge(ValueError):
+    """The provider returned an access-control page instead of data."""
+
+    def __init__(self, message: str, *, markers: tuple[str, ...] = (), response_bytes: int | None = None) -> None:
+        super().__init__(message)
+        self.details = {
+            "provider_challenge": True,
+            "access_control_state": "CHALLENGE",
+            "challenge_markers": markers,
+        }
+        if response_bytes is not None:
+            self.details["response_bytes"] = response_bytes
+
+
+def detect_provider_challenge(body: bytes | str) -> tuple[str, ...]:
+    """Return generic access-control markers without retaining page contents."""
+
+    text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
+    lowered = text.casefold()
+    return tuple(marker for marker in _CHALLENGE_MARKERS if marker in lowered)
+
+
+def validate_understat_payload(body: bytes) -> Mapping[str, Any]:
+    """Validate a public response for preflight without mutating evidence."""
+
+    markers = detect_provider_challenge(body)
+    if markers:
+        raise UnderstatProviderChallenge(
+            "Understat provider access-control challenge",
+            markers=markers,
+            response_bytes=len(body),
+        )
+    payload = _decode_payload(body.decode("utf-8"))
+    if payload is None:
+        raise ValueError("recognized Understat payload missing")
+    return payload
 
 
 class UnderstatSourceAdapter:
@@ -53,7 +100,7 @@ class UnderstatSourceAdapter:
     ) -> None:
         self._transport = transport or UrllibTransport()
         self._timeout = timeout
-        self._retry_policy = retry_policy or RetryPolicy()
+        self._retry_policy = retry_policy or RetryPolicy(jitter_ratio=0.2)
         self._sleep = sleep or time.sleep
         self._base_url = (base_url or self._base).rstrip("/")
 
@@ -71,9 +118,11 @@ class UnderstatSourceAdapter:
             )
 
         metadata: dict[str, Any] = {
-            "url": endpoint,
+            "url": sanitize_endpoint(endpoint),
+            "endpoint": sanitize_endpoint(endpoint),
             "provider_fixture_id": provider_fixture_id,
             "public_surface": "ordinary_html",
+            "transport_implementation": type(self._transport).__name__,
         }
         try:
             request = request_with_retry(
@@ -89,6 +138,7 @@ class UnderstatSourceAdapter:
                 sleep=self._sleep,
             )
         except Exception as exc:
+            metadata.update(failure_metadata(error=exc, endpoint=endpoint, transport=self._transport))
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
@@ -98,7 +148,7 @@ class UnderstatSourceAdapter:
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
-        metadata.update(request_metadata(request))
+        metadata.update(request_metadata(request, transport=self._transport, endpoint=endpoint))
         if request.error is not None:
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
@@ -111,6 +161,7 @@ class UnderstatSourceAdapter:
             )
         response = request.response
         if response is None:
+            metadata.update(failure_metadata(error=RuntimeError("transport returned no response"), endpoint=endpoint, transport=self._transport, attempts=request.attempts))
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
@@ -121,6 +172,7 @@ class UnderstatSourceAdapter:
                 metadata=metadata,
             )
         if response.status < 200 or response.status >= 300:
+            metadata.update(failure_metadata(http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts))
             return SourceResult(
                 CapabilityState.SOURCE_FAILED,
                 self.source_name,
@@ -131,9 +183,39 @@ class UnderstatSourceAdapter:
                 adapter_version=self.adapter_version,
                 metadata=metadata,
             )
+        metadata["response_bytes"] = len(response.body)
+        challenge_markers = detect_provider_challenge(response.body)
+        if challenge_markers:
+            error = UnderstatProviderChallenge(
+                "Understat provider access-control challenge",
+                markers=challenge_markers,
+                response_bytes=len(response.body),
+            )
+            metadata.update(error.details)
+            metadata.update(
+                failure_metadata(
+                    error=error,
+                    http_status=response.status,
+                    endpoint=endpoint,
+                    transport=self._transport,
+                    attempts=request.attempts,
+                    parser_error=True,
+                )
+            )
+            return SourceResult(
+                CapabilityState.PARSER_SCHEMA_DRIFT,
+                self.source_name,
+                capability,
+                http_status=response.status,
+                error=str(error),
+                integration=self.integration_name,
+                adapter_version=self.adapter_version,
+                metadata=metadata,
+            )
         try:
             body = response.body.decode("utf-8")
         except UnicodeDecodeError as exc:
+            metadata.update(failure_metadata(error=exc, http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(
                 CapabilityState.PARSER_SCHEMA_DRIFT,
                 self.source_name,
@@ -147,6 +229,7 @@ class UnderstatSourceAdapter:
 
         embedded = _decode_payload(body)
         if embedded is None:
+            metadata.update(failure_metadata(error=ValueError("recognized Understat payload missing"), http_status=response.status, endpoint=endpoint, transport=self._transport, attempts=request.attempts, parser_error=True))
             return SourceResult(
                 CapabilityState.PARSER_SCHEMA_DRIFT,
                 self.source_name,
@@ -420,4 +503,10 @@ def _value_for_side(value: Mapping[str, Any], side: str) -> Any:
     return None
 
 
-__all__ = ["UnderstatObservationParser", "UnderstatSourceAdapter"]
+__all__ = [
+    "UnderstatObservationParser",
+    "UnderstatProviderChallenge",
+    "UnderstatSourceAdapter",
+    "detect_provider_challenge",
+    "validate_understat_payload",
+]
