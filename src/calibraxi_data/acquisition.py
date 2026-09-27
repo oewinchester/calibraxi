@@ -22,6 +22,7 @@ class AcquisitionAttempt:
     evidence: RawEvidence | None
     started_at: datetime
     finished_at: datetime
+    request_fixture_id: str | None = None
 
     @property
     def source(self) -> str:
@@ -87,6 +88,11 @@ class AcquisitionCoordinator:
                 if translation_error is not None
                 else self._fetch(source, capability, source_params)
             )
+            # Preserve the exact target-provider identifier selected by the
+            # governed translation layer on the attempt.  Downstream parsers
+            # must use this ID when a fallback source is selected; the
+            # canonical/primary provider ID is never a valid substitute.
+            requested_fixture_id = source_params.get("event_id") or source_params.get("fixture_id")
             if result.state is CapabilityState.SUPPORTED and accept_result is not None:
                 try:
                     accepted = bool(accept_result(result))
@@ -130,7 +136,13 @@ class AcquisitionCoordinator:
                 )
                 evidence = None
             result = self._with_evidence(result, evidence)
-            attempt = AcquisitionAttempt(result, evidence, started_at, finished_at)
+            attempt = AcquisitionAttempt(
+                result,
+                evidence,
+                started_at,
+                finished_at,
+                str(requested_fixture_id) if requested_fixture_id not in (None, "") else None,
+            )
             attempts.append(attempt)
 
             if result.state is CapabilityState.SUPPORTED:
@@ -182,6 +194,11 @@ class AcquisitionCoordinator:
             request["fixture_id"] = str(explicit_source_id)
         inherited_fixture_id = request.get("event_id") or request.get("fixture_id")
         if source != primary_source and (inherited_fixture_id or source_specific_id):
+            # A target-provider ID already carried by the canonical fixture is
+            # an explicit governed identity link. It is safe to use directly;
+            # only an inherited primary-provider ID needs translation.
+            if explicit_source_id not in (None, ""):
+                return request, None
             if canonical_id in (None, "") or self._fixture_identity_index is None:
                 return request, f"missing governed {primary_source}-to-{source} fixture ID translation"
             canonical_id = str(canonical_id)

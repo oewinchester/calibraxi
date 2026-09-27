@@ -8,60 +8,49 @@ from typing import Any, Mapping
 
 from .acquisition import AcquisitionCoordinator
 from .capabilities import CapabilityRegistry, SourceManifestRegistry
-from .contracts import CapabilityState, SourceResult
 from .espn import EspnSourceAdapter
 from .evidence import MinioRawEvidenceStore
 from .historical_evaluation import HistoricalPopulation, build_real_historical_population, load_football_data_archive
 from .fixture_identity import FixtureIdentityIndex
 from .live_persistence import LivePostgresStore
 from .live_runner import LiveShadowRunner
+from .operations import OperationalRecorder
 from .persistence import PostgresCanonicalStore
 from .sofascore import SofascoreSourceAdapter
 from .source_registry import default_source_manifests, qualified_capability_policies
+from .understat import UnderstatObservationParser, UnderstatSourceAdapter
+from .openfootball import OpenFootballObservationParser, OpenFootballSourceAdapter
+from .thesportsdb import TheSportsDbObservationParser, TheSportsDbSourceAdapter
 
 
 LIVE_CAPABILITIES = frozenset(
-    {"fixtures", "lineups", "events", "team_match_stats", "shots", "player_stats", "xg", "xg_a"}
+    {"fixtures", "lineups", "events", "team_match_stats", "shots", "xgot", "player_stats", "xg", "xg_a"}
 )
 
 
-class UnavailableUnderstatAdapter:
-    """Report unsupported until a permitted adapter and provider ID are configured."""
+def build_live_capability_registry(
+    *,
+    allow_review_required_sources: bool = False,
+    policy_store: Any | None = None,
+) -> CapabilityRegistry:
+    """Activate the selected production policies.
 
-    source_name = "understat"
-    adapter_version = "understat-live-unavailable-v1"
-
-    def fetch(self, capability: str, **params: Any) -> SourceResult:
-        return SourceResult(
-            CapabilityState.UNSUPPORTED,
-            self.source_name,
-            capability,
-            error="Understat live retrieval is unavailable until its runtime adapter and provider fixture ID are configured",
-            adapter_version=self.adapter_version,
-            metadata={"eligibility": "provider_specific_chronology_required"},
-        )
-
-
-def build_live_capability_registry(*, allow_review_required_sources: bool) -> CapabilityRegistry:
-    """Activate live policies only after their rights state is qualified."""
-
-    if allow_review_required_sources:
-        raise RuntimeError(
-            "review_required source policies cannot be enabled by runner configuration"
-        )
-    manifests = SourceManifestRegistry(default_source_manifests())
-    registry = CapabilityRegistry(manifest_registry=manifests)
+    ``allow_review_required_sources`` is retained as a compatibility argument
+    for older callers. The selected source stack is operational policy in this
+    phase, so runtime configuration cannot turn a review gate on or off.
+    Research-only manifests remain rejected by the registry.
+    """
+    manifests = SourceManifestRegistry(default_source_manifests(), store=policy_store)
+    registry = CapabilityRegistry(policy_store=policy_store, manifest_registry=manifests)
     policies = {policy.key: policy for policy in qualified_capability_policies()}
     missing = LIVE_CAPABILITIES - policies.keys()
     if missing:
         raise RuntimeError(f"live capability policies are missing: {', '.join(sorted(missing))}")
-    review_required = sorted(
-        key for key in LIVE_CAPABILITIES
-        if policies[key].usage_rights_state == "review_required"
-    )
+    review_required = sorted(key for key in LIVE_CAPABILITIES if policies[key].usage_rights_state == "review_required")
     if review_required:
         raise RuntimeError(
-            f"live source policies remain review_required: {', '.join(review_required)}"
+            "selected live source policy is stale and must be operational: "
+            + ", ".join(review_required)
         )
     for policy in qualified_capability_policies():
         if policy.key in LIVE_CAPABILITIES:
@@ -86,6 +75,7 @@ def _compose_runner(
     evidence_store: Any,
     population: HistoricalPopulation,
     fixture_identity_index: FixtureIdentityIndex | None = None,
+    canonical_store: Any | None = None,
     adapters: Mapping[str, Any] | None = None,
 ) -> LiveShadowRunner:
     coordinator = AcquisitionCoordinator(
@@ -93,15 +83,19 @@ def _compose_runner(
         adapters=dict(adapters or {
             "espn": EspnSourceAdapter(),
             "sofascore": SofascoreSourceAdapter(),
-            "understat": UnavailableUnderstatAdapter(),
+            "understat": UnderstatSourceAdapter(),
+            "openfootball": OpenFootballSourceAdapter(),
+            "thesportsdb": TheSportsDbSourceAdapter(),
         }),
         evidence_store=evidence_store,
         fixture_identity_index=fixture_identity_index,
     )
     stores = postgres_store.operational_stores()
+    operations = OperationalRecorder(registry=registry, store=canonical_store) if canonical_store is not None else None
     return LiveShadowRunner(
         coordinator=coordinator,
         fixture_identity_index=fixture_identity_index,
+        operations=operations,
         ledger=stores.ledger,
         task_store=stores.tasks,
         fixture_store=stores.fixtures,
@@ -113,6 +107,11 @@ def _compose_runner(
         monitoring_store=stores.monitoring,
         historical_records=population.records,
         training_examples=population.examples,
+        parsers={
+            "understat": UnderstatObservationParser(),
+            "openfootball": OpenFootballObservationParser(),
+            "thesportsdb": TheSportsDbObservationParser(),
+        },
     )
 
 
@@ -123,9 +122,13 @@ def build_live_shadow_runner(
     allow_review_required_sources: bool,
     archive_path: str | Path = "temp/football-data-archive",
     fixture_identity_index: FixtureIdentityIndex | None = None,
+    canonical_store: Any | None = None,
     adapters: Mapping[str, Any] | None = None,
 ) -> LiveShadowRunner:
-    registry = build_live_capability_registry(allow_review_required_sources=allow_review_required_sources)
+    registry = build_live_capability_registry(
+        allow_review_required_sources=allow_review_required_sources,
+        policy_store=canonical_store,
+    )
     population = _load_population(archive_path)
     return _compose_runner(
         registry=registry,
@@ -133,6 +136,7 @@ def build_live_shadow_runner(
         evidence_store=evidence_store,
         population=population,
         fixture_identity_index=fixture_identity_index,
+        canonical_store=canonical_store,
         adapters=adapters,
     )
 
@@ -140,7 +144,6 @@ def build_live_shadow_runner(
 def create_live_shadow_runner() -> LiveShadowRunner:
     """Read deployment configuration and create the PostgreSQL/MinIO runner."""
 
-    registry = build_live_capability_registry(allow_review_required_sources=False)
     database_dsn = os.getenv("CALIBRAXI_POSTGRES_DSN") or os.getenv("DATABASE_URL")
     if not database_dsn:
         raise RuntimeError("CALIBRAXI_POSTGRES_DSN or DATABASE_URL is required for the live shadow runner")
@@ -150,6 +153,10 @@ def create_live_shadow_runner() -> LiveShadowRunner:
 
     postgres_store = LivePostgresStore.from_dsn(database_dsn)
     canonical_store = PostgresCanonicalStore.from_dsn(database_dsn)
+    registry = build_live_capability_registry(
+        allow_review_required_sources=False,
+        policy_store=canonical_store,
+    )
     evidence_store = MinioRawEvidenceStore.from_environment(
         bucket=os.getenv("CALIBRAXI_MINIO_BUCKET", "calibraxi-dev"),
         prefix="live-shadow/raw",
@@ -160,12 +167,14 @@ def create_live_shadow_runner() -> LiveShadowRunner:
         evidence_store=evidence_store,
         population=archive,
         fixture_identity_index=FixtureIdentityIndex(store=canonical_store),
+        canonical_store=canonical_store,
     )
 
 
 __all__ = [
     "LIVE_CAPABILITIES",
-    "UnavailableUnderstatAdapter",
+    "UnderstatObservationParser",
+    "UnderstatSourceAdapter",
     "build_live_capability_registry",
     "build_live_shadow_runner",
     "create_live_shadow_runner",

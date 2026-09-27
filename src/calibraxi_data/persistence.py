@@ -80,11 +80,13 @@ class CanonicalStore(Protocol):
     def list_quarantines(self, *, run_id: str | None = None) -> tuple[QuarantineDecision, ...]: ...
     def record_health_signal(self, signal: SourceHealthSignal) -> SourceCapabilityHealthSnapshot: ...
     def health_for(self, capability: str, source: str) -> SourceCapabilityHealthSnapshot | None: ...
+    def list_source_health(self) -> tuple[SourceCapabilityHealthSnapshot, ...]: ...
     def save_capability_policy(self, policy: SourceCapability) -> None: ...
     def capability_policy_history(self, key: str) -> tuple[SourceCapability, ...]: ...
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool: ...
     def release_worker_lease(self, lease_key: str, *, token: str) -> None: ...
     def save_source_manifest(self, manifest: SourceManifest) -> None: ...
+    def supersede_source_manifest(self, existing: SourceManifest, manifest: SourceManifest) -> None: ...
     def source_manifest(self, source: str) -> SourceManifest | None: ...
     def propose_fixture_mapping(self, candidate: FixtureMappingCandidate) -> None: ...
     def adjudicate_fixture_mapping(self, *, source: str, source_fixture_id: str, canonical_fixture_id: str, status: FixtureMappingStatus, evidence_ids: Iterable[str] = (), rationale: str | None = None, decided_at: datetime | None = None) -> FixtureMappingCandidate: ...
@@ -98,6 +100,14 @@ def _canonical_id(identity: SourceIdentity) -> str:
 
 def _json_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _freshness_seconds(attempted_at: datetime, source_observed_at: datetime | None) -> float | None:
+    if source_observed_at is None:
+        return None
+    attempted = attempted_at.astimezone(timezone.utc)
+    observed = source_observed_at.astimezone(timezone.utc)
+    return max(0.0, (attempted - observed).total_seconds())
 
 
 class FileSystemCanonicalStore:
@@ -117,6 +127,7 @@ class FileSystemCanonicalStore:
         self._worker_leases: dict[str, tuple[str, datetime]] = {}
         self._policy_history: dict[str, list[SourceCapability]] = {}
         self._source_manifests: dict[str, SourceManifest] = {}
+        self._source_manifest_history: list[SourceManifest] = []
         self._fixture_mappings: dict[tuple[str, str, str], FixtureMappingCandidate] = {}
         self._load()
 
@@ -269,10 +280,15 @@ class FileSystemCanonicalStore:
             empty_population_count=(previous.empty_population_count if previous else 0) + int(signal.empty_population),
             quarantine_count=(previous.quarantine_count if previous else 0) + int(signal.quarantine),
             retryable_failure_count=(previous.retryable_failure_count if previous else 0) + int(signal.retryable_failure),
+            timeout_count=(previous.timeout_count if previous else 0) + int(signal.timeout),
+            rate_limit_count=(previous.rate_limit_count if previous else 0) + int(signal.rate_limit),
+            mapping_failure_count=(previous.mapping_failure_count if previous else 0) + int(signal.mapping_failure),
             last_attempt_at=signal.attempted_at,
             last_success_at=signal.attempted_at if signal.success else (previous.last_success_at if previous else None),
             last_failure_at=signal.attempted_at if signal.failure else (previous.last_failure_at if previous else None),
             last_latency_ms=signal.latency_ms if signal.latency_ms is not None else (previous.last_latency_ms if previous else None),
+            last_source_observed_at=signal.source_observed_at if signal.source_observed_at is not None else (previous.last_source_observed_at if previous else None),
+            freshness_seconds=_freshness_seconds(signal.attempted_at, signal.source_observed_at) if signal.source_observed_at is not None else (previous.freshness_seconds if previous else None),
             last_error=signal.error if signal.error is not None else (None if signal.success else (previous.last_error if previous else None)),
             updated_at=now,
         )
@@ -282,6 +298,9 @@ class FileSystemCanonicalStore:
 
     def health_for(self, capability: str, source: str) -> SourceCapabilityHealthSnapshot | None:
         return self._health.get((capability, source))
+
+    def list_source_health(self) -> tuple[SourceCapabilityHealthSnapshot, ...]:
+        return tuple(self._health[key] for key in sorted(self._health))
 
     def save_capability_policy(self, policy: SourceCapability) -> None:
         versions = self._policy_history.setdefault(policy.key, [])
@@ -297,6 +316,14 @@ class FileSystemCanonicalStore:
         existing = self._source_manifests.get(manifest.source)
         if existing is not None and existing != manifest:
             raise ValueError(f"source manifest already persisted: {manifest.source}")
+        self._source_manifests[manifest.source] = manifest
+        self._flush()
+
+    def supersede_source_manifest(self, existing: SourceManifest, manifest: SourceManifest) -> None:
+        current = self._source_manifests.get(existing.source)
+        if current != existing:
+            raise ValueError(f"source manifest changed before supersession: {existing.source}")
+        self._source_manifest_history.append(existing)
         self._source_manifests[manifest.source] = manifest
         self._flush()
 
@@ -377,6 +404,7 @@ class FileSystemCanonicalStore:
         (self.root / "worker-leases.json").write_text(json.dumps({key: {"token": token, "lease_until": lease_until} for key, (token, lease_until) in self._worker_leases.items()}, ensure_ascii=False, sort_keys=True, default=str, indent=2), encoding="utf-8")
         (self.root / "capability-policies.json").write_text(json.dumps({key: [asdict(item) for item in policies] for key, policies in self._policy_history.items()}, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (self.root / "source-manifests.json").write_text(json.dumps([asdict(item) for item in self._source_manifests.values()], ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        (self.root / "source-manifest-history.json").write_text(json.dumps([asdict(item) for item in self._source_manifest_history], ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
         (self.root / "fixture-mappings.json").write_text(json.dumps([asdict(item) for item in self._fixture_mappings.values()], ensure_ascii=False, sort_keys=True, default=str, indent=2), encoding="utf-8")
 
     def _load(self) -> None:
@@ -437,6 +465,12 @@ class FileSystemCanonicalStore:
                 item["capabilities"] = tuple(item.get("capabilities") or ())
                 item["semantic_contracts"] = dict(item.get("semantic_contracts") or {})
                 self._source_manifests[item["source"]] = SourceManifest(**item)
+        manifest_history_path = self.root / "source-manifest-history.json"
+        if manifest_history_path.exists():
+            for item in json.loads(manifest_history_path.read_text(encoding="utf-8")):
+                item["capabilities"] = tuple(item.get("capabilities") or ())
+                item["semantic_contracts"] = dict(item.get("semantic_contracts") or {})
+                self._source_manifest_history.append(SourceManifest(**item))
         mappings_path = self.root / "fixture-mappings.json"
         if mappings_path.exists():
             for item in json.loads(mappings_path.read_text(encoding="utf-8")):
@@ -566,14 +600,27 @@ class PostgresCanonicalStore:
             empty_population_count INTEGER NOT NULL DEFAULT 0,
             quarantine_count INTEGER NOT NULL DEFAULT 0,
             retryable_failure_count INTEGER NOT NULL DEFAULT 0,
+            timeout_count INTEGER NOT NULL DEFAULT 0,
+            rate_limit_count INTEGER NOT NULL DEFAULT 0,
+            mapping_failure_count INTEGER NOT NULL DEFAULT 0,
             last_attempt_at TIMESTAMPTZ,
             last_success_at TIMESTAMPTZ,
             last_failure_at TIMESTAMPTZ,
             last_latency_ms INTEGER,
+            last_source_observed_at TIMESTAMPTZ,
+            freshness_seconds DOUBLE PRECISION,
             last_error TEXT,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (capability, source)
         )
+        """,
+        """
+        ALTER TABLE source_capability_health
+            ADD COLUMN IF NOT EXISTS timeout_count INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS rate_limit_count INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS mapping_failure_count INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS last_source_observed_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS freshness_seconds DOUBLE PRECISION
         """,
         """
         CREATE TABLE IF NOT EXISTS ingestion_worker_leases (
@@ -612,6 +659,20 @@ class PostgresCanonicalStore:
             semantic_contracts JSONB NOT NULL DEFAULT '{}'::jsonb,
             notes TEXT,
             registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS source_manifest_history (
+            history_id BIGSERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            implementation_version TEXT NOT NULL,
+            acquisition_mode TEXT NOT NULL,
+            capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+            rights_state TEXT NOT NULL,
+            operational_eligibility TEXT NOT NULL,
+            semantic_contracts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            notes TEXT,
+            superseded_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
         """
@@ -689,6 +750,53 @@ class PostgresCanonicalStore:
                 existing = self._source_manifest_from_row(row)
                 if existing != manifest:
                     raise ValueError(f"source manifest already persisted: {manifest.source}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def supersede_source_manifest(self, existing: SourceManifest, manifest: SourceManifest) -> None:
+        """Record a stale manifest revision before activating its successor."""
+
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT source, implementation_version, acquisition_mode, capabilities, rights_state, operational_eligibility, semantic_contracts, notes FROM source_manifests WHERE source = %s FOR UPDATE",
+                (existing.source,),
+            )
+            row = cursor.fetchone()
+            if row is None or self._source_manifest_from_row(row) != existing:
+                raise ValueError(f"source manifest changed before supersession: {existing.source}")
+            cursor.execute(
+                """
+                INSERT INTO source_manifest_history
+                    (source, implementation_version, acquisition_mode, capabilities, rights_state,
+                     operational_eligibility, semantic_contracts, notes)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s)
+                """,
+                (existing.source, existing.implementation_version, existing.acquisition_mode, _json_value(list(existing.capabilities)), existing.rights_state, existing.operational_eligibility, _json_value(dict(existing.semantic_contracts)), existing.notes),
+            )
+            cursor.execute(
+                """
+                UPDATE source_manifests
+                   SET implementation_version = %s,
+                       acquisition_mode = %s,
+                       capabilities = %s::jsonb,
+                       rights_state = %s,
+                       operational_eligibility = %s,
+                       semantic_contracts = %s::jsonb,
+                       notes = %s,
+                       registered_at = now()
+                 WHERE source = %s
+                """,
+                (manifest.implementation_version, manifest.acquisition_mode, _json_value(list(manifest.capabilities)), manifest.rights_state, manifest.operational_eligibility, _json_value(dict(manifest.semantic_contracts)), manifest.notes, manifest.source),
+            )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1084,9 +1192,10 @@ class PostgresCanonicalStore:
                 INSERT INTO source_capability_health
                     (capability, source, health, attempt_count, success_count, failure_count,
                      schema_drift_count, empty_population_count, quarantine_count,
-                     retryable_failure_count, last_attempt_at, last_success_at, last_failure_at,
-                     last_latency_ms, last_error, updated_at)
-                VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count,
+                     last_attempt_at, last_success_at, last_failure_at, last_latency_ms,
+                     last_source_observed_at, freshness_seconds, last_error, updated_at)
+                VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (capability, source) DO UPDATE SET
                     health = EXCLUDED.health,
                     attempt_count = source_capability_health.attempt_count + 1,
@@ -1096,18 +1205,24 @@ class PostgresCanonicalStore:
                     empty_population_count = source_capability_health.empty_population_count + EXCLUDED.empty_population_count,
                     quarantine_count = source_capability_health.quarantine_count + EXCLUDED.quarantine_count,
                     retryable_failure_count = source_capability_health.retryable_failure_count + EXCLUDED.retryable_failure_count,
+                    timeout_count = source_capability_health.timeout_count + EXCLUDED.timeout_count,
+                    rate_limit_count = source_capability_health.rate_limit_count + EXCLUDED.rate_limit_count,
+                    mapping_failure_count = source_capability_health.mapping_failure_count + EXCLUDED.mapping_failure_count,
                     last_attempt_at = EXCLUDED.last_attempt_at,
                     last_success_at = COALESCE(EXCLUDED.last_success_at, source_capability_health.last_success_at),
                     last_failure_at = COALESCE(EXCLUDED.last_failure_at, source_capability_health.last_failure_at),
                     last_latency_ms = COALESCE(EXCLUDED.last_latency_ms, source_capability_health.last_latency_ms),
+                    last_source_observed_at = COALESCE(EXCLUDED.last_source_observed_at, source_capability_health.last_source_observed_at),
+                    freshness_seconds = COALESCE(EXCLUDED.freshness_seconds, source_capability_health.freshness_seconds),
                     last_error = CASE WHEN EXCLUDED.success_count > 0 THEN NULL ELSE COALESCE(EXCLUDED.last_error, source_capability_health.last_error) END,
                     updated_at = EXCLUDED.updated_at
                 RETURNING capability, source, health, attempt_count, success_count, failure_count,
                           schema_drift_count, empty_population_count, quarantine_count,
-                          retryable_failure_count, last_attempt_at, last_success_at, last_failure_at,
-                          last_latency_ms, last_error, updated_at
+                          retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count,
+                          last_attempt_at, last_success_at, last_failure_at, last_latency_ms,
+                          last_source_observed_at, freshness_seconds, last_error, updated_at
                 """,
-                (signal.capability, signal.source, signal.health.value, int(signal.success), int(signal.failure), int(signal.schema_drift), int(signal.empty_population), int(signal.quarantine), int(signal.retryable_failure), signal.attempted_at, signal.attempted_at if signal.success else None, signal.attempted_at if signal.failure else None, signal.latency_ms, signal.error, now),
+                (signal.capability, signal.source, signal.health.value, int(signal.success), int(signal.failure), int(signal.schema_drift), int(signal.empty_population), int(signal.quarantine), int(signal.retryable_failure), int(signal.timeout), int(signal.rate_limit), int(signal.mapping_failure), signal.attempted_at, signal.attempted_at if signal.success else None, signal.attempted_at if signal.failure else None, signal.latency_ms, signal.source_observed_at, _freshness_seconds(signal.attempted_at, signal.source_observed_at), signal.error, now),
             )
             row = cursor.fetchone()
             connection.commit()
@@ -1126,11 +1241,25 @@ class PostgresCanonicalStore:
         try:
             cursor = connection.cursor()
             cursor.execute(
-                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_error, updated_at FROM source_capability_health WHERE capability = %s AND source = %s",
+                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at FROM source_capability_health WHERE capability = %s AND source = %s",
                 (capability, source),
             )
             row = cursor.fetchone()
             return self._health_snapshot(row) if row is not None else None
+        finally:
+            if cursor is not None:
+                cursor.close()
+            connection.close()
+
+    def list_source_health(self) -> tuple[SourceCapabilityHealthSnapshot, ...]:
+        connection = self._connection_factory()
+        cursor = None
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT capability, source, health, attempt_count, success_count, failure_count, schema_drift_count, empty_population_count, quarantine_count, retryable_failure_count, timeout_count, rate_limit_count, mapping_failure_count, last_attempt_at, last_success_at, last_failure_at, last_latency_ms, last_source_observed_at, freshness_seconds, last_error, updated_at FROM source_capability_health ORDER BY capability, source"
+            )
+            return tuple(self._health_snapshot(row) for row in cursor.fetchall())
         finally:
             if cursor is not None:
                 cursor.close()
@@ -1279,7 +1408,7 @@ class PostgresCanonicalStore:
     @staticmethod
     def _health_snapshot(row: Any) -> SourceCapabilityHealthSnapshot:
         return SourceCapabilityHealthSnapshot(
-            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], last_attempt_at=row[10], last_success_at=row[11], last_failure_at=row[12], last_latency_ms=row[13], last_error=row[14], updated_at=row[15]
+            capability=row[0], source=row[1], health=HealthState(row[2]), attempt_count=row[3], success_count=row[4], failure_count=row[5], schema_drift_count=row[6], empty_population_count=row[7], quarantine_count=row[8], retryable_failure_count=row[9], timeout_count=row[10], rate_limit_count=row[11], mapping_failure_count=row[12], last_attempt_at=row[13], last_success_at=row[14], last_failure_at=row[15], last_latency_ms=row[16], last_source_observed_at=row[17], freshness_seconds=row[18], last_error=row[19], updated_at=row[20]
         )
 
     def claim_worker_lease(self, lease_key: str, *, token: str, lease_until: datetime) -> bool:

@@ -404,17 +404,22 @@ def build_epl_bootstrap_coordinator(
     *,
     canonical_store: Any,
     evidence_store: Any,
-    allow_review_required_sources: bool,
+    allow_review_required_sources: bool = False,
     transport: HttpTransport | None = None,
     fetcher: Callable[[str], tuple[bytes, str]] | None = None,
 ) -> AcquisitionCoordinator:
-    """Build the local EPL snapshot acquisition path with an explicit rights opt-in."""
+    """Build the local EPL snapshot acquisition path from operational policy.
+
+    The compatibility ``allow_review_required_sources`` argument is ignored;
+    selected production policies must be eligible without a runtime rights
+    bypass.
+    """
 
     manifest = next(item for item in default_source_manifests() if item.source == SOURCE)
     policy = next(item for item in qualified_capability_policies() if item.key == "historical_results")
     manifests = SourceManifestRegistry((manifest,))
     registry = CapabilityRegistry(manifest_registry=manifests)
-    registry.register(policy, allow_review_required=allow_review_required_sources)
+    registry.register(policy)
     adapter = FootballDataCsvAdapter(transport=transport, fetcher=fetcher)
     return AcquisitionCoordinator(
         registry=registry,
@@ -1943,12 +1948,10 @@ class EplBootstrapper:
                 else:
                     coordinator = self.acquisition_coordinator
                     if coordinator is None:
-                        if not self.allow_review_required_sources:
-                            raise ValueError("review-required Football-Data source requires explicit local rights opt-in")
                         coordinator = build_epl_bootstrap_coordinator(
                             canonical_store=self.canonical_store,
                             evidence_store=self.evidence_store,
-                            allow_review_required_sources=True,
+                            allow_review_required_sources=self.allow_review_required_sources,
                             fetcher=self.fetcher,
                         )
                     acquired = coordinator.acquire("historical_results", params={"season_code": code})

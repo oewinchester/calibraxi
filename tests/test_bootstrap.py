@@ -368,23 +368,18 @@ def test_live_bootstrap_uses_governed_acquisition_and_captures_csv_evidence(tmp_
     assert evidence.read_payload(source_evidence) == CSV.encode("latin-1")
 
 
-def test_live_bootstrap_requires_explicit_review_required_rights_opt_in(tmp_path):
+def test_live_bootstrap_uses_operational_policy_without_rights_opt_in(tmp_path):
     canonical = FileSystemCanonicalStore(tmp_path / "canonical")
     evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")
 
-    try:
-        coordinator_builder = getattr(bootstrap_module, "build_epl_bootstrap_coordinator", None)
-        assert callable(coordinator_builder), "live bootstrap must expose an explicit rights opt-in"
-        coordinator_builder(
-            canonical_store=canonical,
-            evidence_store=evidence,
-            transport=StaticCsvTransport(CSV.encode("latin-1")),
-            allow_review_required_sources=False,
-        )
-    except ValueError as exc:
-        assert "rights" in str(exc)
-    else:
-        raise AssertionError("review-required historical source activated without explicit opt-in")
+    coordinator_builder = getattr(bootstrap_module, "build_epl_bootstrap_coordinator", None)
+    assert callable(coordinator_builder), "live bootstrap must expose an operational source policy"
+    coordinator_builder(
+        canonical_store=canonical,
+        evidence_store=evidence,
+        transport=StaticCsvTransport(CSV.encode("latin-1")),
+        allow_review_required_sources=False,
+    )
 
 
 def test_csv_adapter_quarantines_http_success_with_schema_drift():

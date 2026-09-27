@@ -43,6 +43,9 @@ def run_cycle(runner: Any, dates: Iterable[str], *, now: datetime | None = None)
         "first_observed_forecast_count": first_observed_forecasts,
         "forecast_count": first_observed_forecasts + cycle_forecasts,
         "failed_dates": list(discovery.failed_dates),
+        "discovery_states": dict(getattr(discovery, "states", {}) or {}),
+        "cached_fallback_dates": list(getattr(discovery, "cached_fallback_dates", ()) or ()),
+        "cached_fallback_fixture_count": int(getattr(discovery, "cached_fallback_fixture_count", 0) or 0),
         "cycle": cycle,
     }
 

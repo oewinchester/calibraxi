@@ -189,10 +189,45 @@ class Horizon(str, Enum):
 class PopulationKind(str, Enum):
     """Explicit evaluation populations; they must never be silently mixed."""
 
+    TEST_SMOKE = "test_smoke"
     HISTORICAL_RECONSTRUCTED = "historical_reconstructed"
     RECONSTRUCTED = "historical_reconstructed"
     PROSPECTIVE_TRUE_PIT = "prospective_true_pit"
     TRUE_PIT = "prospective_true_pit"
+
+
+def population_kind_for(value: Any, *, default: PopulationKind = PopulationKind.PROSPECTIVE_TRUE_PIT) -> PopulationKind:
+    """Resolve an artifact's operational population without guessing football data.
+
+    Production artifacts default to true-PIT.  The smoke markers are limited to
+    test-generated identifiers used by the existing audit fixtures, so a smoke
+    row remains queryable explicitly without entering production reads.
+    """
+
+    fixture_id = getattr(value, "fixture_id", None)
+    if fixture_id is None and isinstance(value, Mapping):
+        fixture_id = value.get("fixture_id")
+    marker = str(fixture_id or "").lower()
+    if (
+        marker.startswith("fixture:smoke:")
+        or marker.startswith("fixture:task-smoke:")
+        or marker.startswith("fixture:test:")
+        or marker.startswith("smoke:")
+        or "live-phase-smoke" in marker
+        or ":smoke:" in marker
+        or marker.endswith(":smoke")
+    ):
+        return PopulationKind.TEST_SMOKE
+
+    raw = getattr(value, "population_kind", None)
+    if raw is None and isinstance(value, Mapping):
+        raw = value.get("population_kind")
+    if raw is not None:
+        try:
+            return PopulationKind(raw)
+        except ValueError:
+            pass
+    return default
 
 
 class ReliabilityStatus(str, Enum):
@@ -361,7 +396,7 @@ class KnowledgeLedgerEntry:
 class KnowledgeLedger(Protocol):
     def save(self, entry: KnowledgeLedgerEntry) -> KnowledgeLedgerEntry: ...
     def get(self, entry_id: str) -> KnowledgeLedgerEntry | None: ...
-    def list(self) -> tuple[KnowledgeLedgerEntry, ...]: ...
+    def list(self, *, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[KnowledgeLedgerEntry, ...]: ...
     def as_known_at(self, fixture_id: str, cutoff_at: datetime, *, capability: str | None = None) -> tuple[KnowledgeLedgerEntry, ...]: ...
 
 
@@ -389,15 +424,19 @@ class FileKnowledgeLedger:
             return None
         return KnowledgeLedgerEntry.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
-    def list(self) -> tuple[KnowledgeLedgerEntry, ...]:
+    def list(self, *, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[KnowledgeLedgerEntry, ...]:
         values = [self.get(path.stem) for path in sorted(self.root.glob("*.json"))]
-        return tuple(item for item in values if item is not None)
+        values = [item for item in values if item is not None]
+        if population_kind is not None:
+            expected = PopulationKind(population_kind)
+            values = [item for item in values if population_kind_for(item) is expected]
+        return tuple(values)
 
     def as_known_at(self, fixture_id: str, cutoff_at: datetime, *, capability: str | None = None) -> tuple[KnowledgeLedgerEntry, ...]:
         cutoff = _utc(cutoff_at, "cutoff_at")
         values = [
             entry
-            for entry in self.list()
+            for entry in self.list(population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
             if entry.fixture_id == fixture_id
             and entry.knowledge_at <= cutoff
             and entry.state is ObservationState.SUCCESS
@@ -990,7 +1029,7 @@ class ProspectiveFeatureSnapshotBuilder:
 class ProspectiveFeatureSnapshotStore(Protocol):
     def save(self, snapshot: ProspectiveFeatureSnapshot) -> ProspectiveFeatureSnapshot: ...
     def get(self, snapshot_id: str) -> ProspectiveFeatureSnapshot | None: ...
-    def list(self, *, fixture_id: str | None = None) -> tuple[ProspectiveFeatureSnapshot, ...]: ...
+    def list(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ProspectiveFeatureSnapshot, ...]: ...
 
 
 class FileProspectiveFeatureSnapshotStore:
@@ -1015,11 +1054,14 @@ class FileProspectiveFeatureSnapshotStore:
         path = self.root / f"{snapshot_id}.json"
         return ProspectiveFeatureSnapshot.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
 
-    def list(self, *, fixture_id: str | None = None) -> tuple[ProspectiveFeatureSnapshot, ...]:
+    def list(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ProspectiveFeatureSnapshot, ...]:
         values = [self.get(path.stem) for path in sorted(self.root.glob("*.json"))]
         values = [item for item in values if item is not None]
         if fixture_id is not None:
             values = [item for item in values if item.fixture_id == fixture_id]
+        if population_kind is not None:
+            expected = PopulationKind(population_kind)
+            values = [item for item in values if population_kind_for(item) is expected]
         return tuple(sorted(values, key=lambda item: (item.cutoff_at, item.snapshot_id)))
 
 
@@ -1124,13 +1166,16 @@ class FileLiveFixtureStore:
         path = self.root / f"{_file_key(fixture_id)}.json"
         return LiveFixture.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
 
-    def list(self, *, upcoming_only: bool = False, as_of: datetime | None = None) -> tuple[LiveFixture, ...]:
+    def list(self, *, upcoming_only: bool = False, as_of: datetime | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[LiveFixture, ...]:
         # The filename is a hash of the id, so read the canonical id from the
         # immutable payload instead of trying to reverse the filename key.
         values = [LiveFixture.from_dict(json.loads(path.read_text(encoding="utf-8"))) for path in sorted(self.root.glob("*.json"))]
         if upcoming_only:
             cutoff = _utc(as_of or datetime.now(UTC), "as_of")
             values = [item for item in values if item.kickoff_at >= cutoff and not item.completed]
+        if population_kind is not None:
+            expected = PopulationKind(population_kind)
+            values = [item for item in values if population_kind_for(item) is expected]
         return tuple(sorted(values, key=lambda item: (item.kickoff_at, item.fixture_id)))
 
 
@@ -1300,9 +1345,13 @@ class FileShadowForecastStore:
         path = self.root / f"{run_id}.json"
         return ShadowForecast.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
 
-    def list(self) -> tuple[ShadowForecast, ...]:
+    def list(self, *, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ShadowForecast, ...]:
         values = [self.get(path.stem) for path in sorted(self.root.glob("*.json"))]
-        return tuple(item for item in values if item is not None)
+        values = [item for item in values if item is not None]
+        if population_kind is not None:
+            expected = PopulationKind(population_kind)
+            values = [item for item in values if population_kind_for(item) is expected]
+        return tuple(values)
 
     def for_fixture(self, fixture_id: str, *, as_of: datetime | None = None) -> tuple[ShadowForecast, ...]:
         cutoff = _utc(as_of, "as_of") if as_of is not None else None
@@ -1472,11 +1521,14 @@ class FileForecastSettlementStore:
         path = self.root / f"{settlement_id}.json"
         return ForecastSettlement.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else None
 
-    def list(self, *, forecast_run_id: str | None = None) -> tuple[ForecastSettlement, ...]:
+    def list(self, *, forecast_run_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ForecastSettlement, ...]:
         values = [self.get(path.stem) for path in sorted(self.root.glob("*.json"))]
         values = [item for item in values if item is not None]
         if forecast_run_id is not None:
             values = [item for item in values if item.forecast_run_id == forecast_run_id]
+        if population_kind is not None:
+            expected = PopulationKind(population_kind)
+            values = [item for item in values if population_kind_for(item) is expected]
         return tuple(sorted(values, key=lambda item: (item.settled_at, item.created_at, item.settlement_id)))
 
     def latest(self, forecast_run_id: str) -> ForecastSettlement | None:
@@ -2031,6 +2083,7 @@ __all__ = [
     "ObservationTaskOutcome",
     "OperatingMode",
     "PopulationKind",
+    "population_kind_for",
     "ProspectiveFeatureSnapshot",
     "ProspectiveFeatureSnapshotBuilder",
     "PublicationState",

@@ -114,6 +114,80 @@ def test_fixture_fallback_policy_captures_primary_failure_and_sofascore_evidence
     assert result.evidence.source == "sofascore"
 
 
+def test_fixture_date_discovery_fallback_uses_sofascore_schedule_route(tmp_path):
+    from calibraxi_data import SofascoreSourceAdapter, SourceResult
+
+    class FailedEspn:
+        def fetch(self, capability, **params):
+            assert params["date"] == "20260926"
+            return SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, http_status=503, error="primary unavailable")
+
+    class SofascoreTransport:
+        def __init__(self):
+            self.urls = []
+
+        def request(self, url, *, headers, timeout):
+            self.urls.append(url)
+            assert url.endswith("/scheduled-events/2026-09-26")
+            return HttpResponse(200, b'{"events":[{"id":14025013,"startTimestamp":1755284400}]}', {})
+
+    transport = SofascoreTransport()
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("fixtures", "espn", ("sofascore",)))
+    result = AcquisitionCoordinator(
+        registry=registry,
+        adapters={"espn": FailedEspn(), "sofascore": SofascoreSourceAdapter(transport=transport)},
+        evidence_store=FileSystemRawEvidenceStore(tmp_path),
+    ).acquire("fixtures", params={"league": "eng.1", "date": "20260926"})
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.source == "sofascore"
+    assert [attempt.source for attempt in result.attempts] == ["espn", "sofascore"]
+    assert transport.urls == [
+        "https://www.sofascore.com/api/v1/sport/football/scheduled-events/2026-09-26"
+    ]
+
+
+def test_fixture_date_discovery_can_fail_over_to_thesportsdb(tmp_path):
+    from calibraxi_data import SourceResult
+    from calibraxi_data.thesportsdb import TheSportsDbSourceAdapter
+
+    class FailedSource:
+        def __init__(self, source):
+            self.source = source
+
+        def fetch(self, capability, **params):
+            return SourceResult(CapabilityState.SOURCE_FAILED, self.source, capability, error="source unavailable")
+
+    class TheSportsDbTransport:
+        def request(self, url, *, headers, timeout):
+            assert "eventsday.php" in url
+            assert "d=2026-09-26" in url
+            assert "l=4328" in url
+            assert "l=eng.1" not in url
+            return HttpResponse(
+                200,
+                b'{"events":[{"idEvent":"tsdb-1","idLeague":"4328","strEvent":"Arsenal vs Chelsea","dateEvent":"2026-09-26","strTime":"15:00:00","idHomeTeam":"1","idAwayTeam":"2"}]}',
+                {},
+            )
+
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("fixtures", "espn", ("sofascore", "thesportsdb")))
+    result = AcquisitionCoordinator(
+        registry=registry,
+        adapters={
+            "espn": FailedSource("espn"),
+            "sofascore": FailedSource("sofascore"),
+            "thesportsdb": TheSportsDbSourceAdapter(transport=TheSportsDbTransport()),
+        },
+        evidence_store=FileSystemRawEvidenceStore(tmp_path),
+    ).acquire("fixtures", params={"date": "20260926", "league": "eng.1"})
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert result.source == "thesportsdb"
+    assert [attempt.source for attempt in result.attempts] == ["espn", "sofascore", "thesportsdb"]
+
+
 def test_fixture_fallback_never_reuses_primary_provider_id(tmp_path):
     from calibraxi_data import SourceResult
 
@@ -185,6 +259,37 @@ def test_fixture_fallback_can_use_only_an_adjudicated_source_mapping(tmp_path):
     ).acquire("fixtures", params={"canonical_fixture_id": "fixture:1", "event_id": "401879301"})
 
     assert result.source == "sofascore"
+
+
+def test_detail_fallback_accepts_explicit_target_provider_id_without_reusing_primary_id(tmp_path):
+    from calibraxi_data import SourceResult
+
+    class FailedEspn:
+        def fetch(self, capability, **params):
+            assert "event_id" not in params
+            return SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="primary ID unavailable")
+
+    class Sofascore:
+        def fetch(self, capability, **params):
+            assert params["event_id"] == "14025013"
+            return SourceResult(CapabilityState.SUPPORTED, "sofascore", capability, payload={"event": {"id": "14025013"}})
+
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("lineups", "espn", ("sofascore",)))
+    result = AcquisitionCoordinator(
+        registry=registry,
+        adapters={"espn": FailedEspn(), "sofascore": Sofascore()},
+        evidence_store=FileSystemRawEvidenceStore(tmp_path),
+    ).acquire(
+        "lineups",
+        params={
+            "canonical_fixture_id": "fixture:1",
+            "source_fixture_ids": {"sofascore": "14025013"},
+        },
+    )
+
+    assert result.source == "sofascore"
+    assert result.state is CapabilityState.SUPPORTED
     assert result.attempts[-1].result.metadata == {}
 
 

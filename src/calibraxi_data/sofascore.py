@@ -46,6 +46,7 @@ class SofascoreSourceAdapter:
         "player_match_stats": "event/{event_id}/lineups",
         "player_stats": "event/{event_id}/lineups",
         "shots": "event/{event_id}/shotmap",
+        "xgot": "event/{event_id}/shotmap",
     }
 
     def __init__(
@@ -65,18 +66,34 @@ class SofascoreSourceAdapter:
         path = self._paths.get(capability)
         event_id = params.get("event_id") or params.get("fixture_id")
         schedule_request = capability == "fixtures" and params.get("tournament_id") and params.get("season_id") and params.get("round") is not None and not event_id
+        schedule_date_input = params.get("date") if capability == "fixtures" and not event_id and not schedule_request else None
+        schedule_date = None
+        if schedule_date_input is not None:
+            try:
+                schedule_date = _normalize_schedule_date(schedule_date_input)
+            except (TypeError, ValueError) as exc:
+                return SourceResult(
+                    CapabilityState.UNSUPPORTED,
+                    self.source_name,
+                    capability,
+                    error=f"invalid Sofascore schedule date: {exc}",
+                    integration=self.integration_name,
+                    adapter_version=self.adapter_version,
+                    metadata={"schedule_date_input": str(schedule_date_input)},
+                )
         if schedule_request:
             path = "unique-tournament/{tournament_id}/season/{season_id}/events/round/{round}"
-        if path is None or event_id in (None, ""):
-            if schedule_request:
-                pass
-            else:
-                return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, integration=self.integration_name, adapter_version=self.adapter_version)
+        elif schedule_date is not None:
+            path = "sport/football/scheduled-events/{date}"
+        if path is None or (event_id in (None, "") and not schedule_request and schedule_date is None):
+            return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, integration=self.integration_name, adapter_version=self.adapter_version)
         if path is None:
             return SourceResult(CapabilityState.UNSUPPORTED, self.source_name, capability, integration=self.integration_name, adapter_version=self.adapter_version)
-        format_params = {"event_id": event_id, "tournament_id": params.get("tournament_id"), "season_id": params.get("season_id"), "round": params.get("round")}
+        format_params = {"event_id": event_id, "tournament_id": params.get("tournament_id"), "season_id": params.get("season_id"), "round": params.get("round"), "date": schedule_date}
         url = f"{self._base}/{path.format(**format_params)}"
         metadata = {"url": url, "event_id": str(event_id) if event_id is not None else None}
+        if schedule_date is not None:
+            metadata.update({"schedule_date": schedule_date, "schedule_date_input": str(schedule_date_input)})
         try:
             request = request_with_retry(
                 self._transport,
@@ -121,6 +138,8 @@ class SofascoreObservationParser:
             return self._incidents(payload, event_id)
         if capability == "shots":
             return self._shots(payload, event_id)
+        if capability == "xgot":
+            return self._shots(payload, event_id, xgot_only=True)
         return ()
 
     def _fixture(self, payload: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
@@ -228,13 +247,15 @@ class SofascoreObservationParser:
             )
         return tuple(observations)
 
-    def _shots(self, payload: Mapping[str, Any], event_id: str | None) -> tuple[SourceObservation, ...]:
+    def _shots(self, payload: Mapping[str, Any], event_id: str | None, *, xgot_only: bool = False) -> tuple[SourceObservation, ...]:
         if not event_id:
             return ()
         shots = payload.get("shotmap") if isinstance(payload.get("shotmap"), list) else []
         observations: list[SourceObservation] = []
         for index, shot in enumerate(shots):
             if not isinstance(shot, Mapping):
+                continue
+            if xgot_only and shot.get("xgot") in (None, ""):
                 continue
             shot_id = _as_id(shot.get("id")) or f"index-{index}"
             attributes = {
@@ -279,6 +300,20 @@ def _unix_datetime(value: Any) -> datetime | None:
         return datetime.fromtimestamp(int(value), tz=timezone.utc) if value not in (None, "") else None
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _normalize_schedule_date(value: Any) -> str:
+    """Return the provider's ISO date for a runner date scope."""
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value).strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"expected YYYYMMDD or YYYY-MM-DD, got {text!r}")
 
 
 def _status_family(value: Any) -> str:

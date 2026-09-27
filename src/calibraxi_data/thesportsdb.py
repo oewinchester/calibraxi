@@ -26,6 +26,12 @@ class TheSportsDbSourceAdapter:
     source_name = "thesportsdb"
     adapter_version = "thesportsdb-http-json-v1"
     _base_template = "https://www.thesportsdb.com/api/v1/json/{api_key}"
+    _league_aliases = {
+        "eng.1": "4328",
+        "epl": "4328",
+        "english premier league": "4328",
+        "premier league": "4328",
+    }
 
     def __init__(
         self,
@@ -80,13 +86,28 @@ class TheSportsDbSourceAdapter:
             return f"{self._base}/search_all_teams.php", {"l": str(params.get("league", "English Premier League"))}
         if capability == "fixtures":
             league_id = params.get("league_id") or params.get("id") or params.get("league")
+            league_id = self._normalize_league_id(league_id)
             season = params.get("season")
+            date = params.get("date")
+            if date:
+                date_text = str(date)
+                if len(date_text) == 8 and date_text.isdigit():
+                    date_text = f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}"
+                return f"{self._base}/eventsday.php", {"d": date_text, **({"l": str(league_id)} if league_id else {})}
             if params.get("round") is not None:
                 return f"{self._base}/eventsround.php", {"id": str(league_id), "r": str(params["round"]), **({"s": str(season)} if season else {})}
             if league_id and season:
                 return f"{self._base}/eventsseason.php", {"id": str(league_id), "s": str(season)}
             return (None, {})
         return None, {}
+
+    @classmethod
+    def _normalize_league_id(cls, value: Any) -> str | None:
+        """Translate known CalibraXI league aliases to TheSportsDB IDs."""
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        return cls._league_aliases.get(text.casefold(), text)
 
 
 # Keep the shorter adapter name available to callers configuring source maps.
@@ -151,11 +172,28 @@ class TheSportsDbObservationParser:
             return None
         home_id = _string(event.get("idHomeTeam"))
         away_id = _string(event.get("idAwayTeam"))
+        home_score = _score(event.get("intHomeScore"))
+        away_score = _score(event.get("intAwayScore"))
+        status = _string(event.get("strStatus")) or _string(event.get("strProgress"))
+        completed = bool(status and status.casefold() in {"match finished", "finished", "ft", "aet", "pen"}) or (
+            home_score is not None and away_score is not None and bool(event.get("strTimestamp"))
+        )
+        attributes = {
+            "kickoff_at": kickoff,
+            "home_team_source_id": home_id,
+            "away_team_source_id": away_id,
+            "league_source_id": _string(event.get("idLeague")),
+            "season": event.get("strSeason"),
+            "status": status,
+            "status_completed": completed,
+            "home_goals": home_score,
+            "away_goals": away_score,
+        }
         return SourceObservation(
             EntityType.FIXTURE,
             SourceIdentity(self.source_name, EntityType.FIXTURE, str(event["idEvent"])),
             event.get("strEvent"),
-            {"kickoff_at": kickoff, "home_team_source_id": home_id, "away_team_source_id": away_id, "league_source_id": _string(event.get("idLeague")), "season": event.get("strSeason")},
+            attributes,
         )
 
     def _fixture_teams(self, event: Mapping[str, Any]) -> tuple[SourceObservation, ...]:
@@ -169,6 +207,15 @@ class TheSportsDbObservationParser:
 
 def _string(value: Any) -> str | None:
     return str(value) if value not in (None, "") else None
+
+
+def _score(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _kickoff(event: Mapping[str, Any]) -> datetime | None:

@@ -26,6 +26,7 @@ from .live import (
     ObservationTask,
     ObservationTaskOutcome,
     PopulationKind,
+    population_kind_for,
     ProspectiveFeatureSnapshot,
     ReliabilityReport,
     ShadowForecast,
@@ -78,6 +79,31 @@ def _same_shadow_content(existing: Any, incoming: Any) -> bool:
     return existing == incoming
 
 
+def _population_value(value: Any) -> str:
+    return population_kind_for(value).value
+
+
+def _population_filter(value: PopulationKind | str | None) -> str | None:
+    if value is None:
+        return None
+    return PopulationKind(value).value
+
+
+def _payload_with_population_kind(value: Any, population_kind: Any | None) -> Any:
+    """Make the migrated population column authoritative during rehydration."""
+
+    if population_kind is None:
+        return value
+    body = value
+    if isinstance(body, str):
+        body = json.loads(body)
+    if not isinstance(body, Mapping):
+        return body
+    result = dict(body)
+    result["population_kind"] = PopulationKind(population_kind).value
+    return result
+
+
 class _KnowledgeLedgerAdapter:
     def __init__(self, store: "LivePostgresStore") -> None:
         self.store = store
@@ -88,8 +114,8 @@ class _KnowledgeLedgerAdapter:
     def get(self, entry_id: str) -> KnowledgeLedgerEntry | None:
         return self.store.get_knowledge_entry(entry_id)
 
-    def list(self) -> tuple[KnowledgeLedgerEntry, ...]:
-        return self.store.list_knowledge_entries()
+    def list(self, *, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[KnowledgeLedgerEntry, ...]:
+        return self.store.list_knowledge_entries(population_kind=population_kind)
 
     def as_known_at(self, fixture_id: str, cutoff_at: datetime, *, capability: str | None = None) -> tuple[KnowledgeLedgerEntry, ...]:
         return self.store.as_known_at(fixture_id, cutoff_at, capability=capability)
@@ -105,8 +131,8 @@ class _FixtureAdapter:
     def get(self, fixture_id: str) -> LiveFixture | None:
         return self.store.get_live_fixture(fixture_id)
 
-    def list(self, *, upcoming_only: bool = False, as_of: datetime | None = None) -> tuple[LiveFixture, ...]:
-        return self.store.list_live_fixtures(upcoming_only=upcoming_only, as_of=as_of)
+    def list(self, *, upcoming_only: bool = False, as_of: datetime | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[LiveFixture, ...]:
+        return self.store.list_live_fixtures(upcoming_only=upcoming_only, as_of=as_of, population_kind=population_kind)
 
 
 class _SnapshotAdapter:
@@ -119,8 +145,8 @@ class _SnapshotAdapter:
     def get(self, snapshot_id: str) -> ProspectiveFeatureSnapshot | None:
         return self.store.get_prospective_feature_snapshot(snapshot_id)
 
-    def list(self, *, fixture_id: str | None = None) -> tuple[ProspectiveFeatureSnapshot, ...]:
-        return self.store.list_prospective_feature_snapshots(fixture_id=fixture_id)
+    def list(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ProspectiveFeatureSnapshot, ...]:
+        return self.store.list_prospective_feature_snapshots(fixture_id=fixture_id, population_kind=population_kind)
 
 
 class _TaskAdapter:
@@ -133,14 +159,14 @@ class _TaskAdapter:
     def get_task(self, task_id: str) -> ObservationTask | None:
         return self.store.get_task(task_id)
 
-    def list_tasks(self, *, fixture_id: str | None = None) -> tuple[ObservationTask, ...]:
-        return self.store.list_tasks(fixture_id=fixture_id)
+    def list_tasks(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ObservationTask, ...]:
+        return self.store.list_tasks(fixture_id=fixture_id, population_kind=population_kind)
 
     def save_outcome(self, outcome: ObservationTaskOutcome) -> ObservationTaskOutcome:
         return self.store.save_task_outcome(outcome)
 
-    def list_outcomes(self, task_id: str | None = None) -> tuple[ObservationTaskOutcome, ...]:
-        return self.store.list_task_outcomes(task_id=task_id)
+    def list_outcomes(self, task_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ObservationTaskOutcome, ...]:
+        return self.store.list_task_outcomes(task_id=task_id, population_kind=population_kind)
 
     def claim_task(self, task_id: str, token: str, lease_until: datetime, *, now: datetime | None = None) -> bool:
         return self.store.claim_task(task_id, token, lease_until, now=now)
@@ -162,11 +188,11 @@ class _ForecastAdapter:
     def get(self, run_id: str) -> ShadowForecast | None:
         return self.store.get_shadow_forecast(run_id)
 
-    def list(self) -> tuple[ShadowForecast, ...]:
-        return self.store.list_shadow_forecasts()
+    def list(self, *, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ShadowForecast, ...]:
+        return self.store.list_shadow_forecasts(population_kind=population_kind)
 
     def for_fixture(self, fixture_id: str, *, as_of: datetime | None = None) -> tuple[ShadowForecast, ...]:
-        values = self.store.list_shadow_forecasts(fixture_id=fixture_id)
+        values = self.store.list_shadow_forecasts(fixture_id=fixture_id, population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
         if as_of is not None:
             cutoff = _utc(as_of, "as_of")
             values = tuple(
@@ -190,8 +216,8 @@ class _SettlementAdapter:
     def get(self, settlement_id: str) -> ForecastSettlement | None:
         return self.store.get_settlement(settlement_id)
 
-    def list(self, *, forecast_run_id: str | None = None) -> tuple[ForecastSettlement, ...]:
-        return self.store.list_settlements(forecast_run_id=forecast_run_id)
+    def list(self, *, forecast_run_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ForecastSettlement, ...]:
+        return self.store.list_settlements(forecast_run_id=forecast_run_id, population_kind=population_kind)
 
     def latest(self, forecast_run_id: str) -> ForecastSettlement | None:
         return self.store.latest_settlement(forecast_run_id)
@@ -204,7 +230,7 @@ class _TrackRecordAdapter:
     def save(self, entry: TrackRecordEntry) -> TrackRecordEntry:
         return self.store.save_track_record(entry)
 
-    def list(self, *, population_id: str | None = None, kind: Any = None) -> tuple[TrackRecordEntry, ...]:
+    def list(self, *, population_id: str | None = None, kind: Any = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[TrackRecordEntry, ...]:
         population_kind = getattr(kind, "value", kind)
         return self.store.list_track_record(population_id=population_id, population_kind=population_kind)
 
@@ -222,8 +248,8 @@ class _ReliabilityAdapter:
     def get(self, report_id: str) -> ReliabilityReport | None:
         return self.store.get_reliability(report_id)
 
-    def list(self, *, population_id: str | None = None) -> tuple[ReliabilityReport, ...]:
-        return self.store.list_reliability(population_id=population_id)
+    def list(self, *, population_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ReliabilityReport, ...]:
+        return self.store.list_reliability(population_id=population_id, population_kind=population_kind)
 
 
 class _MonitoringAdapter:
@@ -236,8 +262,8 @@ class _MonitoringAdapter:
     def get(self, report_id: str) -> MonitoringReport | None:
         return self.store.get_monitoring(report_id)
 
-    def list(self, *, population_id: str | None = None) -> tuple[MonitoringReport, ...]:
-        return self.store.list_monitoring(population_id=population_id)
+    def list(self, *, population_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[MonitoringReport, ...]:
+        return self.store.list_monitoring(population_id=population_id, population_kind=population_kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +298,8 @@ class LivePostgresStore:
             available_at TIMESTAMPTZ, knowledge_at TIMESTAMPTZ NOT NULL,
             processing_at TIMESTAMPTZ, evidence_id TEXT, parser_version TEXT,
             schema_version TEXT, horizon TEXT, state TEXT NOT NULL,
-            correction_of TEXT, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
+            correction_of TEXT, population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit',
+            payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_calibraxi_knowledge_fixture_time ON calibraxi_knowledge_ledger(fixture_id, knowledge_at)",
@@ -283,7 +310,7 @@ class LivePostgresStore:
             competition TEXT NOT NULL, status TEXT NOT NULL,
             provider_ids JSONB NOT NULL, home_goals INTEGER, away_goals INTEGER,
             evidence_ids JSONB NOT NULL, knowledge_at TIMESTAMPTZ,
-            source TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+            source TEXT NOT NULL, population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit', updated_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL
         )
         """,
@@ -295,7 +322,7 @@ class LivePostgresStore:
             features JSONB NOT NULL, missingness JSONB NOT NULL,
             observation_ids JSONB NOT NULL, evidence_ids JSONB NOT NULL,
             eligibility_basis JSONB NOT NULL, knowledge_at TIMESTAMPTZ,
-            generated_at TIMESTAMPTZ NOT NULL, home_team TEXT, away_team TEXT,
+            generated_at TIMESTAMPTZ NOT NULL, population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit', home_team TEXT, away_team TEXT,
             season TEXT, payload JSONB NOT NULL
         )
         """,
@@ -305,20 +332,22 @@ class LivePostgresStore:
         CREATE TABLE IF NOT EXISTS calibraxi_observation_tasks (
             task_id TEXT PRIMARY KEY, fixture_id TEXT NOT NULL, kickoff_at TIMESTAMPTZ NOT NULL,
             horizon TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL, source TEXT, capability TEXT
+            created_at TIMESTAMPTZ NOT NULL, source TEXT, capability TEXT,
+            population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS calibraxi_observation_task_outcomes (
             outcome_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL,
-            recorded_at TIMESTAMPTZ NOT NULL, observation_id TEXT, reason TEXT
+            recorded_at TIMESTAMPTZ NOT NULL, observation_id TEXT, reason TEXT,
+            population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_calibraxi_task_outcomes_task ON calibraxi_observation_task_outcomes(task_id, recorded_at)",
         """
         CREATE TABLE IF NOT EXISTS calibraxi_observation_task_leases (
             task_id TEXT PRIMARY KEY, token TEXT NOT NULL, claimed_at TIMESTAMPTZ NOT NULL,
-            lease_until TIMESTAMPTZ NOT NULL
+            lease_until TIMESTAMPTZ NOT NULL, population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'
         )
         """,
         """
@@ -335,6 +364,7 @@ class LivePostgresStore:
             persisted_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), mode TEXT NOT NULL,
             persistence_attested BOOLEAN NOT NULL DEFAULT FALSE,
             publication_state TEXT NOT NULL, context TEXT NOT NULL,
+            population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit',
             payload JSONB NOT NULL
         )
         """,
@@ -347,7 +377,7 @@ class LivePostgresStore:
             settlement_id TEXT PRIMARY KEY, forecast_run_id TEXT NOT NULL, fixture_id TEXT NOT NULL,
             final_home_goals INTEGER NOT NULL, final_away_goals INTEGER NOT NULL,
             settled_at TIMESTAMPTZ NOT NULL, result_evidence_ids JSONB NOT NULL,
-            metrics JSONB NOT NULL, correction_of TEXT, created_at TIMESTAMPTZ NOT NULL,
+            metrics JSONB NOT NULL, correction_of TEXT, population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit', created_at TIMESTAMPTZ NOT NULL,
             payload JSONB NOT NULL
         )
         """,
@@ -375,9 +405,29 @@ class LivePostgresStore:
         """
         CREATE TABLE IF NOT EXISTS calibraxi_monitoring_reports (
             report_id TEXT PRIMARY KEY, population_id TEXT NOT NULL, status TEXT NOT NULL,
-            payload JSONB NOT NULL, generated_at TIMESTAMPTZ NOT NULL
+            population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit', payload JSONB NOT NULL, generated_at TIMESTAMPTZ NOT NULL
         )
         """,
+        "ALTER TABLE calibraxi_knowledge_ledger ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_live_fixtures ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_prospective_feature_snapshots ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_observation_tasks ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_observation_task_outcomes ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_observation_task_leases ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_shadow_forecasts ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_forecast_settlements ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "ALTER TABLE calibraxi_monitoring_reports ADD COLUMN IF NOT EXISTS population_kind TEXT NOT NULL DEFAULT 'prospective_true_pit'",
+        "UPDATE calibraxi_live_fixtures SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_knowledge_ledger SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_prospective_feature_snapshots SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_observation_tasks SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_observation_task_outcomes AS outcome SET population_kind=task.population_kind FROM calibraxi_observation_tasks AS task WHERE task.task_id=outcome.task_id",
+        "UPDATE calibraxi_observation_task_leases AS lease SET population_kind=task.population_kind FROM calibraxi_observation_tasks AS task WHERE task.task_id=lease.task_id",
+        "UPDATE calibraxi_shadow_forecasts SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_forecast_settlements SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(fixture_id) LIKE 'fixture:test:%'",
+        "UPDATE calibraxi_track_record_entries SET population_kind='test_smoke' WHERE lower(fixture_id) LIKE '%smoke%' OR lower(population_id) LIKE '%smoke%' OR lower(forecast_run_id) LIKE '%smoke%'",
+        "UPDATE calibraxi_reliability_reports SET population_kind='test_smoke' WHERE lower(population_id) LIKE '%smoke%'",
+        "UPDATE calibraxi_monitoring_reports SET population_kind='test_smoke' WHERE lower(population_id) LIKE '%smoke%'",
     )
 
     def __init__(self, *, connection_factory: Callable[[], Any], auto_migrate: bool = True) -> None:
@@ -457,8 +507,9 @@ class LivePostgresStore:
 
     def save_knowledge_entry(self, entry: KnowledgeLedgerEntry) -> KnowledgeLedgerEntry:
         payload = entry.to_dict()
+        population_kind = _population_value(entry)
         existing = self._read_one(
-            "SELECT source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at FROM calibraxi_knowledge_ledger WHERE entry_id=%s",
+            "SELECT source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, population_kind, payload, created_at FROM calibraxi_knowledge_ledger WHERE entry_id=%s",
             (entry.entry_id,),
         )
         incoming = (
@@ -466,7 +517,7 @@ class LivePostgresStore:
             entry.provider_entity_id, entry.source_observed_at, entry.source_updated_at,
             entry.available_at, entry.knowledge_at, entry.processing_at, entry.evidence_id,
             entry.parser_version, entry.schema_version, entry.horizon.value if entry.horizon else None,
-            entry.state.value, entry.correction_of, payload["payload"], entry.created_at,
+            entry.state.value, entry.correction_of, population_kind, payload["payload"], entry.created_at,
         )
         if existing is not None:
             if len(existing) == len(incoming) + 1:
@@ -475,8 +526,8 @@ class LivePostgresStore:
                 raise ValueError(f"knowledge ledger entry is immutable: {entry.entry_id}")
             return entry
         self._write(
-            "INSERT INTO calibraxi_knowledge_ledger (entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (entry_id) DO NOTHING",
-            (entry.entry_id, *incoming[:16], _json(payload["payload"]), incoming[17]),
+            "INSERT INTO calibraxi_knowledge_ledger (entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, population_kind, payload, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT (entry_id) DO NOTHING",
+            (entry.entry_id, *incoming[:17], _json(payload["payload"]), incoming[18]),
         )
         stored = self.get_knowledge_entry(entry.entry_id)
         if stored is None or not _same(stored.to_dict(), payload):
@@ -484,24 +535,35 @@ class LivePostgresStore:
         return stored
 
     def get_knowledge_entry(self, entry_id: str) -> KnowledgeLedgerEntry | None:
-        row = self._read_one("SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at FROM calibraxi_knowledge_ledger WHERE entry_id=%s", (entry_id,))
+        row = self._read_one("SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, population_kind, payload, created_at FROM calibraxi_knowledge_ledger WHERE entry_id=%s", (entry_id,))
         return self._ledger_from_row(row) if row is not None else None
 
-    def list_knowledge_entries(self, *, fixture_id: str | None = None) -> tuple[KnowledgeLedgerEntry, ...]:
-        if fixture_id is None:
-            rows = self._read_all("SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at FROM calibraxi_knowledge_ledger ORDER BY knowledge_at, entry_id")
-        else:
-            rows = self._read_all("SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at FROM calibraxi_knowledge_ledger WHERE fixture_id=%s ORDER BY knowledge_at, entry_id", (fixture_id,))
-        return tuple(self._ledger_from_row(row) for row in rows)
+    def list_knowledge_entries(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[KnowledgeLedgerEntry, ...]:
+        sql = "SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, population_kind, payload, created_at FROM calibraxi_knowledge_ledger"
+        conditions: list[str] = []
+        params: list[Any] = []
+        if fixture_id is not None:
+            conditions.append("fixture_id=%s")
+            params.append(fixture_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY knowledge_at, entry_id"
+        return tuple(self._ledger_from_row(row) for row in self._read_all(sql, tuple(params)))
 
     def as_known_at(self, fixture_id: str, cutoff_at: datetime, *, capability: str | None = None) -> tuple[KnowledgeLedgerEntry, ...]:
-        sql = "SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, payload, created_at FROM calibraxi_knowledge_ledger WHERE fixture_id=%s AND knowledge_at<=%s AND state='success'"
-        params: tuple[Any, ...] = (fixture_id, cutoff_at)
+        sql = "SELECT entry_id, source, capability, fixture_id, canonical_entity_id, provider_entity_id, source_observed_at, source_updated_at, available_at, knowledge_at, processing_at, evidence_id, parser_version, schema_version, horizon, state, correction_of, population_kind, payload, created_at FROM calibraxi_knowledge_ledger WHERE fixture_id=%s AND knowledge_at<=%s AND state='success'"
+        params: list[Any] = [fixture_id, cutoff_at]
+        sql += " AND population_kind=%s"
+        params.append(PopulationKind.PROSPECTIVE_TRUE_PIT.value)
         if capability is not None:
             sql += " AND capability=%s"
-            params += (capability,)
+            params.append(capability)
         sql += " ORDER BY knowledge_at, entry_id"
-        return tuple(self._ledger_from_row(row) for row in self._read_all(sql, params))
+        return tuple(self._ledger_from_row(row) for row in self._read_all(sql, tuple(params)))
 
     def save_live_fixture(self, fixture: LiveFixture) -> LiveFixture:
         """Persist the current fixture projection.
@@ -512,6 +574,9 @@ class LivePostgresStore:
         """
 
         payload = fixture.to_dict()
+        population_kind = _population_value(fixture)
+        stored_payload = dict(payload)
+        stored_payload["population_kind"] = population_kind
         existing = self._read_one("SELECT payload FROM calibraxi_live_fixtures WHERE fixture_id=%s", (fixture.fixture_id,))
         if existing is not None:
             body = existing[0] if isinstance(existing, tuple) else existing
@@ -523,8 +588,8 @@ class LivePostgresStore:
             if fixture.updated_at < current.updated_at:
                 return current
         self._write(
-            "INSERT INTO calibraxi_live_fixtures (fixture_id, kickoff_at, home_team, away_team, season, competition, status, provider_ids, home_goals, away_goals, evidence_ids, knowledge_at, source, updated_at, payload) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb) ON CONFLICT (fixture_id) DO UPDATE SET kickoff_at=EXCLUDED.kickoff_at, home_team=EXCLUDED.home_team, away_team=EXCLUDED.away_team, season=EXCLUDED.season, competition=EXCLUDED.competition, status=EXCLUDED.status, provider_ids=EXCLUDED.provider_ids, home_goals=EXCLUDED.home_goals, away_goals=EXCLUDED.away_goals, evidence_ids=EXCLUDED.evidence_ids, knowledge_at=EXCLUDED.knowledge_at, source=EXCLUDED.source, updated_at=EXCLUDED.updated_at, payload=EXCLUDED.payload WHERE calibraxi_live_fixtures.updated_at <= EXCLUDED.updated_at",
-            (fixture.fixture_id, fixture.kickoff_at, fixture.home_team, fixture.away_team, fixture.season, fixture.competition, fixture.status, _json(payload["provider_ids"]), fixture.home_goals, fixture.away_goals, _json(payload["evidence_ids"]), fixture.knowledge_at, fixture.source, fixture.updated_at, _json(payload)),
+            "INSERT INTO calibraxi_live_fixtures (fixture_id, kickoff_at, home_team, away_team, season, competition, status, provider_ids, home_goals, away_goals, evidence_ids, knowledge_at, source, population_kind, updated_at, payload) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s,%s,%s,%s,%s::jsonb) ON CONFLICT (fixture_id) DO UPDATE SET kickoff_at=EXCLUDED.kickoff_at, home_team=EXCLUDED.home_team, away_team=EXCLUDED.away_team, season=EXCLUDED.season, competition=EXCLUDED.competition, status=EXCLUDED.status, provider_ids=EXCLUDED.provider_ids, home_goals=EXCLUDED.home_goals, away_goals=EXCLUDED.away_goals, evidence_ids=EXCLUDED.evidence_ids, knowledge_at=EXCLUDED.knowledge_at, source=EXCLUDED.source, population_kind=EXCLUDED.population_kind, updated_at=EXCLUDED.updated_at, payload=EXCLUDED.payload WHERE calibraxi_live_fixtures.updated_at <= EXCLUDED.updated_at",
+            (fixture.fixture_id, fixture.kickoff_at, fixture.home_team, fixture.away_team, fixture.season, fixture.competition, fixture.status, _json(payload["provider_ids"]), fixture.home_goals, fixture.away_goals, _json(payload["evidence_ids"]), fixture.knowledge_at, fixture.source, population_kind, fixture.updated_at, _json(stored_payload)),
         )
         return self.get_live_fixture(fixture.fixture_id) or fixture
 
@@ -537,23 +602,28 @@ class LivePostgresStore:
             body = json.loads(body)
         return LiveFixture.from_dict(body)
 
-    def list_live_fixtures(self, *, upcoming_only: bool = False, as_of: datetime | None = None) -> tuple[LiveFixture, ...]:
-        sql = "SELECT payload FROM calibraxi_live_fixtures"
+    def list_live_fixtures(self, *, upcoming_only: bool = False, as_of: datetime | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[LiveFixture, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_live_fixtures"
         params: tuple[Any, ...] = ()
         if upcoming_only:
             sql += " WHERE kickoff_at >= %s AND home_goals IS NULL AND away_goals IS NULL"
             params = (as_of or _now(),)
         sql += " ORDER BY kickoff_at, fixture_id"
         values: list[LiveFixture] = []
+        expected = _population_filter(population_kind)
         for row in self._read_all(sql, params):
             body = row[0] if isinstance(row, tuple) else row
             if isinstance(body, str):
                 body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else body.get("population_kind") if isinstance(body, Mapping) else None
+            if expected is not None and (str(stored_kind or _population_value(body)) != expected):
+                continue
             values.append(LiveFixture.from_dict(body))
         return tuple(values)
 
     def save_prospective_feature_snapshot(self, snapshot: ProspectiveFeatureSnapshot) -> ProspectiveFeatureSnapshot:
         payload = snapshot.to_dict()
+        population_kind = _population_value(snapshot)
         existing = self._read_one("SELECT payload FROM calibraxi_prospective_feature_snapshots WHERE snapshot_id=%s", (snapshot.snapshot_id,))
         if existing is not None:
             body = existing[0] if isinstance(existing, tuple) else existing
@@ -569,8 +639,8 @@ class LivePostgresStore:
         if duplicate is not None:
             raise ValueError("prospective feature snapshot key already exists")
         self._write(
-            "INSERT INTO calibraxi_prospective_feature_snapshots (snapshot_id, fixture_id, context, cutoff_at, feature_schema_version, features, missingness, observation_ids, evidence_ids, eligibility_basis, knowledge_at, generated_at, home_team, away_team, season, payload) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
-            (snapshot.snapshot_id, snapshot.fixture_id, snapshot.context, snapshot.cutoff_at, snapshot.feature_schema_version, _json(payload["features"]), _json(payload["missingness"]), _json(payload["observation_ids"]), _json(payload["evidence_ids"]), _json(payload["eligibility_basis"]), snapshot.knowledge_at, snapshot.generated_at, snapshot.home_team, snapshot.away_team, snapshot.season, _json(payload)),
+            "INSERT INTO calibraxi_prospective_feature_snapshots (snapshot_id, fixture_id, context, cutoff_at, feature_schema_version, features, missingness, observation_ids, evidence_ids, eligibility_basis, knowledge_at, generated_at, population_kind, home_team, away_team, season, payload) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING",
+            (snapshot.snapshot_id, snapshot.fixture_id, snapshot.context, snapshot.cutoff_at, snapshot.feature_schema_version, _json(payload["features"]), _json(payload["missingness"]), _json(payload["observation_ids"]), _json(payload["evidence_ids"]), _json(payload["eligibility_basis"]), snapshot.knowledge_at, snapshot.generated_at, population_kind, snapshot.home_team, snapshot.away_team, snapshot.season, _json(payload)),
         )
         stored = self.get_prospective_feature_snapshot(snapshot.snapshot_id)
         if stored is not None:
@@ -594,85 +664,139 @@ class LivePostgresStore:
             body = json.loads(body)
         return ProspectiveFeatureSnapshot.from_dict(body)
 
-    def list_prospective_feature_snapshots(self, *, fixture_id: str | None = None) -> tuple[ProspectiveFeatureSnapshot, ...]:
-        sql = "SELECT payload FROM calibraxi_prospective_feature_snapshots"
+    def list_prospective_feature_snapshots(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ProspectiveFeatureSnapshot, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_prospective_feature_snapshots"
         params: tuple[Any, ...] = ()
+        conditions: list[str] = []
         if fixture_id is not None:
-            sql += " WHERE fixture_id=%s"
+            conditions.append("fixture_id=%s")
             params = (fixture_id,)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params += (expected,)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY cutoff_at, snapshot_id"
         values: list[ProspectiveFeatureSnapshot] = []
         for row in self._read_all(sql, params):
             body = row[0] if isinstance(row, tuple) else row
             if isinstance(body, str):
                 body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else None
+            if expected is not None and str(stored_kind or _population_value(body)) != expected:
+                continue
             values.append(ProspectiveFeatureSnapshot.from_dict(body))
         return tuple(values)
 
     @staticmethod
     def _ledger_from_row(row: Any) -> KnowledgeLedgerEntry:
+        # The population column is persisted for SQL-level isolation but is
+        # intentionally not part of the legacy value object.  Resolve its
+        # effective kind from the fixture marker when reconstructing it.
+        payload_index = -2 if len(row) >= 20 else 17
+        created_index = -1
         return KnowledgeLedgerEntry(
             entry_id=row[0], source=row[1], capability=row[2], fixture_id=row[3],
             canonical_entity_id=row[4], provider_entity_id=row[5], source_observed_at=row[6],
             source_updated_at=row[7], available_at=row[8], knowledge_at=row[9], processing_at=row[10],
             evidence_id=row[11], parser_version=row[12], schema_version=row[13], horizon=row[14],
-            state=row[15], correction_of=row[16], payload=row[17], created_at=row[18],
+            state=row[15], correction_of=row[16], payload=row[payload_index], created_at=row[created_index],
         )
 
     def save_task(self, task: ObservationTask) -> ObservationTask:
         payload = task.to_dict()
-        existing = self._read_one("SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability FROM calibraxi_observation_tasks WHERE task_id=%s", (task.task_id,))
+        population_kind = _population_value(task)
+        existing = self._read_one("SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability, population_kind FROM calibraxi_observation_tasks WHERE task_id=%s", (task.task_id,))
         incoming = (task.task_id, task.fixture_id, task.kickoff_at, task.horizon.value, task.scheduled_for, task.created_at, task.source, task.capability)
         if existing is not None:
-            if not _same(existing, incoming):
+            if not _same(existing[:8], incoming) or str(existing[8]) != population_kind:
                 raise ValueError(f"observation task is immutable: {task.task_id}")
             return task
-        self._write("INSERT INTO calibraxi_observation_tasks (task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (task_id) DO NOTHING", incoming)
+        self._write("INSERT INTO calibraxi_observation_tasks (task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability, population_kind) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (task_id) DO NOTHING", (*incoming, population_kind))
         stored = self.get_task(task.task_id)
         if stored is None or not _same(stored.to_dict(), payload):
             raise ValueError(f"observation task is immutable: {task.task_id}")
         return stored
 
     def get_task(self, task_id: str) -> ObservationTask | None:
-        row = self._read_one("SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability FROM calibraxi_observation_tasks WHERE task_id=%s", (task_id,))
+        row = self._read_one("SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability, population_kind FROM calibraxi_observation_tasks WHERE task_id=%s", (task_id,))
         if row is None:
             return None
         return ObservationTask(task_id=row[0], fixture_id=row[1], kickoff_at=row[2], horizon=row[3], scheduled_for=row[4], created_at=row[5], source=row[6], capability=row[7])
 
-    def list_tasks(self, *, fixture_id: str | None = None) -> tuple[ObservationTask, ...]:
-        sql = "SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability FROM calibraxi_observation_tasks"
-        params: tuple[Any, ...] = ()
+    def list_tasks(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ObservationTask, ...]:
+        sql = "SELECT task_id, fixture_id, kickoff_at, horizon, scheduled_for, created_at, source, capability, population_kind FROM calibraxi_observation_tasks"
+        params: list[Any] = []
+        conditions: list[str] = []
         if fixture_id is not None:
-            sql += " WHERE fixture_id=%s"
-            params = (fixture_id,)
+            conditions.append("fixture_id=%s")
+            params.append(fixture_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY scheduled_for, task_id"
-        return tuple(ObservationTask(task_id=row[0], fixture_id=row[1], kickoff_at=row[2], horizon=row[3], scheduled_for=row[4], created_at=row[5], source=row[6], capability=row[7]) for row in self._read_all(sql, params))
+        values: list[ObservationTask] = []
+        for row in self._read_all(sql, tuple(params)):
+            stored_kind = row[8] if isinstance(row, tuple) and len(row) > 8 else None
+            if expected is not None and str(stored_kind or _population_value({"fixture_id": row[1]})) != expected:
+                continue
+            values.append(ObservationTask(task_id=row[0], fixture_id=row[1], kickoff_at=row[2], horizon=row[3], scheduled_for=row[4], created_at=row[5], source=row[6], capability=row[7]))
+        return tuple(values)
 
     def save_task_outcome(self, outcome: ObservationTaskOutcome) -> ObservationTaskOutcome:
+        task_population = self._task_population_kind(outcome.task_id)
         incoming = (outcome.outcome_id, outcome.task_id, outcome.state.value, outcome.recorded_at, outcome.observation_id, outcome.reason)
-        existing = self._read_one("SELECT outcome_id, task_id, state, recorded_at, observation_id, reason FROM calibraxi_observation_task_outcomes WHERE outcome_id=%s", (outcome.outcome_id,))
+        existing = self._read_one("SELECT outcome_id, task_id, state, recorded_at, observation_id, reason, population_kind FROM calibraxi_observation_task_outcomes WHERE outcome_id=%s", (outcome.outcome_id,))
         if existing is not None:
-            if not _same(existing, incoming):
+            if not _same(existing[:6], incoming) or str(existing[6]) != task_population:
                 raise ValueError(f"observation task outcome is immutable: {outcome.outcome_id}")
             return outcome
-        self._write("INSERT INTO calibraxi_observation_task_outcomes (outcome_id, task_id, state, recorded_at, observation_id, reason) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (outcome_id) DO NOTHING", incoming)
+        self._write("INSERT INTO calibraxi_observation_task_outcomes (outcome_id, task_id, state, recorded_at, observation_id, reason, population_kind) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (outcome_id) DO NOTHING", (*incoming, task_population))
         stored = self.get_task_outcome(outcome.outcome_id)
         if stored is None or not _same(stored.to_dict(), outcome.to_dict()):
             raise ValueError(f"observation task outcome is immutable: {outcome.outcome_id}")
         return stored
 
     def get_task_outcome(self, outcome_id: str) -> ObservationTaskOutcome | None:
-        row = self._read_one("SELECT outcome_id, task_id, state, recorded_at, observation_id, reason FROM calibraxi_observation_task_outcomes WHERE outcome_id=%s", (outcome_id,))
+        row = self._read_one("SELECT outcome_id, task_id, state, recorded_at, observation_id, reason, population_kind FROM calibraxi_observation_task_outcomes WHERE outcome_id=%s", (outcome_id,))
         return ObservationTaskOutcome(outcome_id=row[0], task_id=row[1], state=row[2], recorded_at=row[3], observation_id=row[4], reason=row[5]) if row is not None else None
 
-    def list_task_outcomes(self, *, task_id: str | None = None) -> tuple[ObservationTaskOutcome, ...]:
-        sql = "SELECT outcome_id, task_id, state, recorded_at, observation_id, reason FROM calibraxi_observation_task_outcomes"
-        params: tuple[Any, ...] = ()
+    def list_task_outcomes(self, *, task_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ObservationTaskOutcome, ...]:
+        sql = "SELECT outcome_id, task_id, state, recorded_at, observation_id, reason, population_kind FROM calibraxi_observation_task_outcomes"
+        params: list[Any] = []
+        conditions: list[str] = []
         if task_id is not None:
-            sql += " WHERE task_id=%s"
-            params = (task_id,)
+            conditions.append("task_id=%s")
+            params.append(task_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY recorded_at, outcome_id"
-        return tuple(ObservationTaskOutcome(outcome_id=row[0], task_id=row[1], state=row[2], recorded_at=row[3], observation_id=row[4], reason=row[5]) for row in self._read_all(sql, params))
+        values: list[ObservationTaskOutcome] = []
+        for row in self._read_all(sql, tuple(params)):
+            stored_kind = row[6] if isinstance(row, tuple) and len(row) > 6 else self._task_population_kind(row[1])
+            if expected is not None and str(stored_kind) != expected:
+                continue
+            values.append(ObservationTaskOutcome(outcome_id=row[0], task_id=row[1], state=row[2], recorded_at=row[3], observation_id=row[4], reason=row[5]))
+        return tuple(values)
+
+    def _task_population_kind(self, task_id: str) -> str:
+        row = self._read_one("SELECT population_kind FROM calibraxi_observation_tasks WHERE task_id=%s", (task_id,))
+        if row is not None and len(row) > 0:
+            # Small in-memory SQL doubles return the complete task tuple for
+            # any task-table query; PostgreSQL returns the single selected
+            # column.  Accept both shapes without weakening the boundary.
+            candidate = row[8] if len(row) > 8 else row[0]
+            if candidate in {item.value for item in PopulationKind}:
+                return str(candidate)
+        return PopulationKind.PROSPECTIVE_TRUE_PIT.value
 
     def claim_task(self, task_id: str, token: str, lease_until: datetime, *, now: datetime | None = None) -> bool:
         """Atomically claim a due task for a restart-safe worker lease."""
@@ -684,15 +808,15 @@ class LivePostgresStore:
         try:
             cursor.execute(
                 """
-                INSERT INTO calibraxi_observation_task_leases (task_id, token, claimed_at, lease_until)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO calibraxi_observation_task_leases (task_id, token, claimed_at, lease_until, population_kind)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (task_id) DO UPDATE
                 SET token=EXCLUDED.token, claimed_at=EXCLUDED.claimed_at, lease_until=EXCLUDED.lease_until
                 WHERE calibraxi_observation_task_leases.lease_until <= %s
                    OR calibraxi_observation_task_leases.token = %s
                 RETURNING task_id
                 """,
-                (task_id, token, current, until, current, token),
+                (task_id, token, current, until, self._task_population_kind(task_id), current, token),
             )
             claimed = cursor.fetchone() is not None
             connection.commit()
@@ -725,6 +849,7 @@ class LivePostgresStore:
         return row is not None
 
     def save_shadow_forecast(self, forecast: ShadowForecast) -> ShadowForecast:
+        population_kind = _population_value(forecast)
         row = self._read_one(
             "SELECT payload, persisted_at, persistence_attested FROM calibraxi_shadow_forecasts WHERE run_id=%s",
             (forecast.run_id,),
@@ -748,8 +873,8 @@ class LivePostgresStore:
         if row is None:
             payload = forecast.to_dict()
             self._write(
-                "INSERT INTO calibraxi_shadow_forecasts (run_id, fixture_id, kickoff_at, cutoff_at, knowledge_at, feature_snapshot_id, feature_schema_version, model_family, model_version, horizon, raw_distribution, calibrated_distribution, calibration_version, power_rating_state, evidence_ids, source_lineage, created_at, mode, publication_state, context, payload) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s::jsonb) ON CONFLICT (run_id) DO NOTHING",
-                (forecast.run_id, forecast.fixture_id, forecast.kickoff_at, forecast.cutoff_at, forecast.knowledge_at, forecast.feature_snapshot_id, forecast.feature_schema_version, forecast.model_family, forecast.model_version, forecast.horizon.value, _json(payload["raw_distribution"]), _json(payload["calibrated_distribution"]) if payload["calibrated_distribution"] else None, forecast.calibration_version, _json(payload["power_rating_state"]), _json(payload["evidence_ids"]), _json(payload["source_lineage"]), forecast.created_at, forecast.mode.value, forecast.publication_state.value, forecast.context, _json(payload)),
+                "INSERT INTO calibraxi_shadow_forecasts (run_id, fixture_id, kickoff_at, cutoff_at, knowledge_at, feature_snapshot_id, feature_schema_version, model_family, model_version, horizon, raw_distribution, calibrated_distribution, calibration_version, power_rating_state, evidence_ids, source_lineage, created_at, mode, publication_state, context, population_kind, payload) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT (run_id) DO NOTHING",
+                (forecast.run_id, forecast.fixture_id, forecast.kickoff_at, forecast.cutoff_at, forecast.knowledge_at, forecast.feature_snapshot_id, forecast.feature_schema_version, forecast.model_family, forecast.model_version, forecast.horizon.value, _json(payload["raw_distribution"]), _json(payload["calibrated_distribution"]) if payload["calibrated_distribution"] else None, forecast.calibration_version, _json(payload["power_rating_state"]), _json(payload["evidence_ids"]), _json(payload["source_lineage"]), forecast.created_at, forecast.mode.value, forecast.publication_state.value, forecast.context, population_kind, _json(payload)),
             )
             row = self._read_one(
                 "SELECT payload, persisted_at, persistence_attested FROM calibraxi_shadow_forecasts WHERE run_id=%s",
@@ -807,14 +932,22 @@ class LivePostgresStore:
         row = self._read_one("SELECT run_id, fixture_id, kickoff_at, cutoff_at, knowledge_at, feature_snapshot_id, feature_schema_version, model_family, model_version, horizon, raw_distribution, calibrated_distribution, calibration_version, power_rating_state, evidence_ids, source_lineage, created_at, mode, publication_state, context, persisted_at, prediction_cutoff_at FROM calibraxi_shadow_forecasts WHERE run_id=%s AND persistence_attested=TRUE", (run_id,))
         return self._shadow_from_row(row) if row is not None else None
 
-    def list_shadow_forecasts(self, *, fixture_id: str | None = None) -> tuple[ShadowForecast, ...]:
-        sql = "SELECT run_id, fixture_id, kickoff_at, cutoff_at, knowledge_at, feature_snapshot_id, feature_schema_version, model_family, model_version, horizon, raw_distribution, calibrated_distribution, calibration_version, power_rating_state, evidence_ids, source_lineage, created_at, mode, publication_state, context, persisted_at, prediction_cutoff_at FROM calibraxi_shadow_forecasts WHERE persistence_attested=TRUE"
-        params: tuple[Any, ...] = ()
+    def list_shadow_forecasts(self, *, fixture_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ShadowForecast, ...]:
+        sql = "SELECT run_id, fixture_id, kickoff_at, cutoff_at, knowledge_at, feature_snapshot_id, feature_schema_version, model_family, model_version, horizon, raw_distribution, calibrated_distribution, calibration_version, power_rating_state, evidence_ids, source_lineage, created_at, mode, publication_state, context, persisted_at, prediction_cutoff_at, population_kind FROM calibraxi_shadow_forecasts WHERE persistence_attested=TRUE"
+        params: list[Any] = []
         if fixture_id is not None:
             sql += " AND fixture_id=%s"
-            params = (fixture_id,)
+            params.append(fixture_id)
         sql += " ORDER BY cutoff_at, run_id"
-        return tuple(self._shadow_from_row(row) for row in self._read_all(sql, params))
+        expected = _population_filter(population_kind)
+        values: list[ShadowForecast] = []
+        for row in self._read_all(sql, tuple(params)):
+            forecast = self._shadow_from_row(row)
+            stored_kind = row[22] if isinstance(row, tuple) and len(row) > 22 else _population_value(forecast)
+            if expected is not None and str(stored_kind) != expected:
+                continue
+            values.append(forecast)
+        return tuple(values)
 
     @staticmethod
     def _shadow_from_row(row: Any) -> ShadowForecast:
@@ -837,7 +970,7 @@ class LivePostgresStore:
                 raise ValueError("settlement correction target does not exist")
             if tuple(prior) != (settlement.forecast_run_id, settlement.fixture_id):
                 raise ValueError("settlement correction must target the same forecast and fixture")
-        self._write("INSERT INTO calibraxi_forecast_settlements (settlement_id, forecast_run_id, fixture_id, final_home_goals, final_away_goals, settled_at, result_evidence_ids, metrics, correction_of, created_at, payload) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING", (settlement.settlement_id, settlement.forecast_run_id, settlement.fixture_id, settlement.final_home_goals, settlement.final_away_goals, settlement.settled_at, _json(payload["result_evidence_ids"]), _json(payload["metrics"]), settlement.correction_of, settlement.created_at, _json(payload)))
+        self._write("INSERT INTO calibraxi_forecast_settlements (settlement_id, forecast_run_id, fixture_id, final_home_goals, final_away_goals, settled_at, result_evidence_ids, metrics, correction_of, population_kind, created_at, payload) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING", (settlement.settlement_id, settlement.forecast_run_id, settlement.fixture_id, settlement.final_home_goals, settlement.final_away_goals, settlement.settled_at, _json(payload["result_evidence_ids"]), _json(payload["metrics"]), settlement.correction_of, _population_value(settlement), settlement.created_at, _json(payload)))
         stored = self.get_settlement(settlement.settlement_id)
         if stored is not None and _same(stored.to_dict(), payload):
             return stored
@@ -852,18 +985,28 @@ class LivePostgresStore:
             body = json.loads(body)
         return ForecastSettlement.from_dict(body)
 
-    def list_settlements(self, *, forecast_run_id: str | None = None) -> tuple[ForecastSettlement, ...]:
-        sql = "SELECT payload FROM calibraxi_forecast_settlements"
-        params: tuple[Any, ...] = ()
+    def list_settlements(self, *, forecast_run_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ForecastSettlement, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_forecast_settlements"
+        params: list[Any] = []
+        conditions: list[str] = []
         if forecast_run_id is not None:
-            sql += " WHERE forecast_run_id=%s"
-            params = (forecast_run_id,)
+            conditions.append("forecast_run_id=%s")
+            params.append(forecast_run_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY settled_at, settlement_id"
         values: list[ForecastSettlement] = []
-        for row in self._read_all(sql, params):
+        for row in self._read_all(sql, tuple(params)):
             body = row[0] if isinstance(row, tuple) else row
             if isinstance(body, str):
                 body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else _population_value(body)
+            if expected is not None and str(stored_kind) != expected:
+                continue
             values.append(ForecastSettlement.from_dict(body))
         return tuple(values)
 
@@ -885,16 +1028,16 @@ class LivePostgresStore:
         return stored
 
     def get_track_record(self, entry_id: str) -> TrackRecordEntry | None:
-        row = self._read_one("SELECT payload FROM calibraxi_track_record_entries WHERE entry_id=%s", (entry_id,))
+        row = self._read_one("SELECT payload, population_kind FROM calibraxi_track_record_entries WHERE entry_id=%s", (entry_id,))
         if row is None:
             return None
         body = row[0] if isinstance(row, tuple) else row
-        if isinstance(body, str):
-            body = json.loads(body)
+        stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else None
+        body = _payload_with_population_kind(body, stored_kind)
         return TrackRecordEntry.from_dict(body)
 
-    def list_track_record(self, *, population_id: str | None = None, population_kind: str | None = None) -> tuple[TrackRecordEntry, ...]:
-        sql = "SELECT payload FROM calibraxi_track_record_entries"
+    def list_track_record(self, *, population_id: str | None = None, population_kind: str | None = PopulationKind.PROSPECTIVE_TRUE_PIT.value) -> tuple[TrackRecordEntry, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_track_record_entries"
         params: list[Any] = []
         conditions: list[str] = []
         if population_id is not None:
@@ -909,8 +1052,8 @@ class LivePostgresStore:
         values: list[TrackRecordEntry] = []
         for row in self._read_all(sql, tuple(params)):
             body = row[0] if isinstance(row, tuple) else row
-            if isinstance(body, str):
-                body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else None
+            body = _payload_with_population_kind(body, stored_kind)
             values.append(TrackRecordEntry.from_dict(body))
         return tuple(values)
 
@@ -925,7 +1068,7 @@ class LivePostgresStore:
         since: datetime | None = None,
         until: datetime | None = None,
     ) -> Mapping[str, Any]:
-        values = list(self.list_track_record(population_id=population_id))
+        values = list(self.list_track_record(population_id=population_id, population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT.value))
         superseded = {item.correction_of for item in values if item.correction_of}
         values = [item for item in values if item.settlement_id not in superseded]
         if model_family is not None:
@@ -960,26 +1103,35 @@ class LivePostgresStore:
         return stored
 
     def get_reliability(self, report_id: str) -> ReliabilityReport | None:
-        row = self._read_one("SELECT payload FROM calibraxi_reliability_reports WHERE report_id=%s", (report_id,))
+        row = self._read_one("SELECT payload, population_kind FROM calibraxi_reliability_reports WHERE report_id=%s", (report_id,))
         if row is None:
             return None
         body = row[0] if isinstance(row, tuple) else row
-        if isinstance(body, str):
-            body = json.loads(body)
+        stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else None
+        body = _payload_with_population_kind(body, stored_kind)
         return ReliabilityReport.from_dict(body)
 
-    def list_reliability(self, *, population_id: str | None = None) -> tuple[ReliabilityReport, ...]:
-        sql = "SELECT payload FROM calibraxi_reliability_reports"
-        params: tuple[Any, ...] = ()
+    def list_reliability(self, *, population_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[ReliabilityReport, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_reliability_reports"
+        params: list[Any] = []
+        conditions: list[str] = []
         if population_id is not None:
-            sql += " WHERE population_id=%s"
-            params = (population_id,)
+            conditions.append("population_id=%s")
+            params.append(population_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY generated_at, report_id"
         values: list[ReliabilityReport] = []
-        for row in self._read_all(sql, params):
+        for row in self._read_all(sql, tuple(params)):
             body = row[0] if isinstance(row, tuple) else row
-            if isinstance(body, str):
-                body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else body.get("population_kind") if isinstance(body, Mapping) else None
+            if expected is not None and str(stored_kind or _population_value(body)) != expected:
+                continue
+            body = _payload_with_population_kind(body, stored_kind)
             values.append(ReliabilityReport.from_dict(body))
         return tuple(values)
 
@@ -994,7 +1146,8 @@ class LivePostgresStore:
                 raise ValueError(f"monitoring report is immutable: {report_id}")
             return
         incoming = (body, population_id, status, generated_at or _now())
-        self._write("INSERT INTO calibraxi_monitoring_reports (report_id, population_id, status, payload, generated_at) VALUES (%s,%s,%s,%s::jsonb,%s) ON CONFLICT (report_id) DO NOTHING", (report_id, population_id, status, _json(body), incoming[3]))
+        population_kind = str(body.get("population_kind") or PopulationKind.PROSPECTIVE_TRUE_PIT.value)
+        self._write("INSERT INTO calibraxi_monitoring_reports (report_id, population_id, status, payload, generated_at, population_kind) VALUES (%s,%s,%s,%s::jsonb,%s,%s) ON CONFLICT (report_id) DO NOTHING", (report_id, population_id, status, _json(body), incoming[3], population_kind))
         stored = self.get_monitoring(report_id)
         if stored is None or not _same((stored.to_dict(), stored.population_id, stored.status.value), (body, population_id, status)) or stored.generated_at != incoming[3]:
             raise ValueError(f"monitoring report is immutable: {report_id}")
@@ -1012,26 +1165,35 @@ class LivePostgresStore:
         return report
 
     def get_monitoring(self, report_id: str) -> MonitoringReport | None:
-        row = self._read_one("SELECT payload FROM calibraxi_monitoring_reports WHERE report_id=%s", (report_id,))
+        row = self._read_one("SELECT payload, population_kind FROM calibraxi_monitoring_reports WHERE report_id=%s", (report_id,))
         if row is None:
             return None
         body = row[0] if isinstance(row, tuple) else row
-        if isinstance(body, str):
-            body = json.loads(body)
+        stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else None
+        body = _payload_with_population_kind(body, stored_kind)
         return MonitoringReport.from_dict(body)
 
-    def list_monitoring(self, *, population_id: str | None = None) -> tuple[MonitoringReport, ...]:
-        sql = "SELECT payload FROM calibraxi_monitoring_reports"
-        params: tuple[Any, ...] = ()
+    def list_monitoring(self, *, population_id: str | None = None, population_kind: PopulationKind | str | None = PopulationKind.PROSPECTIVE_TRUE_PIT) -> tuple[MonitoringReport, ...]:
+        sql = "SELECT payload, population_kind FROM calibraxi_monitoring_reports"
+        params: list[Any] = []
+        conditions: list[str] = []
         if population_id is not None:
-            sql += " WHERE population_id=%s"
-            params = (population_id,)
+            conditions.append("population_id=%s")
+            params.append(population_id)
+        expected = _population_filter(population_kind)
+        if expected is not None:
+            conditions.append("population_kind=%s")
+            params.append(expected)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY generated_at, report_id"
         values: list[MonitoringReport] = []
-        for row in self._read_all(sql, params):
+        for row in self._read_all(sql, tuple(params)):
             body = row[0] if isinstance(row, tuple) else row
-            if isinstance(body, str):
-                body = json.loads(body)
+            stored_kind = row[1] if isinstance(row, tuple) and len(row) > 1 else body.get("population_kind") if isinstance(body, Mapping) else None
+            if expected is not None and str(stored_kind or _population_value(body)) != expected:
+                continue
+            body = _payload_with_population_kind(body, stored_kind)
             values.append(MonitoringReport.from_dict(body))
         return tuple(values)
 
@@ -1039,7 +1201,7 @@ class LivePostgresStore:
 class LiveReadService:
     """Stable read boundary that never merges reconstructed and true-PIT data."""
 
-    def __init__(self, *, ledger: Any, forecasts: Any, settlements: Any, track_record: Any, reliability: Any, fixtures: Any | None = None, snapshots: Any | None = None, historical_evaluation: Any | None = None) -> None:
+    def __init__(self, *, ledger: Any, forecasts: Any, settlements: Any, track_record: Any, reliability: Any, fixtures: Any | None = None, snapshots: Any | None = None, source_health: Any | None = None, historical_evaluation: Any | None = None) -> None:
         self.ledger = ledger
         self.forecasts = forecasts
         self.settlements = settlements
@@ -1047,7 +1209,322 @@ class LiveReadService:
         self.reliability = reliability
         self.fixtures = fixtures
         self.snapshots = snapshots
+        self.source_health = source_health
         self.historical_evaluation = historical_evaluation
+
+    @staticmethod
+    def _read_collection(source: Any, method_name: str, fallback_name: str = "list", **kwargs: Any) -> tuple[Any, ...]:
+        """Read a collection through either a PostgreSQL adapter or file store.
+
+        The live runner deliberately accepts small store protocols.  Keeping
+        that same compatibility at the read boundary lets operational tooling
+        use the file stores in local runs and PostgreSQL in production without
+        a second summary implementation.
+        """
+
+        if source is None:
+            return ()
+        method = getattr(source, method_name, None)
+        if method is None:
+            method = getattr(source, fallback_name, None)
+        if method is None:
+            return ()
+        try:
+            values = method(**kwargs)
+        except TypeError:
+            # A few intentionally small test doubles expose ``list()`` only.
+            values = method()
+        return tuple(values or ())
+
+    def _fixture_rows(self, *, upcoming_only: bool, as_of: datetime) -> tuple[Any, ...]:
+        source = self.fixtures
+        if source is None and hasattr(self.ledger, "list_live_fixtures"):
+            source = self.ledger
+        if source is None:
+            return ()
+        return self._read_collection(
+            source,
+            "list_live_fixtures",
+            "list",
+            upcoming_only=upcoming_only,
+            as_of=as_of,
+            population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT,
+        )
+
+    def _ledger_rows(self, *, as_of: datetime) -> tuple[Any, ...]:
+        values = self._read_collection(self.ledger, "list_knowledge_entries", "list")
+        return tuple(
+            item
+            for item in values
+            if getattr(item, "knowledge_at", None) is not None
+            and _utc(item.knowledge_at, "knowledge_at") <= as_of
+        )
+
+    def _snapshot_rows(self, *, as_of: datetime) -> tuple[Any, ...]:
+        source = self.snapshots
+        if source is None and hasattr(self.ledger, "list_prospective_feature_snapshots"):
+            source = self.ledger
+        values = self._read_collection(source, "list_prospective_feature_snapshots", "list")
+        return tuple(
+            item
+            for item in values
+            if getattr(item, "generated_at", None) is not None
+            and _utc(item.generated_at, "generated_at") <= as_of
+        )
+
+    def _forecast_rows(self, *, as_of: datetime) -> tuple[ShadowForecast, ...]:
+        source = self.forecasts
+        values = self._read_collection(source, "list_shadow_forecasts", "list")
+        eligible: list[ShadowForecast] = []
+        for item in values:
+            persisted_at = getattr(item, "persisted_at", None)
+            prediction_cutoff = getattr(item, "prediction_cutoff_at", None)
+            if persisted_at is None:
+                continue
+            if _utc(persisted_at, "persisted_at") > as_of:
+                continue
+            if prediction_cutoff is not None and _utc(prediction_cutoff, "prediction_cutoff_at") > as_of:
+                continue
+            eligible.append(item)
+        return tuple(sorted(eligible, key=lambda item: (item.kickoff_at, item.run_id)))
+
+    def _settlement_rows(self, *, as_of: datetime) -> tuple[Any, ...]:
+        values = self._read_collection(self.settlements, "list_settlements", "list")
+        return tuple(
+            item
+            for item in values
+            if getattr(item, "created_at", None) is not None
+            and _utc(item.created_at, "created_at") <= as_of
+        )
+
+    def _source_health_rows(self, *, as_of: datetime) -> tuple[Any, ...]:
+        values = self._read_collection(self.source_health, "list_source_health", "list")
+        return tuple(
+            item
+            for item in values
+            if getattr(item, "updated_at", None) is None
+            or _utc(item.updated_at, "updated_at") <= as_of
+        )
+
+    @staticmethod
+    def _source_health_dict(item: Any) -> Mapping[str, Any]:
+        fields = (
+            "capability",
+            "source",
+            "health",
+            "attempt_count",
+            "success_count",
+            "failure_count",
+            "schema_drift_count",
+            "empty_population_count",
+            "quarantine_count",
+            "retryable_failure_count",
+            "timeout_count",
+            "rate_limit_count",
+            "mapping_failure_count",
+            "last_attempt_at",
+            "last_success_at",
+            "last_failure_at",
+            "last_latency_ms",
+            "last_source_observed_at",
+            "freshness_seconds",
+            "last_error",
+            "updated_at",
+        )
+        result: dict[str, Any] = {}
+        for field in fields:
+            value = getattr(item, field, None)
+            if isinstance(value, datetime):
+                value = _utc(value, field).isoformat()
+            else:
+                value = getattr(value, "value", value)
+            result[field] = value
+        return result
+
+    @staticmethod
+    def _state_value(value: Any) -> str:
+        return str(getattr(value, "value", value))
+
+    def operational_summary(self, *, as_of: datetime | None = None) -> Mapping[str, Any]:
+        """Return the backend data-coverage contract for live operations.
+
+        Every section is derived from the prospective stores and is therefore
+        safe for a dashboard or health endpoint to consume.  Counts are kept
+        separate from the historical evaluation population; no reconstructed
+        rows are consulted here.
+        """
+
+        cutoff = _utc(as_of or _now(), "as_of")
+        all_fixtures = tuple(
+            item
+            for item in self._fixture_rows(upcoming_only=False, as_of=cutoff)
+            if population_kind_for(item) is PopulationKind.PROSPECTIVE_TRUE_PIT
+        )
+        upcoming = tuple(item for item in all_fixtures if item.kickoff_at >= cutoff and not item.completed)
+        upcoming_ids = {item.fixture_id for item in upcoming}
+        all_ledger = self._ledger_rows(as_of=cutoff)
+        ledger = tuple(item for item in all_ledger if item.fixture_id in upcoming_ids)
+        snapshots = tuple(item for item in self._snapshot_rows(as_of=cutoff) if item.fixture_id in upcoming_ids)
+        all_forecasts = self._forecast_rows(as_of=cutoff)
+        forecasts = tuple(item for item in all_forecasts if item.fixture_id in upcoming_ids)
+
+        # A fixture's provider IDs are the current read projection of confirmed
+        # identity links.  Report both single-source knowledge and cross-source
+        # links so an operator never has to infer mapping coverage from names.
+        mapped = [item for item in upcoming if getattr(item, "provider_ids", {})]
+        cross_source = [item for item in mapped if len(item.provider_ids) > 1]
+        provider_counts: dict[str, int] = {}
+        for fixture in upcoming:
+            for provider in getattr(fixture, "provider_ids", {}):
+                provider_counts[str(provider)] = provider_counts.get(str(provider), 0) + 1
+
+        expected_capabilities = {
+            "fixtures",
+            "lineups",
+            "events",
+            "team_match_stats",
+            "player_stats",
+            "shots",
+            "xg",
+            "xg_a",
+            "xgot",
+        }
+        capabilities = sorted(expected_capabilities | {str(item.capability) for item in ledger})
+        source_coverage: dict[str, Any] = {}
+        for capability in capabilities:
+            rows = [item for item in ledger if str(item.capability) == capability]
+            state_counts: dict[str, int] = {}
+            source_counts: dict[str, int] = {}
+            successful_fixtures: set[str] = set()
+            for row in rows:
+                state = self._state_value(row.state)
+                state_counts[state] = state_counts.get(state, 0) + 1
+                source = str(row.source)
+                source_counts[source] = source_counts.get(source, 0) + 1
+                if state == "success":
+                    successful_fixtures.add(row.fixture_id)
+            source_coverage[capability] = {
+                "fixture_count": len(upcoming),
+                "observed_fixture_count": len(successful_fixtures),
+                "observation_count": len(rows),
+                "state_counts": state_counts,
+                "source_counts": source_counts,
+            }
+
+        expected_enrichment = ("lineups", "events", "team_match_stats", "player_stats", "shots", "xg", "xg_a", "xgot")
+        enrichment: dict[str, Any] = {}
+        for capability in expected_enrichment:
+            rows = [item for item in ledger if str(item.capability) == capability]
+            state_counts: dict[str, int] = {}
+            successful_fixtures: set[str] = set()
+            for row in rows:
+                state = self._state_value(row.state)
+                state_counts[state] = state_counts.get(state, 0) + 1
+                if state == "success":
+                    successful_fixtures.add(row.fixture_id)
+            enrichment[capability] = {
+                "fixture_count": len(upcoming),
+                "observed_fixture_count": len(successful_fixtures),
+                "observation_count": len(rows),
+                "state_counts": state_counts,
+            }
+        # ``team_stats`` is the public dashboard label; retain the canonical
+        # capability key above for callers that operate on adapter names.
+        enrichment["team_stats"] = enrichment["team_match_stats"]
+
+        snapshot_fixture_ids = {item.fixture_id for item in snapshots}
+        forecast_fixture_ids = {item.fixture_id for item in forecasts}
+        attested = [item for item in forecasts if getattr(item, "persisted_at", None) is not None and getattr(item, "prediction_cutoff_at", None) is not None]
+        model_runs: dict[str, int] = {}
+        model_versions: dict[str, dict[str, int]] = {}
+        for forecast in forecasts:
+            family = str(forecast.model_family)
+            model_runs[family] = model_runs.get(family, 0) + 1
+            versions = model_versions.setdefault(family, {})
+            version = str(forecast.model_version)
+            versions[version] = versions.get(version, 0) + 1
+        missing_reasons = {
+            "no_snapshot": len(upcoming_ids - snapshot_fixture_ids),
+            "no_forecast": len(upcoming_ids - forecast_fixture_ids),
+            "forecast_not_attested": len([item for item in forecasts if item not in attested]),
+        }
+
+        all_settlements = self._settlement_rows(as_of=cutoff)
+        source_health = [self._source_health_dict(item) for item in self._source_health_rows(as_of=cutoff)]
+        settlements_by_run: dict[str, list[Any]] = {}
+        for settlement in all_settlements:
+            settlements_by_run.setdefault(str(settlement.forecast_run_id), []).append(settlement)
+        settled_runs = set(settlements_by_run)
+        completed = tuple(item for item in all_fixtures if item.completed)
+        completed_ids = {item.fixture_id for item in completed}
+        completed_forecast_runs = {item.run_id for item in all_forecasts if item.fixture_id in completed_ids}
+        backlog_runs = completed_forecast_runs - settled_runs
+        backlog_fixture_ids = {
+            item.fixture_id
+            for item in all_forecasts
+            if item.fixture_id in completed_ids and item.run_id in backlog_runs
+        }
+        cached_fallback_rows = tuple(
+            item
+            for item in all_ledger
+            if isinstance(getattr(item, "payload", None), Mapping)
+            and bool(item.payload.get("fallback_used"))
+            and item.payload.get("entity_scope") == "fixture_schedule_query"
+        )
+        cached_fallback_dates = sorted(
+            {
+                str(item.payload.get("date"))
+                for item in cached_fallback_rows
+                if item.payload.get("date") not in (None, "")
+            }
+        )
+        cached_fallback_fixture_count = sum(
+            int(item.payload.get("fallback_fixture_count") or item.payload.get("fixture_count") or 0)
+            for item in cached_fallback_rows
+        )
+
+        return {
+            "as_of": cutoff.isoformat(),
+            "population": PopulationKind.PROSPECTIVE_TRUE_PIT.value,
+            "upcoming": {
+                "fixture_count": len(upcoming),
+                "mapped_fixture_count": len(mapped),
+                "confirmed_cross_source_mapping_count": len(cross_source),
+                "unresolved_mapping_count": len(upcoming) - len(mapped),
+                "provider_fixture_counts": provider_counts,
+                "source_coverage": source_coverage,
+            },
+            "forecast": {
+                "snapshot_count": len(snapshots),
+                "snapshot_fixture_count": len(snapshot_fixture_ids),
+                "forecast_count": len(forecasts),
+                "forecast_fixture_count": len(forecast_fixture_ids),
+                "model_runs": model_runs,
+                "model_versions": model_versions,
+                "attested_count": len(attested),
+                "unattested_count": len(forecasts) - len(attested),
+                "missing_reason_counts": missing_reasons,
+            },
+            "enrichment": enrichment,
+            "failover": {
+                "cached_schedule_activation_count": len(cached_fallback_rows),
+                "cached_schedule_dates": cached_fallback_dates,
+                "cached_schedule_fixture_count": cached_fallback_fixture_count,
+            },
+            "settlement": {
+                "completed_fixture_count": len(completed),
+                "settled_run_count": len(settled_runs),
+                "settlement_count": len(all_settlements),
+                "backlog_run_count": len(backlog_runs),
+                "backlog_fixture_count": len(backlog_fixture_ids),
+            },
+            "source_health": source_health,
+        }
+
+    def coverage_summary(self, *, as_of: datetime | None = None) -> Mapping[str, Any]:
+        """Alias for :meth:`operational_summary` used by health endpoints."""
+
+        return self.operational_summary(as_of=as_of)
 
     def upcoming_fixtures(self, *, as_of: datetime | None = None) -> tuple[Any, ...]:
         source = self.fixtures
@@ -1056,10 +1533,11 @@ class LiveReadService:
         if source is None:
             return ()
         if hasattr(source, "list_live_fixtures"):
-            return source.list_live_fixtures(upcoming_only=True, as_of=as_of)
+            values = source.list_live_fixtures(upcoming_only=True, as_of=as_of, population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
+            return tuple(item for item in values if population_kind_for(item) is PopulationKind.PROSPECTIVE_TRUE_PIT)
         if hasattr(source, "list"):
-            values = source.list(upcoming_only=True, as_of=as_of)
-            return tuple(values)
+            values = source.list(upcoming_only=True, as_of=as_of, population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
+            return tuple(item for item in values if population_kind_for(item) is PopulationKind.PROSPECTIVE_TRUE_PIT)
         return ()
 
     def feature_snapshots(self, fixture_id: str, *, as_of: datetime | None = None) -> tuple[Any, ...]:

@@ -33,6 +33,25 @@ def test_thesportsdb_adapter_preserves_upstream_identity_and_stable_request_scop
     assert "s=2026-2027" in transport.urls[0]
 
 
+def test_thesportsdb_schedule_fallback_supports_date_scoped_public_feed():
+    transport = StaticTransport(b'{"events": []}')
+    result = TheSportsDbSourceAdapter(transport=transport).fetch("fixtures", league_id="4328", date="20260927")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert "eventsday.php" in transport.urls[0]
+    assert "d=2026-09-27" in transport.urls[0]
+    assert "l=4328" in transport.urls[0]
+
+
+def test_thesportsdb_schedule_normalizes_runner_epl_slug_to_numeric_league_id():
+    transport = StaticTransport(b'{"events": []}')
+    result = TheSportsDbSourceAdapter(transport=transport).fetch("fixtures", league="eng.1", date="20260927")
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert "l=4328" in transport.urls[0]
+    assert "l=eng.1" not in transport.urls[0]
+
+
 def test_thesportsdb_parser_keeps_competition_season_team_and_fixture_ids():
     parser = TheSportsDbObservationParser()
     observations = parser.parse(
@@ -67,6 +86,7 @@ def test_thesportsdb_parser_keeps_competition_season_team_and_fixture_ids():
     assert fixture.attributes["home_team_source_id"] == "133604"
     assert fixture.attributes["away_team_source_id"] == "134400"
     assert fixture.attributes["kickoff_at"] == datetime(2026, 8, 21, 19, 0, tzinfo=timezone.utc)
+    assert fixture.attributes["status_completed"] is False
     assert {team.source_id for team in teams} == {"133604", "134400"}
 
 

@@ -32,8 +32,34 @@ def test_run_cycle_uses_same_clock_for_discovery_and_collection():
     assert result["knowledge_entry_count"] == 1
     assert result["first_observed_forecast_count"] == 3
     assert result["forecast_count"] == 7
+    assert result["cached_fallback_dates"] == []
+    assert result["cached_fallback_fixture_count"] == 0
     assert runner.calls[0] == ("discover", ("20260926",), now)
     assert runner.calls[1] == ("cycle", now)
+
+
+def test_run_cycle_reports_cached_schedule_fallback_activation():
+    class CachedDiscoveryRunner(FakeRunner):
+        def discover_upcoming(self, dates, *, now):
+            self.calls.append(("discover", tuple(dates), now))
+            return type(
+                "Discovery",
+                (),
+                {
+                    "fixtures": ("fixture-1", "fixture-2"),
+                    "scheduled_task_count": 4,
+                    "knowledge_entry_count": 3,
+                    "forecast_count": 8,
+                    "failed_dates": (),
+                    "cached_fallback_dates": ("20261010",),
+                    "cached_fallback_fixture_count": 2,
+                },
+            )()
+
+    result = run_cycle(CachedDiscoveryRunner(), ("20261010",), now=datetime(2026, 9, 27, tzinfo=UTC))
+
+    assert result["cached_fallback_dates"] == ["20261010"]
+    assert result["cached_fallback_fixture_count"] == 2
 
 
 def test_run_cycle_leaves_runtime_clock_to_runner_when_now_is_not_supplied():

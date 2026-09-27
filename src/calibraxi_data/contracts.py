@@ -141,7 +141,11 @@ class SourceHealthSignal:
     empty_population: bool = False
     quarantine: bool = False
     retryable_failure: bool = False
+    timeout: bool = False
+    rate_limit: bool = False
+    mapping_failure: bool = False
     latency_ms: int | None = None
+    source_observed_at: datetime | None = None
     error: str | None = None
 
 
@@ -163,6 +167,11 @@ class SourceCapabilityHealthSnapshot:
     last_latency_ms: int | None
     last_error: str | None
     updated_at: datetime
+    timeout_count: int = 0
+    rate_limit_count: int = 0
+    mapping_failure_count: int = 0
+    last_source_observed_at: datetime | None = None
+    freshness_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ from calibraxi_data.live import (
     ObservationTask,
     ObservationTaskOutcome,
     PopulationKind,
+    population_kind_for,
     ProspectiveFeatureSnapshot,
     ReliabilityReport,
     ScoreDistribution,
@@ -22,6 +23,7 @@ from calibraxi_data.live import (
     TrackRecordPopulation,
 )
 from calibraxi_data.live_persistence import LivePostgresStore, LiveReadService
+from calibraxi_data import HealthState, SourceCapabilityHealthSnapshot
 
 
 UTC = timezone.utc
@@ -115,6 +117,11 @@ class _MemoryLiveStore(LivePostgresStore):
             payload = self.tables["monitoring"].get(key)
             if payload is None:
                 return None
+            if "select payload, population_kind" in sql:
+                return (
+                    payload["payload"],
+                    payload.get("population_kind", PopulationKind.PROSPECTIVE_TRUE_PIT.value),
+                )
             if "select payload," in sql:
                 return (payload["payload"], payload["population_id"], payload["status"], payload["generated_at"])
             return (payload["payload"],)
@@ -221,6 +228,7 @@ class _MemoryLiveStore(LivePostgresStore):
                 "status": params[2],
                 "payload": _decode(params[3]),
                 "generated_at": params[4],
+                "population_kind": params[5],
             }
         else:
             raise AssertionError(sql)
@@ -237,6 +245,31 @@ class _MemoryLiveStore(LivePostgresStore):
             payload["mode"], payload["publication_state"], payload["context"], persisted_at,
             datetime.fromisoformat(payload["prediction_cutoff_at"]) if payload.get("prediction_cutoff_at") else None,
         )
+
+
+class _ColumnPopulationStore(LivePostgresStore):
+    """Return a migrated population column alongside a stale JSON payload."""
+
+    def __init__(self):
+        population = TrackRecordPopulation(
+            "smoke-population", PopulationKind.TEST_SMOKE, "v1", "test"
+        )
+        reliability = ReliabilityReport.from_observations([], population=population)
+        monitoring = MonitoringReport.from_metrics(
+            population=population, metrics={}, sample_count=0
+        )
+        self.reliability_payload = reliability.to_dict()
+        self.reliability_payload["population_kind"] = PopulationKind.PROSPECTIVE_TRUE_PIT.value
+        self.monitoring_payload = monitoring.to_dict()
+        self.monitoring_payload["population_kind"] = PopulationKind.PROSPECTIVE_TRUE_PIT.value
+
+    def _read_all(self, statement, params=()):
+        sql = " ".join(statement.split()).lower()
+        if "from calibraxi_reliability_reports" in sql:
+            return ((self.reliability_payload, PopulationKind.TEST_SMOKE.value),)
+        if "from calibraxi_monitoring_reports" in sql:
+            return ((self.monitoring_payload, PopulationKind.TEST_SMOKE.value),)
+        raise AssertionError(sql)
 
 
 def _fixture(updated_at=BASE, *, kickoff=None):
@@ -486,6 +519,287 @@ def test_live_read_service_uses_postgres_methods_without_merging_populations():
     assert service.upcoming_fixtures(as_of=BASE)[0].fixture_id == fixture.fixture_id
     assert service.feature_snapshots(fixture.fixture_id, as_of=BASE)[0].snapshot_id == "snap-1"
     assert service.reliability_state() == ()
+
+
+def test_live_read_service_operational_summary_reports_true_pit_coverage():
+    class _Collection:
+        def __init__(self, values=()):
+            self.values = list(values)
+
+        def list(self, **kwargs):
+            values = list(self.values)
+            if kwargs.get("upcoming_only"):
+                cutoff = kwargs.get("as_of", BASE)
+                values = [item for item in values if item.kickoff_at >= cutoff and not item.completed]
+            if "fixture_id" in kwargs:
+                values = [item for item in values if item.fixture_id == kwargs["fixture_id"]]
+            return tuple(values)
+
+    fixture = _fixture()
+    unresolved = LiveFixture(
+        fixture_id="fixture:epl:2026-27:gamma:delta",
+        kickoff_at=BASE + timedelta(days=4),
+        home_team="gamma",
+        away_team="delta",
+        season="2026/27",
+        provider_ids={},
+        knowledge_at=BASE,
+        updated_at=BASE,
+    )
+    ledger = _Collection(
+        (
+            KnowledgeLedgerEntry.create(
+                source="espn",
+                capability="fixtures",
+                fixture_id=fixture.fixture_id,
+                knowledge_at=BASE,
+                payload={"provider_id": "100"},
+                provider_entity_id="100",
+                evidence_id="ev-1",
+                state=ObservationState.SUCCESS,
+            ),
+            KnowledgeLedgerEntry.create(
+                source="sofascore",
+                capability="lineups",
+                fixture_id=fixture.fixture_id,
+                knowledge_at=BASE,
+                payload={"starting_xi": []},
+                provider_entity_id="sofa-100",
+                evidence_id="ev-2",
+                state=ObservationState.SUCCESS,
+            ),
+            KnowledgeLedgerEntry.create(
+                source="understat",
+                capability="xg",
+                fixture_id=fixture.fixture_id,
+                knowledge_at=BASE,
+                payload={"provider": "understat"},
+                provider_entity_id="under-100",
+                evidence_id="ev-3",
+                state=ObservationState.QUARANTINED,
+            ),
+        )
+    )
+    service = LiveReadService(
+        ledger=ledger,
+        fixtures=_Collection((fixture, unresolved)),
+        snapshots=_Collection(),
+        forecasts=_Collection(),
+        settlements=_Collection(),
+        track_record=_Collection(),
+        reliability=_Collection(),
+    )
+
+    summary = service.operational_summary(as_of=BASE + timedelta(hours=1))
+
+    assert summary["population"] == PopulationKind.PROSPECTIVE_TRUE_PIT.value
+    assert summary["upcoming"]["fixture_count"] == 2
+    assert summary["upcoming"]["mapped_fixture_count"] == 1
+    assert summary["upcoming"]["unresolved_mapping_count"] == 1
+    assert summary["upcoming"]["source_coverage"]["fixtures"]["observed_fixture_count"] == 1
+    assert summary["enrichment"]["lineups"]["observed_fixture_count"] == 1
+    assert summary["enrichment"]["xg"]["state_counts"] == {"quarantined": 1}
+    assert summary["forecast"]["missing_reason_counts"]["no_snapshot"] == 2
+    assert summary["settlement"]["backlog_run_count"] == 0
+
+
+def test_live_read_service_reports_cached_schedule_failover():
+    class _Collection:
+        def __init__(self, values=()):
+            self.values = tuple(values)
+
+        def list(self, **kwargs):
+            values = self.values
+            if kwargs.get("upcoming_only"):
+                cutoff = kwargs.get("as_of", BASE)
+                values = tuple(item for item in values if item.kickoff_at >= cutoff and not item.completed)
+            return values
+
+    fixture = _fixture()
+    schedule_date = fixture.kickoff_at.strftime("%Y%m%d")
+    ledger = _Collection(
+        (
+            KnowledgeLedgerEntry.create(
+                source="calibraxi",
+                capability="fixtures",
+                fixture_id=f"schedule:eng.1:{schedule_date}",
+                knowledge_at=BASE,
+                payload={
+                    "entity_scope": "fixture_schedule_query",
+                    "date": schedule_date,
+                    "fallback_used": True,
+                    "fallback_fixture_count": 1,
+                    "reason": "all fixture schedule sources failed",
+                },
+                canonical_entity_id="competition:eng.1",
+                state=ObservationState.SOURCE_FAILED,
+                created_at=BASE,
+            ),
+        )
+    )
+    service = LiveReadService(
+        ledger=ledger,
+        fixtures=_Collection((fixture,)),
+        snapshots=_Collection(),
+        forecasts=_Collection(),
+        settlements=_Collection(),
+        track_record=_Collection(),
+        reliability=_Collection(),
+    )
+
+    summary = service.operational_summary(as_of=BASE + timedelta(hours=1))
+
+    assert summary["failover"] == {
+        "cached_schedule_activation_count": 1,
+        "cached_schedule_dates": [schedule_date],
+        "cached_schedule_fixture_count": 1,
+    }
+
+
+def test_live_read_service_excludes_smoke_fixtures_from_true_pit_summary():
+    class _Collection:
+        def __init__(self, values=()):
+            self.values = tuple(values)
+
+        def list(self, **kwargs):
+            values = self.values
+            if kwargs.get("upcoming_only"):
+                cutoff = kwargs.get("as_of", BASE)
+                values = tuple(item for item in values if item.kickoff_at >= cutoff and not item.completed)
+            if "fixture_id" in kwargs:
+                values = tuple(item for item in values if item.fixture_id == kwargs["fixture_id"])
+            return values
+
+    production = _fixture()
+    smoke = LiveFixture(
+        fixture_id="fixture:smoke:live-phase",
+        kickoff_at=production.kickoff_at + timedelta(hours=1),
+        home_team="smoke-home",
+        away_team="smoke-away",
+        season=production.season,
+        provider_ids={"espn": "smoke-1"},
+        knowledge_at=BASE,
+        updated_at=BASE,
+    )
+    service = LiveReadService(
+        ledger=_Collection(),
+        fixtures=_Collection((production, smoke)),
+        snapshots=_Collection(),
+        forecasts=_Collection(),
+        settlements=_Collection(),
+        track_record=_Collection(),
+        reliability=_Collection(),
+    )
+
+    summary = service.operational_summary(as_of=BASE + timedelta(hours=1))
+
+    assert summary["upcoming"]["fixture_count"] == 1
+    assert tuple(item.fixture_id for item in service.upcoming_fixtures(as_of=BASE + timedelta(hours=1))) == (production.fixture_id,)
+
+
+def test_population_kind_for_recognizes_task_smoke_and_embedded_smoke_ids():
+    assert population_kind_for({"fixture_id": "fixture:task-smoke:lease"}) is PopulationKind.TEST_SMOKE
+    assert population_kind_for({"fixture_id": "fixture:prod:smoke:test"}) is PopulationKind.TEST_SMOKE
+    assert population_kind_for(
+        {
+            "fixture_id": "fixture:smoke:legacy-track-record",
+            "population_kind": PopulationKind.PROSPECTIVE_TRUE_PIT.value,
+        }
+    ) is PopulationKind.TEST_SMOKE
+    assert population_kind_for({"fixture_id": "fixture:epl:2026-27:arsenal:leeds-united"}) is PopulationKind.PROSPECTIVE_TRUE_PIT
+
+
+def test_live_postgres_population_reads_default_to_prospective_and_allow_explicit_smoke_audit():
+    store = _MemoryLiveStore()
+    production = _fixture()
+    smoke = LiveFixture(
+        fixture_id="fixture:smoke:live-phase",
+        kickoff_at=production.kickoff_at + timedelta(hours=1),
+        home_team="smoke-home",
+        away_team="smoke-away",
+        season=production.season,
+        provider_ids={"espn": "smoke-1"},
+        knowledge_at=BASE,
+        updated_at=BASE,
+    )
+
+    store.save_live_fixture(production)
+    store.save_live_fixture(smoke)
+
+    assert tuple(item.fixture_id for item in store.list_live_fixtures()) == (production.fixture_id,)
+    assert tuple(item.fixture_id for item in store.list_live_fixtures(population_kind=PopulationKind.TEST_SMOKE)) == (smoke.fixture_id,)
+
+
+def test_live_postgres_report_reads_use_migrated_population_column_over_stale_payload():
+    store = _ColumnPopulationStore()
+
+    reliability = store.list_reliability(population_kind=PopulationKind.TEST_SMOKE)
+    monitoring = store.list_monitoring(population_kind=PopulationKind.TEST_SMOKE)
+
+    assert reliability[0].population_kind is PopulationKind.TEST_SMOKE
+    assert monitoring[0].population_kind is PopulationKind.TEST_SMOKE
+
+
+def test_live_read_service_operational_summary_exposes_source_health():
+    class _HealthStore:
+        def list_source_health(self):
+            return (
+                SourceCapabilityHealthSnapshot(
+                    capability="fixtures",
+                    source="espn",
+                    health=HealthState.HEALTHY,
+                    attempt_count=3,
+                    success_count=2,
+                    failure_count=1,
+                    schema_drift_count=0,
+                    empty_population_count=1,
+                    quarantine_count=0,
+                    retryable_failure_count=1,
+                    last_attempt_at=BASE,
+                    last_success_at=BASE,
+                    last_failure_at=BASE - timedelta(minutes=1),
+                    last_latency_ms=125,
+                    last_error=None,
+                    updated_at=BASE,
+                ),
+            )
+
+    service = LiveReadService(
+        ledger=(),
+        forecasts=(),
+        settlements=(),
+        track_record=(),
+        reliability=(),
+        source_health=_HealthStore(),
+    )
+
+    summary = service.operational_summary(as_of=BASE + timedelta(hours=1))
+
+    assert summary["source_health"] == [
+        {
+            "capability": "fixtures",
+            "source": "espn",
+            "health": "healthy",
+            "attempt_count": 3,
+            "success_count": 2,
+            "failure_count": 1,
+            "schema_drift_count": 0,
+            "empty_population_count": 1,
+            "quarantine_count": 0,
+            "retryable_failure_count": 1,
+            "timeout_count": 0,
+            "rate_limit_count": 0,
+            "mapping_failure_count": 0,
+            "last_attempt_at": BASE.isoformat(),
+            "last_success_at": BASE.isoformat(),
+            "last_failure_at": (BASE - timedelta(minutes=1)).isoformat(),
+            "last_latency_ms": 125,
+            "last_source_observed_at": None,
+            "freshness_seconds": None,
+            "last_error": None,
+            "updated_at": BASE.isoformat(),
+        }
+    ]
 
 
 def test_live_postgres_exposes_runner_store_bundle_and_monitoring_round_trip():

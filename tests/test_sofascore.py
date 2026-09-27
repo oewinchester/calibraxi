@@ -102,6 +102,29 @@ def test_sofascore_fixture_schedule_endpoint_preserves_event_population():
     assert result.metadata["season_id"] == "76986"
 
 
+def test_sofascore_fixture_date_schedule_endpoint_normalizes_runner_date():
+    transport = MappingTransport(
+        {
+            "/scheduled-events/2026-09-26": {
+                "events": [{"id": 14025013, "startTimestamp": 1755284400}],
+                "hasNextPage": False,
+            }
+        }
+    )
+
+    result = SofascoreSourceAdapter(transport=transport).fetch(
+        "fixtures", league="eng.1", date="20260926"
+    )
+
+    assert result.state is CapabilityState.SUPPORTED
+    assert transport.urls == [
+        "https://www.sofascore.com/api/v1/sport/football/scheduled-events/2026-09-26"
+    ]
+    assert result.metadata["schedule_date"] == "2026-09-26"
+    assert result.metadata["schedule_date_input"] == "20260926"
+    assert result.payload["events"][0]["id"] == 14025013
+
+
 def test_sofascore_parser_normalizes_schedule_event_collections():
     payload = {"events": [{"id": 14025013, "startTimestamp": 1755284400, "status": {"type": "finished"}, "homeTeam": {"id": 44, "name": "Liverpool FC"}, "awayTeam": {"id": 60, "name": "Bournemouth"}, "homeScore": {"current": 4}, "awayScore": {"current": 2}}]}
 
@@ -126,6 +149,7 @@ def test_sofascore_adapter_exposes_match_detail_capabilities_without_empty_succe
     assert adapter.fetch("team_match_stats", event_id=14025013).state is CapabilityState.SUPPORTED
     assert adapter.fetch("player_match_stats", event_id=14025013).state is CapabilityState.SUPPORTED
     assert adapter.fetch("shots", event_id=14025013).payload["shotmap"][0]["xgot"] == 0.4
+    assert adapter.fetch("xgot", event_id=14025013).payload["shotmap"][0]["xgot"] == 0.4
     assert adapter.fetch("lineups").state is CapabilityState.UNSUPPORTED
 
 
@@ -186,6 +210,21 @@ def test_sofascore_parser_normalizes_incidents_and_shots_with_provider_identity(
     assert shots[0].source_id == "14025013:7"
     assert shots[0].attributes["xg"] == 0.2
     assert shots[0].attributes["xgot"] == 0.4
+
+
+def test_sofascore_parser_exposes_xgot_as_a_provider_specific_capability():
+    parser = SofascoreObservationParser()
+
+    observations = parser.parse(
+        "xgot",
+        {"shotmap": [{"id": 7, "xgot": 0.4}, {"id": 8, "xg": 0.1}]},
+        event_id="14025013",
+    )
+
+    assert len(observations) == 1
+    assert observations[0].entity_type is EntityType.SHOT
+    assert observations[0].source_id == "14025013:7"
+    assert observations[0].attributes["xgot"] == 0.4
 
 
 def test_sofascore_fixture_preserves_postponed_status_without_score():

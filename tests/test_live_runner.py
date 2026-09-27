@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+from dataclasses import replace
+
 import pytest
 
 from calibraxi_data import (
@@ -34,6 +36,7 @@ from calibraxi_data import (
     TrackRecordPopulation,
 )
 from calibraxi_data.espn import EspnObservationParser
+from calibraxi_data.thesportsdb import TheSportsDbObservationParser
 
 
 UTC = timezone.utc
@@ -165,7 +168,7 @@ def test_runner_discovers_fixture_schedules_horizons_and_runs_all_shadow_models(
 
     discovered = runner.discover_upcoming(("20260925",), now=BASE)
     assert len(discovered.fixtures) == 1
-    assert discovered.scheduled_task_count == 24
+    assert discovered.scheduled_task_count == 27
     assert discovered.knowledge_entry_count == 1
     assert discovered.forecast_count == 4
 
@@ -254,6 +257,485 @@ def test_fixture_schedule_failures_are_recorded_in_scoped_knowledge_ledger(tmp_p
     assert not runner.fixture_store.list()
     assert not runner.snapshot_store.list()
     assert not runner.forecast_store.list()
+
+
+def test_cached_schedule_fallback_reuses_only_prior_success_and_preserves_chronology(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+    fixture_id = "fixture:epl:2026-27:alpha:beta"
+    cached_at = BASE - timedelta(hours=2)
+
+    class FailedDiscoveryCoordinator:
+        def acquire(self, capability, *, params=None, **kwargs):
+            attempts = []
+            for index, source in enumerate(("espn", "sofascore"), start=1):
+                observed_at = BASE + timedelta(seconds=index)
+                evidence = RawEvidence(
+                    evidence_id=f"outage-{source}",
+                    source=source,
+                    capability=capability,
+                    content_hash=f"hash-{source}",
+                    object_path=f"{source}/fixtures/outage-{source}",
+                    observed_at=None,
+                    available_at=None,
+                    received_at=observed_at,
+                    knowledge_at=observed_at,
+                    processing_at=observed_at,
+                    http_status=503,
+                    result_state=CapabilityState.SOURCE_FAILED,
+                    parser_version=f"{source}-v1",
+                    schema_version=None,
+                )
+                result = SourceResult(
+                    CapabilityState.SOURCE_FAILED,
+                    source,
+                    capability,
+                    error=f"{source} unavailable",
+                )
+                attempts.append(AcquisitionAttempt(result, evidence, observed_at, observed_at))
+            return AcquisitionResult(
+                capability,
+                CapabilityState.SOURCE_FAILED,
+                None,
+                None,
+                attempts[-1].evidence,
+                tuple(attempts),
+                error="all fixture schedule sources unavailable",
+            )
+
+    runner = _runner(tmp_path, FailedDiscoveryCoordinator(), kickoff)
+    runner.fixture_store.save(
+        LiveFixture(
+            fixture_id=fixture_id,
+            kickoff_at=kickoff,
+            home_team="team:alpha",
+            away_team="team:beta",
+            season="2026/27",
+            provider_ids={"espn": "espn-cached"},
+            evidence_ids=("cached-evidence",),
+            knowledge_at=cached_at,
+            source="espn",
+            updated_at=cached_at,
+        )
+    )
+    runner.ledger.save(
+        KnowledgeLedgerEntry.create(
+            source="espn",
+            capability="fixtures",
+            fixture_id=fixture_id,
+            canonical_entity_id=fixture_id,
+            provider_entity_id="espn-cached",
+            knowledge_at=cached_at,
+            processing_at=cached_at,
+            evidence_id="cached-evidence",
+            horizon=Horizon.FIXTURE_FIRST_OBSERVED,
+            payload={
+                "source_id": "espn-cached",
+                "name": "Alpha vs Beta",
+                "kickoff_at": kickoff,
+                "status_family": "scheduled",
+            },
+            created_at=cached_at,
+        )
+    )
+
+    discovered = runner.discover_upcoming((kickoff.strftime("%Y%m%d"),), now=BASE)
+
+    assert len(discovered.fixtures) == 1
+    cached = discovered.fixtures[0]
+    assert cached.provider_ids == {"espn": "espn-cached"}
+    assert cached.evidence_ids == ("cached-evidence",)
+    assert cached.knowledge_at == cached_at
+    assert discovered.cached_fallback_dates == (kickoff.strftime("%Y%m%d"),)
+    assert discovered.cached_fallback_fixture_count == 1
+    assert discovered.failed_dates == ()
+    assert discovered.states[kickoff.strftime("%Y%m%d")] == "cached_fallback"
+    assert discovered.forecast_count == 4
+    assert {entry.state for entry in runner.ledger.list()} == {
+        ObservationState.SUCCESS,
+        ObservationState.SOURCE_FAILED,
+    }
+    assert {entry.evidence_id for entry in runner.ledger.list() if entry.state is ObservationState.SOURCE_FAILED} == {
+        "outage-espn",
+        "outage-sofascore",
+    }
+    forecasts = runner.forecast_store.list()
+    assert {forecast.knowledge_at for forecast in forecasts} == {cached_at}
+    assert {forecast.evidence_ids for forecast in forecasts} == {("cached-evidence",)}
+
+
+def test_cached_schedule_fallback_requires_a_matching_successful_fixture_observation(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+
+    class FailedDiscoveryCoordinator:
+        def acquire(self, capability, *, params=None, **kwargs):
+            return AcquisitionResult(
+                capability,
+                CapabilityState.SOURCE_FAILED,
+                None,
+                None,
+                None,
+                (),
+                error="schedule unavailable",
+            )
+
+    runner = _runner(tmp_path, FailedDiscoveryCoordinator(), kickoff)
+    runner.fixture_store.save(
+        LiveFixture(
+            fixture_id="fixture:epl:2026-27:alpha:beta",
+            kickoff_at=kickoff,
+            home_team="team:alpha",
+            away_team="team:beta",
+            season="2026/27",
+            provider_ids={"espn": "espn-unverified"},
+            knowledge_at=BASE - timedelta(hours=1),
+            updated_at=BASE - timedelta(hours=1),
+        )
+    )
+
+    discovered = runner.discover_upcoming((kickoff.strftime("%Y%m%d"),), now=BASE)
+
+    assert discovered.fixtures == ()
+    assert discovered.cached_fallback_dates == ()
+    assert discovered.cached_fallback_fixture_count == 0
+    assert discovered.failed_dates == (kickoff.strftime("%Y%m%d"),)
+    assert not runner.forecast_store.list()
+
+
+def test_runner_discovers_from_sofascore_date_fallback_when_espn_is_unavailable(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+
+    class FallbackDiscoveryCoordinator:
+        def __init__(self):
+            self.calls = []
+
+        def acquire(self, capability, *, params=None, **kwargs):
+            self.calls.append((capability, dict(params or {})))
+            primary_at = BASE + timedelta(minutes=1)
+            fallback_at = BASE + timedelta(minutes=2)
+            primary_evidence = RawEvidence(
+                evidence_id="schedule-espn-failed",
+                source="espn",
+                capability=capability,
+                content_hash="schedule-espn-failed",
+                object_path="espn/fixtures/schedule-espn-failed",
+                observed_at=None,
+                available_at=None,
+                received_at=primary_at,
+                knowledge_at=primary_at,
+                processing_at=primary_at,
+                http_status=503,
+                result_state=CapabilityState.SOURCE_FAILED,
+                parser_version="espn-http-json-v1",
+                schema_version=None,
+            )
+            fallback_evidence = RawEvidence(
+                evidence_id="schedule-sofascore-success",
+                source="sofascore",
+                capability=capability,
+                content_hash="schedule-sofascore-success",
+                object_path="sofascore/fixtures/schedule-sofascore-success",
+                observed_at=None,
+                available_at=None,
+                received_at=fallback_at,
+                knowledge_at=fallback_at,
+                processing_at=fallback_at,
+                http_status=200,
+                result_state=CapabilityState.SUPPORTED,
+                parser_version="sofascore-http-json-v1",
+                schema_version=None,
+            )
+            payload = {
+                "events": [
+                    {
+                        "id": 14025013,
+                        "startTimestamp": int(kickoff.timestamp()),
+                        "status": {"type": "scheduled"},
+                        "homeTeam": {"id": 44, "name": "Alpha"},
+                        "awayTeam": {"id": 60, "name": "Beta"},
+                    }
+                ]
+            }
+            primary = SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="primary unavailable")
+            fallback = SourceResult(CapabilityState.SUPPORTED, "sofascore", capability, payload=payload, adapter_version="sofascore-http-json-v1")
+            attempts = (
+                AcquisitionAttempt(primary, primary_evidence, primary_at, primary_at),
+                AcquisitionAttempt(fallback, fallback_evidence, fallback_at, fallback_at),
+            )
+            return AcquisitionResult(capability, CapabilityState.SUPPORTED, "sofascore", payload, fallback_evidence, attempts, adapter_version="sofascore-http-json-v1")
+
+    coordinator = FallbackDiscoveryCoordinator()
+    runner = _runner(tmp_path, coordinator, kickoff)
+
+    discovered = runner.discover_upcoming((kickoff.strftime("%Y%m%d"),), now=BASE)
+
+    assert len(discovered.fixtures) == 1
+    fixture = discovered.fixtures[0]
+    assert fixture.provider_ids == {"sofascore": "14025013"}
+    assert discovered.scheduled_task_count == 27
+    assert discovered.forecast_count == 4
+    assert coordinator.calls == [("fixtures", {"league": "eng.1", "date": kickoff.strftime("%Y%m%d")})]
+    assert {entry.source for entry in runner.ledger.list()} == {"espn", "sofascore"}
+
+
+def test_runner_discovers_from_thesportsdb_date_fallback_after_other_sources_fail(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+
+    class FallbackDiscoveryCoordinator:
+        def __init__(self):
+            self.calls = []
+
+        def acquire(self, capability, *, params=None, **kwargs):
+            self.calls.append((capability, dict(params or {})))
+            primary_at = BASE + timedelta(minutes=1)
+            sofascore_at = BASE + timedelta(minutes=2)
+            fallback_at = BASE + timedelta(minutes=3)
+            primary_evidence = replace(
+                _evidence("schedule-espn-failed", primary_at),
+                source="espn",
+                http_status=503,
+                result_state=CapabilityState.SOURCE_FAILED,
+            )
+            sofascore_evidence = replace(
+                _evidence("schedule-sofascore-failed", sofascore_at),
+                source="sofascore",
+                http_status=503,
+                result_state=CapabilityState.SOURCE_FAILED,
+                parser_version="sofascore-http-json-v1",
+            )
+            fallback_evidence = replace(
+                _evidence("schedule-thesportsdb-success", fallback_at),
+                source="thesportsdb",
+                parser_version="thesportsdb-http-json-v1",
+            )
+            payload = {
+                "events": [
+                    {
+                        "idEvent": "tsdb-14025013",
+                        "idLeague": "4328",
+                        "strLeague": "English Premier League",
+                        "strSeason": "2026-2027",
+                        "strEvent": "Alpha vs Beta",
+                        "dateEvent": kickoff.date().isoformat(),
+                        "strTime": kickoff.strftime("%H:%M:%S"),
+                        "idHomeTeam": "tsdb-alpha",
+                        "strHomeTeam": "Alpha",
+                        "idAwayTeam": "tsdb-beta",
+                        "strAwayTeam": "Beta",
+                    }
+                ]
+            }
+            primary = SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="primary unavailable")
+            sofascore = SourceResult(CapabilityState.SOURCE_FAILED, "sofascore", capability, error="fallback unavailable")
+            fallback = SourceResult(CapabilityState.SUPPORTED, "thesportsdb", capability, payload=payload, adapter_version="thesportsdb-http-json-v1")
+            attempts = (
+                AcquisitionAttempt(primary, primary_evidence, primary_at, primary_at),
+                AcquisitionAttempt(sofascore, sofascore_evidence, sofascore_at, sofascore_at),
+                AcquisitionAttempt(fallback, fallback_evidence, fallback_at, fallback_at),
+            )
+            return AcquisitionResult(capability, CapabilityState.SUPPORTED, "thesportsdb", payload, fallback_evidence, attempts, adapter_version="thesportsdb-http-json-v1")
+
+    coordinator = FallbackDiscoveryCoordinator()
+    runner = _runner(tmp_path, coordinator, kickoff)
+    runner.parsers["thesportsdb"] = TheSportsDbObservationParser()
+
+    discovered = runner.discover_upcoming((kickoff.strftime("%Y%m%d"),), now=BASE)
+
+    assert len(discovered.fixtures) == 1
+    fixture = discovered.fixtures[0]
+    assert fixture.provider_ids == {"thesportsdb": "tsdb-14025013"}
+    assert discovered.scheduled_task_count == 27
+    assert discovered.forecast_count == 4
+    assert coordinator.calls == [("fixtures", {"league": "eng.1", "date": kickoff.strftime("%Y%m%d")})]
+    assert {entry.source for entry in runner.ledger.list()} == {"espn", "sofascore", "thesportsdb"}
+
+
+def test_runner_rejects_semantic_empty_primary_schedule_before_fallback(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+
+    class EmptyThenFallbackCoordinator:
+        def __init__(self):
+            self.acceptance_seen = False
+
+        def acquire(self, capability, *, params=None, accept_result=None, **kwargs):
+            assert accept_result is not None
+            self.acceptance_seen = True
+            empty = SourceResult(
+                CapabilityState.SUPPORTED,
+                "espn",
+                capability,
+                payload={"events": []},
+            )
+            assert accept_result(empty) is False
+            fallback_payload = {
+                "events": [
+                    {
+                        "id": 14025013,
+                        "startTimestamp": int(kickoff.timestamp()),
+                        "status": {"type": "scheduled"},
+                        "homeTeam": {"id": 44, "name": "Alpha"},
+                        "awayTeam": {"id": 60, "name": "Beta"},
+                    }
+                ]
+            }
+            fallback = SourceResult(
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                capability,
+                payload=fallback_payload,
+                adapter_version="sofascore-http-json-v1",
+            )
+            assert accept_result(fallback) is True
+            at = BASE + timedelta(minutes=1)
+            evidence = RawEvidence(
+                evidence_id="semantic-fallback",
+                source="sofascore",
+                capability=capability,
+                content_hash="semantic-fallback",
+                object_path="sofascore/fixtures/semantic-fallback",
+                observed_at=None,
+                available_at=None,
+                received_at=at,
+                knowledge_at=at,
+                processing_at=at,
+                http_status=200,
+                result_state=CapabilityState.SUPPORTED,
+                parser_version="sofascore-http-json-v1",
+                schema_version=None,
+            )
+            return AcquisitionResult(
+                capability,
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                fallback_payload,
+                evidence,
+                (AcquisitionAttempt(empty, None, at, at), AcquisitionAttempt(fallback, evidence, at, at)),
+                adapter_version="sofascore-http-json-v1",
+            )
+
+    coordinator = EmptyThenFallbackCoordinator()
+    runner = _runner(tmp_path, coordinator, kickoff)
+
+    discovered = runner.discover_upcoming((kickoff.strftime("%Y%m%d"),), now=BASE)
+
+    assert coordinator.acceptance_seen
+    assert len(discovered.fixtures) == 1
+    assert discovered.fixtures[0].provider_ids == {"sofascore": "14025013"}
+
+
+def test_runner_routes_enrichment_to_governed_fallback_id_when_primary_id_is_missing(tmp_path):
+    kickoff = BASE + timedelta(hours=73)
+
+    class CaptureCoordinator:
+        def __init__(self):
+            self.calls = []
+
+        def acquire(self, capability, *, params=None, **kwargs):
+            self.calls.append((capability, dict(params or {})))
+            return AcquisitionResult(capability, CapabilityState.UNSUPPORTED, "sofascore", None, None, ())
+
+    coordinator = CaptureCoordinator()
+    runner = _runner(tmp_path, coordinator, kickoff)
+    fixture = LiveFixture(
+        fixture_id="fixture:epl:2026-27:alpha:beta",
+        kickoff_at=kickoff,
+        home_team="alpha",
+        away_team="beta",
+        season="2026/27",
+        provider_ids={"sofascore": "sofa-9"},
+        knowledge_at=BASE,
+        updated_at=BASE,
+    )
+    runner.fixture_store.save(fixture)
+
+    runner.collect_capability(fixture.fixture_id, "lineups", now=BASE, source="espn")
+
+    assert coordinator.calls
+    params = coordinator.calls[0][1]
+    assert params["source_fixture_ids"] == {"sofascore": "sofa-9"}
+    assert "event_id" not in params
+
+
+def test_runner_normalizes_successful_fallback_with_returned_provider_mapping(tmp_path):
+    kickoff = BASE + timedelta(hours=2)
+    fixture_id = "fixture:epl:2026-27:alpha:beta"
+    index = FixtureIdentityIndex()
+    index.propose(
+        FixtureMappingCandidate(
+            source="sofascore",
+            source_fixture_id="sofa-9",
+            canonical_fixture_id=fixture_id,
+            evidence_ids=("evidence:sofascore-fixture",),
+        )
+    )
+    index.adjudicate(
+        source="sofascore",
+        source_fixture_id="sofa-9",
+        canonical_fixture_id=fixture_id,
+        status=FixtureMappingStatus.CONFIRMED,
+        evidence_ids=("evidence:sofascore-fixture",),
+        decided_at=BASE,
+    )
+
+    class FallbackCoordinator:
+        def acquire(self, capability, *, params=None, **kwargs):
+            at = BASE + timedelta(minutes=1)
+            evidence = RawEvidence(
+                evidence_id="fallback-events",
+                source="sofascore",
+                capability=capability,
+                content_hash="fallback-events",
+                object_path="sofascore/events/fallback-events",
+                observed_at=None,
+                available_at=None,
+                received_at=at,
+                knowledge_at=at,
+                processing_at=at,
+                http_status=200,
+                result_state=CapabilityState.SUPPORTED,
+                parser_version="sofascore-http-json-v1",
+                schema_version="test-v1",
+            )
+            failed = SourceResult(CapabilityState.SOURCE_FAILED, "espn", capability, error="primary unavailable")
+            successful = SourceResult(
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                capability,
+                payload={"incidents": [{"id": "incident-1", "incidentType": "goal", "time": 12}]},
+                adapter_version="sofascore-http-json-v1",
+            )
+            return AcquisitionResult(
+                capability,
+                CapabilityState.SUPPORTED,
+                "sofascore",
+                successful.payload,
+                evidence,
+                (
+                    AcquisitionAttempt(failed, None, at, at),
+                    AcquisitionAttempt(successful, evidence, at, at),
+                ),
+            )
+
+    runner = _runner(tmp_path, FallbackCoordinator(), kickoff, fixture_identity_index=index)
+    runner.fixture_store.save(
+        LiveFixture(
+            fixture_id=fixture_id,
+            kickoff_at=kickoff,
+            home_team="team:alpha",
+            away_team="team:beta",
+            season="2026/27",
+            provider_ids={"espn": "espn-1"},
+            knowledge_at=BASE,
+            updated_at=BASE,
+        )
+    )
+
+    collected = runner.collect_capability(fixture_id, "events", now=BASE, source="espn")
+
+    assert collected.state is ObservationState.SUCCESS
+    entries = runner.ledger.list()
+    assert len(entries) == 1
+    assert entries[0].source == "sofascore"
+    assert entries[0].provider_entity_id == "sofa-9:incident-1"
 
 
 def test_empty_fixture_schedule_response_is_preserved_without_a_fixture_forecast(tmp_path):
@@ -458,6 +940,14 @@ def test_runner_never_reuses_espn_id_for_sofascore_or_understat(tmp_path):
     assert missing_sofascore.state is ObservationState.UNSUPPORTED
     assert missing_understat.state is ObservationState.UNSUPPORTED
     assert coordinator.calls == []
+    understat_entries = [
+        entry
+        for entry in runner.ledger.list()
+        if entry.fixture_id == fixture.fixture_id and entry.source == "understat" and entry.capability == "xg"
+    ]
+    assert len(understat_entries) == 1
+    assert understat_entries[0].state is ObservationState.UNSUPPORTED
+    assert "provider_fixture_id_unavailable:understat" in understat_entries[0].payload["reason"]
 
     mapped = LiveFixture.from_dict({**fixture.to_dict(), "provider_ids": {"espn": "espn-1", "sofascore": "sofa-9", "understat": "under-7"}, "updated_at": (BASE + timedelta(minutes=1)).isoformat()})
     runner.fixture_store.save(mapped)
@@ -559,6 +1049,95 @@ def test_enrichment_is_collected_at_governed_horizons_not_every_runner_cycle(tmp
     before_replay = len(coordinator.calls)
     runner.run_once(now=collection_time + timedelta(minutes=1))
     assert len(coordinator.calls) == before_replay
+
+
+def test_post_kickoff_cycle_polls_mapped_enrichment_and_respects_bounded_cadence(tmp_path):
+    kickoff = BASE - timedelta(minutes=10)
+
+    class PostKickoffCoordinator:
+        def __init__(self):
+            self.calls = []
+            self.counter = 0
+
+        def acquire(self, capability, *, params=None, **kwargs):
+            self.calls.append((capability, dict(params or {})))
+            self.counter += 1
+            source = "espn" if capability in {"fixtures", "lineups"} else "sofascore"
+            # Keep observed knowledge time at the cycle origin so the test
+            # exercises the exact 15-minute poll boundary independently of
+            # the number of capabilities attempted in that cycle.
+            observed_at = BASE
+            evidence = RawEvidence(
+                evidence_id=f"post-{self.counter}",
+                source=source,
+                capability=capability,
+                content_hash=f"post-hash-{self.counter}",
+                object_path=f"{source}/{capability}/post-{self.counter}",
+                observed_at=None,
+                available_at=None,
+                received_at=observed_at,
+                knowledge_at=observed_at,
+                processing_at=observed_at,
+                http_status=200,
+                result_state=CapabilityState.SUPPORTED,
+                parser_version=f"{source}-test-v1",
+                schema_version="test-v1",
+            )
+            if capability == "fixtures":
+                payload = _scoreboard(kickoff, status="STATUS_FINAL", home_score=1, away_score=0)
+            elif capability == "events":
+                payload = {"incidents": [{"id": "incident-1", "incidentType": "goal", "time": 3}]}
+            elif capability == "lineups" or capability == "player_stats":
+                payload = {
+                    "home": {"players": [{"player": {"id": 11, "name": "Alpha Player"}, "teamId": 1, "substitute": False, "statistics": {"rating": 7.1}}]},
+                    "away": {"players": [{"player": {"id": 22, "name": "Beta Player"}, "teamId": 2, "substitute": True, "statistics": {"rating": 6.8}}]},
+                }
+            elif capability == "team_match_stats":
+                payload = {"statistics": [{"period": "ALL", "groups": [{"statisticsItems": [{"name": "Possession", "home": "55%", "away": "45%"}]}]}]}
+            elif capability in {"shots", "xgot"}:
+                payload = {"shotmap": [{"id": 7, "xg": 0.21, "xgot": 0.18, "isHome": True, "time": 4}]}
+            else:
+                payload = {}
+            result = SourceResult(CapabilityState.SUPPORTED, source, capability, payload=payload, adapter_version=f"{source}-test-v1")
+            attempt = AcquisitionAttempt(result=result, evidence=evidence, started_at=observed_at, finished_at=observed_at)
+            return AcquisitionResult(capability, CapabilityState.SUPPORTED, source, payload, evidence, (attempt,), adapter_version=f"{source}-test-v1")
+
+    coordinator = PostKickoffCoordinator()
+    runner = _runner(tmp_path, coordinator, kickoff)
+    runner.fixture_store.save(
+        LiveFixture(
+            fixture_id="fixture:epl:2026-27:alpha:beta",
+            kickoff_at=kickoff,
+            home_team="team:alpha",
+            away_team="team:beta",
+            season="2026/27",
+            provider_ids={"espn": "espn-100", "sofascore": "sofa-100"},
+            knowledge_at=BASE - timedelta(hours=1),
+            updated_at=BASE - timedelta(hours=1),
+        )
+    )
+
+    first = runner.run_once(now=BASE)
+    first_capabilities = {capability for capability, _ in coordinator.calls}
+    assert {"fixtures", "lineups", "events", "team_match_stats", "player_stats", "shots"} <= first_capabilities
+    assert not {"xg", "xg_a"} & first_capabilities
+    first_event_entries = [entry for entry in runner.ledger.list() if entry.horizon is Horizon.EVENT and entry.capability == "events" and entry.state is ObservationState.SUCCESS]
+    assert len(first_event_entries) == 1
+    assert first_event_entries[0].provider_entity_id == "sofa-100:incident-1"
+    assert runner.fixture_store.get("fixture:epl:2026-27:alpha:beta").completed
+
+    call_count = len(coordinator.calls)
+    second = runner.run_once(now=BASE + timedelta(minutes=1))
+    assert len(coordinator.calls) == call_count
+    assert second.observation_count == 0
+    assert "fixtures" not in {capability for capability, _ in coordinator.calls[call_count:]}
+
+    runner.run_once(now=BASE + timedelta(minutes=16))
+    assert len(coordinator.calls) > call_count
+    assert "fixtures" not in {capability for capability, _ in coordinator.calls[call_count:]}
+    event_entries = [entry for entry in runner.ledger.list() if entry.horizon is Horizon.EVENT and entry.capability == "events" and entry.state is ObservationState.SUCCESS]
+    assert len(event_entries) == 2
+    assert event_entries[0].entry_id != event_entries[1].entry_id
 
 
 def test_runner_settlement_is_append_only_and_enters_true_pit_track_record(tmp_path):

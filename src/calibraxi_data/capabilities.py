@@ -24,8 +24,16 @@ class SourceManifestRegistry:
         if self._store is not None:
             existing = self._store.source_manifest(manifest.source)
             if existing is not None and existing != manifest:
-                raise ValueError(f"source manifest conflicts with persisted manifest: {manifest.source}")
-            self._store.save_source_manifest(manifest)
+                # A deployed runner may contain a research-only snapshot from
+                # an earlier phase. The selected production source policy can
+                # supersede that stale snapshot, while arbitrary content
+                # changes remain rejected and the old record is retained by
+                # the persistence adapter.
+                if not _is_operational_upgrade(existing, manifest) or not hasattr(self._store, "supersede_source_manifest"):
+                    raise ValueError(f"source manifest conflicts with persisted manifest: {manifest.source}")
+                self._store.supersede_source_manifest(existing, manifest)
+            else:
+                self._store.save_source_manifest(manifest)
         self._manifests[manifest.source] = manifest
 
     def get(self, source: str) -> SourceManifest:
@@ -62,6 +70,25 @@ class SourceManifestRegistry:
                 raise ValueError(f"source rights state is not eligible: {source}")
         if capability.usage_rights_state not in allowed_rights:
             raise ValueError(f"capability rights state is not eligible: {capability.usage_rights_state}")
+
+
+def _is_operational_upgrade(existing: SourceManifest, incoming: SourceManifest) -> bool:
+    """Allow stale activation or an additive compatible capability revision."""
+
+    incoming_operational = incoming.operational_eligibility in {"eligible", "production"}
+    incoming_rights = incoming.rights_state in {"approved", "permitted"}
+    existing_stale = existing.operational_eligibility not in {"eligible", "production"} or existing.rights_state not in {"approved", "permitted"}
+    if not incoming_operational or not incoming_rights:
+        return False
+    if existing_stale:
+        return True
+    if existing.acquisition_mode != incoming.acquisition_mode:
+        return False
+    if existing.rights_state != incoming.rights_state or existing.operational_eligibility != incoming.operational_eligibility:
+        return False
+    if not set(existing.capabilities).issubset(incoming.capabilities):
+        return False
+    return all(incoming.semantic_contracts.get(key) == value for key, value in existing.semantic_contracts.items())
 
 
 class CapabilityRegistry:
@@ -110,7 +137,23 @@ class CapabilityRegistry:
             if current.policy_version == capability.policy_version:
                 raise ValueError(f"capability policy version already active: {capability.key}:{capability.policy_version}")
         if self._policy_store is not None:
-            self._policy_store.save_capability_policy(capability)
+            # A process restart replays the immutable policy snapshot.  The
+            # same version is safe to reuse only when its complete contract
+            # is identical; a changed version must remain an append-only
+            # policy update.
+            existing_history = tuple(self._policy_store.capability_policy_history(capability.key))
+            existing = next(
+                (item for item in existing_history if item.policy_version == capability.policy_version),
+                None,
+            )
+            if existing is not None:
+                if existing != capability:
+                    raise ValueError(
+                        f"capability policy version already persisted with different content: "
+                        f"{capability.key}:{capability.policy_version}"
+                    )
+            else:
+                self._policy_store.save_capability_policy(capability)
         if capability.key in self._capabilities:
             self._capabilities[capability.key] = capability
             self._history.setdefault(capability.key, []).append(capability)

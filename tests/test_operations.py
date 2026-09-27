@@ -65,6 +65,59 @@ def test_health_signals_persist_counters_and_update_registry(tmp_path):
     assert snapshot.last_error == "HTTP 503"
 
 
+def test_health_signals_preserve_failure_categories_and_source_freshness(tmp_path):
+    store = FileSystemCanonicalStore(tmp_path / "canonical")
+    registry = CapabilityRegistry()
+    registry.register(SourceCapability("fixtures", "espn"))
+    attempted = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    observed = attempted - timedelta(seconds=17)
+
+    recorder = OperationalRecorder(registry=registry, store=store)
+    recorder.record_health(
+        SourceHealthSignal(
+            capability="fixtures",
+            source="espn",
+            health=HealthState.SOURCE_FAILED,
+            attempted_at=attempted,
+            failure=True,
+            retryable_failure=True,
+            timeout=True,
+            rate_limit=True,
+            mapping_failure=True,
+            source_observed_at=observed,
+            error="HTTP 429 after provider timeout and mapping failure",
+        )
+    )
+
+    snapshot = store.health_for("fixtures", "espn")
+    assert snapshot is not None
+    assert snapshot.timeout_count == 1
+    assert snapshot.rate_limit_count == 1
+    assert snapshot.mapping_failure_count == 1
+    assert snapshot.last_source_observed_at == observed
+    assert snapshot.freshness_seconds == 17
+
+
+def test_operational_recorder_classifies_timeout_rate_limit_and_mapping_failures():
+    attempted = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    source_result = SourceResult(
+        CapabilityState.SOURCE_FAILED,
+        "sofascore",
+        "lineups",
+        http_status=429,
+        error="timeout while resolving provider fixture ID mapping",
+        metadata={"source_observed_at": (attempted - timedelta(seconds=4)).isoformat()},
+    )
+    attempt = AcquisitionAttempt(source_result, None, attempted, attempted)
+
+    signal = OperationalRecorder._signal_for_attempt(attempt, None)
+
+    assert signal.timeout is True
+    assert signal.rate_limit is True
+    assert signal.mapping_failure is True
+    assert signal.source_observed_at == attempted - timedelta(seconds=4)
+
+
 def test_operational_recorder_records_quarantine_and_health_from_validation(tmp_path):
     store = FileSystemCanonicalStore(tmp_path / "canonical")
     evidence = FileSystemRawEvidenceStore(tmp_path / "evidence")

@@ -18,10 +18,13 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import uuid4
 
+from .acquisition import AcquisitionAttempt, AcquisitionResult
 from .bootstrap import canonical_fixture_id, canonical_team_id
-from .contracts import CapabilityState, EntityType
+from .contracts import CapabilityState, EntityType, SourceResult
 from .espn import EspnObservationParser, SourceObservation
 from .sofascore import SofascoreObservationParser
+from .operations import OperationalRecorder
+from .quality import QualityIssue, ValidationResult
 from .forecasting import (
     DixonColesBaseline,
     EligibilityBasis,
@@ -119,6 +122,8 @@ class DiscoveryResult:
     failed_dates: tuple[str, ...] = ()
     states: Mapping[str, str] = field(default_factory=dict)
     forecast_count: int = 0
+    cached_fallback_dates: tuple[str, ...] = ()
+    cached_fallback_fixture_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,15 +176,31 @@ class LiveShadowRunner:
         "events": "sofascore",
         "team_match_stats": "sofascore",
         "shots": "sofascore",
+        "xgot": "sofascore",
         "player_stats": "sofascore",
         "xg": "understat",
         "xg_a": "understat",
+    }
+    # Keep a local fallback order for small deployment/test coordinators that
+    # do not expose their registry. Production coordinators still provide the
+    # authoritative order through CapabilityRegistry.
+    CAPABILITY_SOURCE_ORDER = {
+        "fixtures": ("espn", "sofascore"),
+        "lineups": ("espn", "sofascore"),
+        "events": ("sofascore",),
+        "team_match_stats": ("sofascore",),
+        "shots": ("sofascore",),
+        "xgot": ("sofascore",),
+        "player_stats": ("sofascore",),
+        "xg": ("understat",),
+        "xg_a": ("understat",),
     }
     ENRICHMENT_CAPABILITIES = (
         "lineups",
         "events",
         "team_match_stats",
         "shots",
+        "xgot",
         "player_stats",
         "xg",
         "xg_a",
@@ -189,10 +210,17 @@ class LiveShadowRunner:
         "events": (Horizon.T_6H, Horizon.T_1H, Horizon.T_15M),
         "team_match_stats": (Horizon.T_6H, Horizon.T_1H, Horizon.T_15M),
         "shots": (Horizon.T_6H, Horizon.T_1H, Horizon.T_15M),
+        "xgot": (Horizon.T_6H, Horizon.T_1H, Horizon.T_15M),
         "player_stats": (Horizon.T_6H, Horizon.T_1H, Horizon.T_15M),
         "xg": (Horizon.T_72H, Horizon.T_24H),
         "xg_a": (Horizon.T_72H, Horizon.T_24H),
     }
+    # Post-kickoff enrichment is event-driven, but a continuously running
+    # worker still needs a durable cadence so repeated cycles do not flood a
+    # provider. Completed fixtures receive a short tail window for final
+    # corrections before polling stops.
+    POST_KICKOFF_ENRICHMENT_INTERVAL = timedelta(minutes=5)
+    POST_KICKOFF_ENRICHMENT_WINDOW = timedelta(hours=3)
 
     def __init__(
         self,
@@ -210,6 +238,7 @@ class LiveShadowRunner:
         track_record_store: Any | None = None,
         reliability_store: Any | None = None,
         monitoring_store: Any | None = None,
+        operations: OperationalRecorder | None = None,
         historical_records: Sequence[MatchRecord] = (),
         training_examples: Sequence[TrainingExample] = (),
         model_factories: Mapping[str, Callable[[], Any]] | None = None,
@@ -236,6 +265,7 @@ class LiveShadowRunner:
         self.track_record_store = track_record_store or FileTrackRecordStore("temp/live-shadow")
         self.reliability_store = reliability_store or FileReliabilityReportStore("temp/live-shadow")
         self.monitoring_store = monitoring_store or FileMonitoringReportStore("temp/live-shadow")
+        self.operations = operations
         self.scheduler = ObservationHorizonScheduler(self.task_store)
         self.historical_records = tuple(historical_records)
         self.training_examples = tuple(training_examples)
@@ -254,13 +284,28 @@ class LiveShadowRunner:
         entries = 0
         failed_dates: list[str] = []
         states: dict[str, str] = {}
+        cached_fallback_dates: list[str] = []
+        cached_fallback_fixture_count = 0
         for date in dates:
             date_text = str(date)
             try:
-                acquired = self.coordinator.acquire("fixtures", params={"league": self.league, "date": date_text})
+                acquired = self.coordinator.acquire(
+                    "fixtures",
+                    params={"league": self.league, "date": date_text},
+                    accept_result=lambda result: self._accept_source_result("fixtures", result),
+                )
             except Exception as exc:
-                failed_dates.append(date_text)
                 states[date_text] = f"source_failed:{exc}"
+                self._record_synthetic_failure(
+                    capability="fixtures",
+                    source=self._configured_sources("fixtures")[0],
+                    state=ObservationState.SOURCE_FAILED,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    now=current,
+                    horizon=Horizon.FIXTURE_FIRST_OBSERVED,
+                    scope=f"schedule:{self.league}:{date_text}",
+                )
+                cached = self._cached_fixture_discovery(date_text, current=current)
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source="calibraxi",
@@ -271,11 +316,38 @@ class LiveShadowRunner:
                 )
                 self.ledger.save(entry)
                 entries += 1
+                if cached:
+                    for fixture in cached:
+                        fixtures[fixture.fixture_id] = fixture
+                    entries += self._record_cached_fallback(
+                        date_text,
+                        current=current,
+                        fixture_count=len(cached),
+                    )
+                    cached_fallback_dates.append(date_text)
+                    cached_fallback_fixture_count += len(cached)
+                    states[date_text] = "cached_fallback"
+                else:
+                    failed_dates.append(date_text)
                 continue
             discovered, created = self._ingest_acquired_fixtures(acquired, date_text=date_text, current=current)
             if not discovered and acquired.state is not CapabilityState.SUPPORTED:
-                failed_dates.append(date_text)
-                states[date_text] = CapabilityState(acquired.state).value
+                cached = self._cached_fixture_discovery(date_text, current=current)
+                if cached:
+                    for fixture in cached:
+                        fixtures[fixture.fixture_id] = fixture
+                    entries += self._record_cached_fallback(
+                        date_text,
+                        current=current,
+                        fixture_count=len(cached),
+                        evidence=acquired.evidence,
+                    )
+                    cached_fallback_dates.append(date_text)
+                    cached_fallback_fixture_count += len(cached)
+                    states[date_text] = "cached_fallback"
+                else:
+                    failed_dates.append(date_text)
+                    states[date_text] = CapabilityState(acquired.state).value
             else:
                 states[date_text] = CapabilityState(acquired.state).value
             for fixture in discovered:
@@ -286,7 +358,39 @@ class LiveShadowRunner:
         scheduled = len(self.task_store.list_tasks())
         forecast_time = current if now is not None else max(current, _utc(self.clock(), "forecast_time"))
         first_forecasts = self._ensure_first_observed_forecasts(fixtures, current=forecast_time)
-        return DiscoveryResult(tuple(sorted(fixtures.values(), key=lambda item: (item.kickoff_at, item.fixture_id))), scheduled, entries, tuple(failed_dates), states, first_forecasts)
+        return DiscoveryResult(
+            fixtures=tuple(sorted(fixtures.values(), key=lambda item: (item.kickoff_at, item.fixture_id))),
+            scheduled_task_count=scheduled,
+            knowledge_entry_count=entries,
+            failed_dates=tuple(failed_dates),
+            states=states,
+            forecast_count=first_forecasts,
+            cached_fallback_dates=tuple(cached_fallback_dates),
+            cached_fallback_fixture_count=cached_fallback_fixture_count,
+        )
+
+    def _record_cached_fallback(
+        self,
+        date_text: str,
+        *,
+        current: datetime,
+        fixture_count: int,
+        evidence: Any | None = None,
+    ) -> int:
+        """Persist an explicit activation marker for a durable schedule fallback."""
+
+        entry = self._save_schedule_scope_entry(
+            date_text,
+            source="calibraxi-cache",
+            evidence=evidence,
+            state=ObservationState.SOURCE_FAILED,
+            current=current,
+            reason="cached_fixture_fallback",
+            fixture_count=fixture_count,
+            fallback_used=True,
+        )
+        self.ledger.save(entry)
+        return 1
 
     def run_once(self, *, now: datetime | None = None, collect_enrichment: bool = True) -> ShadowCycleResult:
         current = _utc(now or self.clock(), "now")
@@ -371,11 +475,17 @@ class LiveShadowRunner:
                 continue
             if str(fixture.status).lower() in {"finished", "cancelled", "postponed"}:
                 continue
+            if not self._post_kickoff_enrichment_due(fixture.fixture_id, "fixtures", now=current):
+                continue
             result = self.collect_capability(fixture.fixture_id, "fixtures", now=current, horizon=Horizon.EVENT)
             if result.state is ObservationState.SUCCESS:
                 observation_count += len(result.entry_ids)
             elif result.state in {ObservationState.UNSUPPORTED, ObservationState.SOURCE_FAILED, ObservationState.QUARANTINED, ObservationState.MISSING}:
                 unavailable += 1
+        post_observations, post_unavailable, post_errors = self._collect_post_kickoff_enrichment(now=current)
+        observation_count += post_observations
+        unavailable += post_unavailable
+        errors.extend(post_errors)
         settlement = self.settle_completed(now=current)
         reliability_count = self.refresh_reliability(generated_at=current)
         monitoring_count = self.refresh_monitoring(generated_at=current)
@@ -390,6 +500,214 @@ class LiveShadowRunner:
             unavailable_capability_count=unavailable,
             errors=tuple(errors),
         )
+
+    def _cached_fixture_discovery(self, date_text: str, *, current: datetime) -> tuple[LiveFixture, ...]:
+        """Reuse durable fixture observations when every live schedule route fails.
+
+        This is a read-through cache of already observed source facts. It never
+        creates a new fixture observation or evidence record, and it only uses a
+        successful fixture ledger entry whose original knowledge time is already
+        in the past relative to this discovery attempt.
+        """
+
+        try:
+            schedule_date = _schedule_date_key(date_text)
+        except ValueError:
+            return ()
+        try:
+            projections = self.fixture_store.list(population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
+        except TypeError:
+            projections = self.fixture_store.list()
+        try:
+            ledger_rows = self.ledger.list(population_kind=PopulationKind.PROSPECTIVE_TRUE_PIT)
+        except TypeError:
+            ledger_rows = self.ledger.list()
+        entries_by_fixture: dict[str, list[KnowledgeLedgerEntry]] = {}
+        for entry in ledger_rows:
+            if (
+                entry.capability != "fixtures"
+                or entry.state is not ObservationState.SUCCESS
+                or not entry.evidence_id
+                or not entry.provider_entity_id
+                or entry.knowledge_at > current
+            ):
+                continue
+            try:
+                if Horizon.parse(entry.horizon or Horizon.FIXTURE_FIRST_OBSERVED) is not Horizon.FIXTURE_FIRST_OBSERVED:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            entries_by_fixture.setdefault(entry.fixture_id, []).append(entry)
+
+        cached: list[LiveFixture] = []
+        for projection in projections:
+            candidates = sorted(
+                entries_by_fixture.get(projection.fixture_id, ()),
+                key=lambda item: (item.knowledge_at, item.entry_id),
+            )
+            for entry in candidates:
+                known = self._fixture_as_known_at_entry(projection, entry)
+                if known is None or known.kickoff_at.strftime("%Y%m%d") != schedule_date:
+                    continue
+                if known.kickoff_at < current or known.completed:
+                    continue
+                if str(known.status).lower() in {"finished", "final", "complete", "completed", "cancelled", "postponed"}:
+                    continue
+                self._schedule_cached_fixture(known, current=current, first_observed_at=entry.knowledge_at)
+                cached.append(known)
+                break
+        return tuple(sorted(cached, key=lambda item: (item.kickoff_at, item.fixture_id)))
+
+    def _schedule_cached_fixture(self, fixture: LiveFixture, *, current: datetime, first_observed_at: datetime) -> None:
+        """Restore the durable task plan without rewriting the cached fixture row."""
+
+        tasks = self._schedule_fixture_observations(
+            fixture,
+            current=current,
+            first_observed_at=first_observed_at,
+        )
+        first = next((task for task in tasks if task.horizon is Horizon.FIXTURE_FIRST_OBSERVED), None)
+        if first is not None and self.scheduler.outcome(first.task_id) is None:
+            candidates = tuple(
+                entry
+                for entry in self.ledger.list()
+                if entry.fixture_id == fixture.fixture_id
+                and entry.capability == "fixtures"
+                and entry.state is ObservationState.SUCCESS
+                and entry.knowledge_at == first_observed_at
+                and entry.evidence_id in fixture.evidence_ids
+            )
+            if candidates:
+                # This metadata closes the task around the original immutable
+                # observation; it does not create a new observation timestamp.
+                self.scheduler.record_observation(first.task_id, candidates[0].entry_id, recorded_at=first_observed_at)
+
+    def _collect_post_kickoff_enrichment(self, *, now: datetime) -> tuple[int, int, tuple[str, ...]]:
+        """Poll optional detail capabilities after kickoff with a durable cadence.
+
+        These observations use the event horizon and never enter the pre-match
+        forecast group. A missing provider mapping or an optional source error
+        is retained as an explicit ledger state while the remaining
+        capabilities and settlement continue.
+        """
+
+        observed = 0
+        unavailable = 0
+        errors: list[str] = []
+        for fixture in self.fixture_store.list(as_of=now):
+            if fixture.kickoff_at > now:
+                continue
+            status = str(fixture.status).lower()
+            if status in {"cancelled", "postponed"}:
+                continue
+            if fixture.completed and now > fixture.kickoff_at + self.POST_KICKOFF_ENRICHMENT_WINDOW:
+                continue
+            for capability in self.ENRICHMENT_CAPABILITIES:
+                if not self._post_kickoff_enrichment_due(fixture.fixture_id, capability, now=now):
+                    continue
+                source = self.CAPABILITY_SOURCES[capability]
+                try:
+                    result = self.collect_capability(
+                        fixture.fixture_id,
+                        capability,
+                        now=now,
+                        horizon=Horizon.EVENT,
+                        source=source,
+                    )
+                except Exception as exc:
+                    # Optional enrichment must never prevent result settlement
+                    # or the next capability from being attempted.
+                    unavailable += 1
+                    errors.append(f"post_kickoff:{fixture.fixture_id}:{capability}:{type(exc).__name__}:{exc}")
+                    try:
+                        self._save_non_success(
+                            fixture,
+                            capability,
+                            ObservationState.SOURCE_FAILED,
+                            now,
+                            Horizon.EVENT,
+                            f"post_kickoff:{type(exc).__name__}: {exc}",
+                            source=source,
+                        )
+                    except Exception as persist_exc:
+                        errors.append(
+                            f"post_kickoff_persist:{fixture.fixture_id}:{capability}:{type(persist_exc).__name__}:{persist_exc}"
+                        )
+                    continue
+                if result.state is ObservationState.SUCCESS and result.entry_ids:
+                    observed += len(result.entry_ids)
+                elif result.state in {
+                    ObservationState.UNSUPPORTED,
+                    ObservationState.SOURCE_FAILED,
+                    ObservationState.QUARANTINED,
+                    ObservationState.MISSING,
+                }:
+                    unavailable += 1
+                    if result.reason:
+                        errors.append(f"post_kickoff:{fixture.fixture_id}:{capability}:{result.reason}")
+        return observed, unavailable, tuple(errors)
+
+    def _post_kickoff_enrichment_due(self, fixture_id: str, capability: str, *, now: datetime) -> bool:
+        latest = max(
+            (
+                entry
+                for entry in self.ledger.list()
+                if entry.fixture_id == fixture_id
+                and entry.capability == capability
+                and entry.horizon is Horizon.EVENT
+            ),
+            key=lambda entry: (entry.knowledge_at, entry.entry_id),
+            default=None,
+        )
+        return latest is None or now - latest.knowledge_at >= self.POST_KICKOFF_ENRICHMENT_INTERVAL
+
+    def _configured_sources(self, capability: str) -> tuple[str, ...]:
+        registry = getattr(self.coordinator, "_registry", None)
+        if registry is not None:
+            try:
+                sources = tuple(registry.source_order(capability))
+                if sources:
+                    return sources
+            except (AttributeError, KeyError):
+                pass
+        return tuple(
+            self.CAPABILITY_SOURCE_ORDER.get(
+                capability,
+                (self.CAPABILITY_SOURCES.get(capability, "espn"),),
+            )
+        )
+
+    def _provider_fixture_id(self, fixture: LiveFixture, source: str) -> str | None:
+        provider_id = fixture.provider_ids.get(source)
+        if provider_id:
+            return str(provider_id)
+        if self.fixture_identity_index is not None:
+            mapped = self.fixture_identity_index.source_fixture_id(
+                source=source,
+                canonical_fixture_id=fixture.fixture_id,
+            )
+            if mapped:
+                return str(mapped)
+        return None
+
+    def _accept_source_result(self, capability: str, result: SourceResult) -> bool:
+        """Reject semantic-empty/malformed payloads before fallback selection.
+
+        The final configured source may legitimately report an empty collection
+        (for example, a date with no fixtures). Earlier empty responses are
+        quarantined so a compatible fallback gets a chance to provide data.
+        """
+
+        parser = self.parsers.get(result.source)
+        if parser is None:
+            return True
+        try:
+            observations = parser.parse(capability, result.payload)
+        except Exception:
+            return False
+        if observations:
+            return True
+        return result.source == self._configured_sources(capability)[-1]
 
     def collect_capability(
         self,
@@ -410,12 +728,20 @@ class LiveShadowRunner:
         # governed Understat fixture mapping is captured.
         if capability in {"xg", "xg_a"}:
             source = "understat"
-        provider_id = fixture.provider_ids.get(source)
-        if not provider_id and self.fixture_identity_index is not None:
-            provider_id = self.fixture_identity_index.source_fixture_id(
-                source=source,
-                canonical_fixture_id=fixture.fixture_id,
+        provider_id = self._provider_fixture_id(fixture, source)
+        configured_sources = self._configured_sources(capability)
+        configured_ids = {
+            candidate
+            for candidate in configured_sources
+            if fixture.provider_ids.get(candidate)
+            or (
+                self.fixture_identity_index is not None
+                and self.fixture_identity_index.source_fixture_id(
+                    source=candidate,
+                    canonical_fixture_id=fixture.fixture_id,
+                )
             )
+        }
         params: dict[str, Any] = {
             "league": self.league,
             "canonical_fixture_id": fixture.fixture_id,
@@ -425,7 +751,7 @@ class LiveShadowRunner:
             params["date"] = fixture.kickoff_at.strftime("%Y%m%d")
         elif provider_id:
             params["event_id"] = provider_id
-        else:
+        elif not configured_ids:
             return self._save_non_success(
                 fixture,
                 capability,
@@ -436,12 +762,86 @@ class LiveShadowRunner:
                 source=source,
             )
         try:
-            acquired = self.coordinator.acquire(capability, params=params)
+            acquired = self.coordinator.acquire(
+                capability,
+                params=params,
+                accept_result=lambda result: self._accept_source_result(capability, result),
+            )
         except Exception as exc:
             return self._save_non_success(fixture, capability, ObservationState.SOURCE_FAILED, current, horizon, str(exc), source=source)
-        entries = self._entries_for_acquired(acquired, fixture=fixture, capability=capability, horizon=horizon, now=current)
+        try:
+            entries = self._entries_for_acquired(
+                acquired,
+                fixture=fixture,
+                capability=capability,
+                horizon=horizon,
+                now=current,
+            )
+        except Exception as exc:
+            # Raw evidence has already been captured by the acquisition
+            # boundary. A parser/schema failure is therefore a quarantined
+            # capability observation, not a reason to abort the live cycle.
+            # Keep the exception type in the ledger so health reporting can
+            # distinguish malformed payloads from source outages.
+            self._record_live_acquisition(
+                acquired,
+                run_id=self._operation_run_id(
+                    scope=fixture.fixture_id,
+                    capability=capability,
+                    horizon=horizon,
+                    acquired=acquired,
+                ),
+                validation=ValidationResult(
+                    capability=capability,
+                    state=CapabilityState.PARSER_SCHEMA_DRIFT,
+                    accepted=False,
+                    payload=getattr(acquired, "payload", None),
+                    source=getattr(acquired, "source", None),
+                    issues=(QualityIssue("PARSER_SCHEMA_DRIFT", f"parser/schema failure: {type(exc).__name__}: {exc}"),),
+                ),
+            )
+            return self._save_non_success(
+                fixture,
+                capability,
+                ObservationState.QUARANTINED,
+                current,
+                horizon,
+                f"schema_drift:{type(exc).__name__}: {exc}",
+                acquired=acquired,
+                source=source,
+            )
         if not entries:
             state = _state_for(acquired.state)
+            attempts = tuple(getattr(acquired, "attempts", ()))
+            final_result = attempts[-1].result if attempts else acquired
+            if final_result.state is CapabilityState.SUPPORTED:
+                validation = ValidationResult(
+                    capability=capability,
+                    state=CapabilityState.MISSING,
+                    accepted=False,
+                    payload=getattr(acquired, "payload", None),
+                    source=getattr(final_result, "source", None),
+                    issues=(QualityIssue("EMPTY_EXPECTED_COLLECTION", getattr(acquired, "error", None) or "no normalized observation"),),
+                )
+            else:
+                validation = ValidationResult(
+                    capability=capability,
+                    state=final_result.state,
+                    accepted=False,
+                    payload=getattr(acquired, "payload", None),
+                    source=getattr(final_result, "source", None),
+                    issues=(QualityIssue(final_result.state.value.upper(), getattr(final_result, "error", None) or final_result.state.value),),
+                )
+            self._record_live_acquisition(
+                acquired,
+                run_id=self._operation_run_id(
+                    scope=fixture.fixture_id,
+                    capability=capability,
+                    horizon=horizon,
+                    acquired=acquired,
+                ),
+                validation=validation,
+            )
             return self._save_non_success(
                 fixture,
                 capability,
@@ -454,6 +854,22 @@ class LiveShadowRunner:
             )
         if capability == "fixtures":
             self._update_fixture_from_entries(fixture, entries, current=current)
+        self._record_live_acquisition(
+            acquired,
+            run_id=self._operation_run_id(
+                scope=fixture.fixture_id,
+                capability=capability,
+                horizon=horizon,
+                acquired=acquired,
+            ),
+            validation=ValidationResult(
+                capability=capability,
+                state=CapabilityState.SUPPORTED,
+                accepted=True,
+                payload=getattr(acquired, "payload", None),
+                source=getattr(acquired, "source", None),
+            ),
+        )
         return CollectionResult(fixture.fixture_id, capability, ObservationState.SUCCESS, tuple(item.entry_id for item in entries), tuple(item.evidence_id for item in entries if item.evidence_id), max(item.knowledge_at for item in entries))
 
     def settle_completed(self, *, now: datetime | None = None) -> SettlementResult:
@@ -746,6 +1162,18 @@ class LiveShadowRunner:
             result = attempt.result
             evidence = attempt.evidence
             if result.state is not CapabilityState.SUPPORTED:
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult(
+                        capability="fixtures",
+                        state=result.state,
+                        accepted=False,
+                        payload=result.payload,
+                        source=result.source,
+                        issues=(QualityIssue(result.state.value.upper(), result.error or result.state.value),),
+                    ),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -758,6 +1186,18 @@ class LiveShadowRunner:
                 entries += 1
                 continue
             if not isinstance(result.payload, Mapping):
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult(
+                        capability="fixtures",
+                        state=CapabilityState.PARSER_SCHEMA_DRIFT,
+                        accepted=False,
+                        payload=result.payload,
+                        source=result.source,
+                        issues=(QualityIssue("PARSER_SCHEMA_DRIFT", "supported schedule payload is not an object"),),
+                    ),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -770,6 +1210,18 @@ class LiveShadowRunner:
                 entries += 1
                 continue
             if evidence is None:
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult(
+                        capability="fixtures",
+                        state=CapabilityState.MISSING,
+                        accepted=False,
+                        payload=result.payload,
+                        source=result.source,
+                        issues=(QualityIssue("MISSING_EVIDENCE", "schedule response has no durable evidence"),),
+                    ),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -783,6 +1235,11 @@ class LiveShadowRunner:
                 continue
             parser = self.parsers.get(result.source)
             if parser is None:
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult("fixtures", CapabilityState.SUPPORTED, True, result.payload, result.source),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -794,12 +1251,56 @@ class LiveShadowRunner:
                 self.ledger.save(entry)
                 entries += 1
                 continue
-            observations = parser.parse("fixtures", result.payload)
+            try:
+                observations = parser.parse("fixtures", result.payload)
+            except Exception as exc:
+                # Keep the schedule evidence and quarantine the malformed
+                # payload. Discovery can continue for the next date/source;
+                # a parser contract break must not terminate the live runner.
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult(
+                        capability="fixtures",
+                        state=CapabilityState.PARSER_SCHEMA_DRIFT,
+                        accepted=False,
+                        payload=result.payload,
+                        source=result.source,
+                        issues=(QualityIssue("PARSER_SCHEMA_DRIFT", f"parser/schema failure: {type(exc).__name__}: {exc}"),),
+                    ),
+                )
+                entry = self._save_schedule_scope_entry(
+                    date_text,
+                    source=result.source,
+                    evidence=evidence,
+                    state=ObservationState.QUARANTINED,
+                    current=current,
+                    reason=f"schema_drift:{type(exc).__name__}: {exc}",
+                )
+                self.ledger.save(entry)
+                entries += 1
+                continue
             team_names = {item.source_id: item.name for item in observations if item.entity_type is EntityType.TEAM and item.name}
             fixture_observations = tuple(item for item in observations if item.entity_type is EntityType.FIXTURE)
             if not fixture_observations:
                 events = result.payload.get("events")
                 empty_schedule = isinstance(events, (list, tuple)) and not events
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=(
+                        ValidationResult("fixtures", CapabilityState.SUPPORTED, True, result.payload, result.source)
+                        if empty_schedule
+                        else ValidationResult(
+                            capability="fixtures",
+                            state=CapabilityState.PARSER_SCHEMA_DRIFT,
+                            accepted=False,
+                            payload=result.payload,
+                            source=result.source,
+                            issues=(QualityIssue("PARSER_SCHEMA_DRIFT", "schedule payload produced no fixture entities"),),
+                        )
+                    ),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -850,6 +1351,18 @@ class LiveShadowRunner:
                 entries += 1
                 saved_for_attempt += 1
             if not saved_for_attempt:
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult(
+                        capability="fixtures",
+                        state=CapabilityState.QUARANTINED,
+                        accepted=False,
+                        payload=result.payload,
+                        source=result.source,
+                        issues=(QualityIssue("CANONICAL_NORMALIZATION_FAILED", "schedule fixture entities failed canonical normalization"),),
+                    ),
+                )
                 entry = self._save_schedule_scope_entry(
                     date_text,
                     source=result.source,
@@ -860,7 +1373,149 @@ class LiveShadowRunner:
                 )
                 self.ledger.save(entry)
                 entries += 1
+            else:
+                self._record_discovery_attempt(
+                    attempt,
+                    date_text=date_text,
+                    validation=ValidationResult("fixtures", CapabilityState.SUPPORTED, True, result.payload, result.source),
+                )
         return tuple(fixtures.values()), entries
+
+    def _record_discovery_attempt(
+        self,
+        attempt: Any,
+        *,
+        date_text: str,
+        validation: ValidationResult,
+    ) -> None:
+        """Record one schedule-source attempt after its parser outcome is known."""
+
+        result = attempt.result
+        acquisition = AcquisitionResult(
+            capability="fixtures",
+            state=result.state,
+            source=result.source,
+            payload=result.payload,
+            evidence=attempt.evidence,
+            attempts=(attempt,),
+            integration=result.integration,
+            adapter_version=result.adapter_version,
+            error=result.error,
+        )
+        self._record_live_acquisition(
+            acquisition,
+            run_id=self._operation_run_id(
+                scope=f"schedule:{self.league}:{date_text}",
+                capability="fixtures",
+                horizon=Horizon.FIXTURE_FIRST_OBSERVED,
+                acquired=acquisition,
+            ),
+            validation=validation,
+        )
+
+    def _record_live_acquisition(
+        self,
+        acquisition: AcquisitionResult,
+        *,
+        run_id: str,
+        validation: ValidationResult,
+    ) -> None:
+        if self.operations is not None:
+            self.operations.record_acquisition(run_id=run_id, acquisition=acquisition, validation=validation)
+
+    def _record_synthetic_failure(
+        self,
+        *,
+        capability: str,
+        source: str,
+        state: ObservationState,
+        reason: str,
+        now: datetime,
+        horizon: Horizon | str,
+        scope: str,
+    ) -> None:
+        """Record pre-acquisition failures in source health without evidence.
+
+        Missing mappings and coordinator exceptions happen before the normal
+        acquisition boundary can create an attempt. They still represent an
+        operational failure for the configured source, so persist a synthetic
+        failed attempt with no payload/evidence. This keeps health counters
+        honest without inventing source data.
+        """
+
+        if self.operations is None:
+            return
+        try:
+            configured = self._configured_sources(capability)
+        except Exception:
+            return
+        if source not in configured:
+            return
+        capability_state = {
+            ObservationState.MISSING: CapabilityState.MISSING,
+            ObservationState.UNSUPPORTED: CapabilityState.UNSUPPORTED,
+            ObservationState.SOURCE_FAILED: CapabilityState.SOURCE_FAILED,
+            ObservationState.QUARANTINED: CapabilityState.QUARANTINED,
+        }.get(state)
+        if capability_state is None:
+            return
+        result = SourceResult(
+            capability_state,
+            source,
+            capability,
+            error=reason,
+            metadata={"synthetic_failure": True},
+        )
+        attempt = AcquisitionAttempt(result=result, evidence=None, started_at=now, finished_at=now)
+        acquisition = AcquisitionResult(
+            capability=capability,
+            state=capability_state,
+            source=source,
+            payload=None,
+            evidence=None,
+            attempts=(attempt,),
+            error=reason,
+        )
+        validation = ValidationResult(
+            capability=capability,
+            state=capability_state,
+            accepted=False,
+            payload=None,
+            source=source,
+            issues=(QualityIssue(capability_state.value.upper(), reason),),
+        )
+        self._record_live_acquisition(
+            acquisition,
+            run_id=self._operation_run_id(
+                scope=scope,
+                capability=capability,
+                horizon=horizon,
+                acquired=acquisition,
+            ),
+            validation=validation,
+        )
+
+    @staticmethod
+    def _operation_run_id(
+        *,
+        scope: str,
+        capability: str,
+        horizon: Horizon | str,
+        acquired: Any,
+    ) -> str:
+        evidence_ids = tuple(
+            getattr(getattr(attempt, "evidence", None), "evidence_id", None)
+            for attempt in getattr(acquired, "attempts", ())
+        )
+        attempt_times = tuple(
+            (
+                getattr(attempt, "source", None),
+                getattr(attempt, "started_at", None),
+                getattr(attempt, "finished_at", None),
+            )
+            for attempt in getattr(acquired, "attempts", ())
+        )
+        return f"live:{_stable_id({'scope': scope, 'capability': capability, 'horizon': getattr(horizon, 'value', str(horizon)), 'evidence_ids': evidence_ids, 'attempt_times': attempt_times})}"
 
     def _save_schedule_scope_entry(
         self,
@@ -872,6 +1527,7 @@ class LiveShadowRunner:
         current: datetime,
         reason: str,
         fixture_count: int | None = None,
+        fallback_used: bool = False,
     ) -> KnowledgeLedgerEntry:
         evidence_knowledge_at = getattr(evidence, "knowledge_at", None)
         knowledge_at = _utc(evidence_knowledge_at or current, "knowledge_at")
@@ -889,6 +1545,9 @@ class LiveShadowRunner:
         }
         if fixture_count is not None:
             payload["fixture_count"] = fixture_count
+        if fallback_used:
+            payload["fallback_used"] = True
+            payload["fallback_fixture_count"] = fixture_count or 0
         return KnowledgeLedgerEntry.create(
             source=source,
             capability="fixtures",
@@ -945,7 +1604,12 @@ class LiveShadowRunner:
             if result.state is not CapabilityState.SUPPORTED or not isinstance(result.payload, Mapping):
                 continue
             parser = self.parsers.get(result.source)
-            provider_id = fixture.provider_ids.get(result.source)
+            # Acquisition records the exact target-provider ID used for the
+            # selected attempt.  This is authoritative for parser invocation
+            # when a fallback source supplied a governed translated ID that
+            # has not yet been merged into the fixture projection.
+            request_fixture_id = getattr(attempt, "request_fixture_id", None)
+            provider_id = str(request_fixture_id) if request_fixture_id not in (None, "") else self._provider_fixture_id(fixture, result.source)
             if parser is None:
                 # A qualified provider can be collected before a normalized
                 # parser exists. Preserve its raw provider-specific payload in
@@ -1040,6 +1704,16 @@ class LiveShadowRunner:
         acquired: Any | None = None,
         source: str | None = None,
     ) -> CollectionResult:
+        if acquired is None and source is not None:
+            self._record_synthetic_failure(
+                capability=capability,
+                source=source,
+                state=state,
+                reason=reason,
+                now=now,
+                horizon=horizon,
+                scope=f"fixture:{fixture.fixture_id}",
+            )
         evidence = getattr(acquired, "evidence", None)
         evidence_id = getattr(evidence, "evidence_id", None)
         source_name = source or getattr(acquired, "source", None) or getattr(evidence, "source", None) or "calibraxi"
@@ -1466,6 +2140,16 @@ def _optional_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number >= 0 else None
+
+
+def _schedule_date_key(value: Any) -> str:
+    text = str(value).strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    raise ValueError(f"invalid schedule date: {value!r}")
 
 
 __all__ = [
